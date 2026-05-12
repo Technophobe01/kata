@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/mattn/go-runewidth"
 )
 
 // eventDescriber returns the human-readable description for an event of
@@ -194,6 +196,171 @@ func eventDescription(e EventLogEntry) string {
 		return d(e)
 	}
 	return strings.TrimPrefix(e.Type, "issue.")
+}
+
+// eventChunkLines renders one event into the lines of its events-tab
+// chunk. Most events are single-line: "[type] time actor — description".
+// issue.closed events additionally emit indented continuation lines
+// surfacing the close message and each evidence item so reviewers can
+// audit closures directly from the events tab.
+func eventChunkLines(e EventLogEntry, width int, isCursor bool) []string {
+	// Type is daemon-authored; Actor and description interpolate
+	// agent-authored payload fields — sanitize both.
+	head := fmt.Sprintf("[%s] %s %s — %s",
+		e.Type, fmtTime(e.CreatedAt),
+		sanitizeForDisplay(e.Actor),
+		sanitizeForDisplay(eventDescription(e)))
+	lines := []string{applyActivityCursor(head, isCursor)}
+	if e.Type == "issue.closed" {
+		lines = append(lines, closeDetailLines(e, width)...)
+	}
+	return lines
+}
+
+// closeDetailLines returns the indented "message:" and "evidence:" rows
+// that hang under an issue.closed header. Empty fields are skipped so a
+// minimal close (e.g. TUI bypass with no message and no evidence) still
+// renders cleanly as a single header line.
+//
+// Values are sanitized with sanitizeForLine (not sanitizeForDisplay) so
+// embedded newlines render as the literal escape "\n" instead of
+// spilling into extra physical rows that bypass chunk line-counting and
+// cursor anchoring. Long values are then wrapped to width with a hanging
+// indent so the events tab surfaces the full message on a narrow pane
+// instead of clipping it with an ellipsis.
+func closeDetailLines(e EventLogEntry, width int) []string {
+	var out []string
+	if msg := payloadString(e, "message"); msg != "" {
+		out = append(out, wrapDetailRow("  message: ", sanitizeForLine(msg), width)...)
+	}
+	for _, line := range closeEvidenceSummaries(e) {
+		out = append(out, wrapDetailRow("  evidence: ", sanitizeForLine(line), width)...)
+	}
+	return out
+}
+
+// wrapDetailRow renders one labeled detail row across as many physical
+// rows as it takes to fit value into width. The first row carries
+// prefix + the value head; continuation rows carry a hanging indent of
+// the same display width so the value column stays vertically aligned.
+// width <= 0 returns the row unwrapped so callers that don't yet know
+// the pane width still emit readable output.
+func wrapDetailRow(prefix, value string, width int) []string {
+	if width <= 0 {
+		return []string{prefix + value}
+	}
+	prefixW := runewidth.StringWidth(prefix)
+	budget := width - prefixW
+	if budget < 1 {
+		budget = 1
+	}
+	parts := hardWrap(value, budget)
+	if len(parts) == 0 {
+		return []string{prefix}
+	}
+	out := make([]string, 0, len(parts))
+	out = append(out, prefix+parts[0])
+	hang := strings.Repeat(" ", prefixW)
+	for _, p := range parts[1:] {
+		out = append(out, hang+p)
+	}
+	return out
+}
+
+// closeEvidenceSummaries extracts the evidence array from an
+// issue.closed event payload and returns one short label per item
+// (e.g. "commit a1b2c3d", "reviewed-paths internal/db/queries.go").
+// Missing or malformed evidence returns nil.
+func closeEvidenceSummaries(e EventLogEntry) []string {
+	if e.Payload == nil {
+		return nil
+	}
+	raw, ok := e.Payload["evidence"]
+	if !ok {
+		return nil
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, formatEvidenceItem(m))
+	}
+	return out
+}
+
+// formatEvidenceItem renders one evidence map from the close payload
+// (matching api.Evidence wire shape) into a short human label. The
+// switch mirrors the EvidenceType union in internal/api/evidence.go;
+// unknown types fall back to the raw type tag so future additions don't
+// disappear silently.
+func formatEvidenceItem(m map[string]any) string {
+	t, _ := m["type"].(string)
+	switch t {
+	case "commit":
+		return evidenceLabel(t, stringField(m, "sha"))
+	case "pr":
+		return evidenceLabel(t, stringField(m, "url"))
+	case "test":
+		return evidenceLabel(t, stringField(m, "command"))
+	case "no-change-audit":
+		return evidenceLabel(t, stringField(m, "rationale"))
+	case "duplicate-of", "superseded-by":
+		return evidenceLabel(t, stringField(m, "issue_ref"))
+	case "reviewed-paths":
+		return evidenceLabel(t, joinStringArray(m, "paths"))
+	}
+	if t == "" {
+		return "?"
+	}
+	return t
+}
+
+// evidenceLabel joins a type tag with its payload value, dropping the
+// trailing space when the value is empty so a malformed item renders as
+// "commit" instead of "commit ".
+func evidenceLabel(kind, value string) string {
+	if value == "" {
+		return kind
+	}
+	return kind + " " + value
+}
+
+// stringField reads a string field out of a generic map, returning ""
+// for missing keys or non-string values.
+func stringField(m map[string]any, key string) string {
+	v, ok := m[key]
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+// joinStringArray returns the comma-separated string-array field at key.
+// Missing keys, non-array values, and arrays with no usable strings all
+// return "".
+func joinStringArray(m map[string]any, key string) string {
+	raw, ok := m[key]
+	if !ok {
+		return ""
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return ""
+	}
+	parts := make([]string, 0, len(arr))
+	for _, v := range arr {
+		if s, ok := v.(string); ok && s != "" {
+			parts = append(parts, s)
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // reasonSuffix renders " (reason)" for closed events that carry one.

@@ -12,7 +12,6 @@ start of each session for the agent contract; the short version:
   workspace the bare form (`abc4`) is enough; cross-project references
   qualify with the project name (`kata#abc4`). Full 26-char ULIDs are
   also accepted. Legacy numeric refs (`#12`, `12`) no longer resolve.
-  See `docs/superpowers/specs/2026-05-10-kata-short-ids.md`.
 - `kata list --json` to see open work; `kata show <ref> --json` for detail.
 - Search before creating: `kata search "<keywords>" --json`.
 - Update existing issues over creating duplicates (`kata comment`,
@@ -21,19 +20,14 @@ start of each session for the agent contract; the short version:
   from the operating issue's POV. Repeatable except `--parent`. Removes
   are `--remove-parent` (strict; must equal current) plus idempotent
   `--remove-blocks/--remove-blocked-by/--remove-related`.
-- Close only when the work is actually complete: `kata close <ref> --reason done`.
+- Close only when the work is actually complete:
+  `kata close <ref> --done --message "<scope + verification>" --commit <sha>`.
+  Use `--duplicate-of <ref>`, `--superseded-by <ref>`, `--audit-no-change`, or
+  `--wontfix` when those reasons fit. The daemon refuses parent-close while
+  children are open and throttles sibling-close bursts.
 - Never `kata delete` or `kata purge` without explicit user authorization.
 
 For long-running work, `kata events --tail` streams NDJSON.
-
-## Specs and plans
-
-- Design specs: `docs/superpowers/specs/`
-- Implementation plans: `docs/superpowers/plans/`
-
-The master spec is `docs/superpowers/specs/2026-04-29-kata-design.md`.
-The shared-server-mode guardrails (still relevant for the future auth
-work) live in `docs/superpowers/specs/2026-04-29-kata-shared-server-mode.md`.
 
 ## Remote-client mode (no auth)
 
@@ -53,5 +47,3 @@ A daemon can serve clients on other hosts over a private network:
   those sources are available, so the daemon (or its absence) emits
   the existing validation error. No auth yet — network ACLs are the
   boundary.
-
-See `docs/superpowers/specs/2026-05-04-kata-remote-client-design.md`.

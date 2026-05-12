@@ -151,7 +151,7 @@ kata list
 # Each issue prints its short_id (e.g. abc4); use it for follow-up commands.
 kata show abc4
 kata comment abc4 --body "Reproduced on macOS."
-kata close abc4 --reason done
+kata close abc4 --done --message "Fixed; verified tests pass." --commit <sha>
 ```
 
 Open the TUI for human triage:
@@ -195,7 +195,8 @@ kata edit <issue-ref> [--title TEXT] [--body TEXT] [--owner NAME]
                   [--remove-parent <ref>] [--remove-blocks <ref>]
                   [--remove-blocked-by <ref>] [--remove-related <ref>]
 kata comment <ref> [--body TEXT | --body-file PATH | --body-stdin]
-kata close <ref> [--reason done|wontfix|duplicate]
+kata close <ref> --done --message <text> [--commit|--pr|--test|--reviewed|--evidence]
+kata close <ref> [--wontfix|--duplicate-of <ref>|--superseded-by <ref>|--audit-no-change]
 kata reopen <ref>
 ```
 
@@ -203,6 +204,42 @@ Refs accept a bare short_id (`abc4`), a qualified short_id (`kata#abc4`), or
 a full 26-char ULID. The relationship flags on `create`/`edit` are
 documented in detail in "Relationships ride on `kata create` and `kata edit`"
 below.
+
+Closing issues:
+
+```sh
+kata close abc4 --done --message "<what changed and how it was verified>" \
+                --commit <sha>
+kata close abc4 --duplicate-of d4ex  --message "<short pointer>"
+kata close abc4 --superseded-by d4ex --message "<short pointer>"
+kata close abc4 --wontfix --message "<>=60 chars of rationale>"
+kata close abc4 --audit-no-change \
+                --message "<scope + verification of no-change conclusion>" \
+                --evidence "no-change-audit:<short rationale>" \
+                --reviewed <path/to/file>
+```
+
+Closing an issue asserts that the work is complete. Close each issue
+as soon as its work is verified — not at the end of a batch. Use the
+`needs-review` label and a comment when the work is incomplete instead.
+The daemon refuses these structurally dangerous patterns:
+
+- closing a parent while its children remain open
+- closing >3 siblings under the same parent within 5 minutes
+- closing two siblings of the same parent with the same close message
+  (within 30 minutes, for `done`/`audit-no-change`)
+
+The sibling-burst and repeated-message throttles can be disabled
+daemon-wide via `[close.throttle] enabled = false` in
+`<KATA_HOME>/config.toml`; the parent-completeness refusal and the
+substance/evidence checks on `--message`/`--evidence` always run.
+
+The TUI close path (`x` in `kata tui`) bypasses the substance and
+evidence checks — interactive humans close with a single keystroke.
+Structural guards still apply.
+
+`kata audit closes` lists close events with filters; specific lazy
+closes can be undone individually with `kata reopen <ref>`.
 
 Labels, ownership, and relationships:
 
@@ -345,7 +382,7 @@ kata label add abc4 safari --json
 kata edit abc4 --blocks d4ex --json
 
 # Close when done
-kata close abc4 --reason done --json
+kata close abc4 --done --message "Fixed; verified tests pass." --commit <sha> --json
 ```
 
 For long-running agents, poll events and remember the returned cursor; resume
@@ -436,8 +473,7 @@ url = "http://100.64.0.5:7777"
 
 There is no authentication in this mode — network ACLs (firewall, VPN,
 tailnet) are the access boundary. Default behavior (no flag, no env, no local
-file) is unchanged: a local Unix-socket daemon is auto-started on demand. See
-`docs/superpowers/specs/2026-05-04-kata-remote-client-design.md`.
+file) is unchanged: a local Unix-socket daemon is auto-started on demand.
 
 ## Configuration
 

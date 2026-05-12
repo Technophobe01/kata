@@ -335,12 +335,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if next, cmd, ok := m.routeSSE(msg); ok {
 		return next, cmd
 	}
+	var bootstrapCmd tea.Cmd
 	switch msg.(type) {
 	case initialFetchMsg, refetchedMsg:
 		if m.isStaleListFetch(msg) {
 			return m, nil
 		}
 		m = m.populateCache(msg)
+		if _, isInitial := msg.(initialFetchMsg); isInitial {
+			m, bootstrapCmd = m.maybeBootstrapSplitDetail()
+		}
 	}
 	if mut, ok := msg.(mutationDoneMsg); ok {
 		next, cmd := m.routeMutation(mut)
@@ -416,7 +420,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	return m.dispatchToView(msg)
+	next, cmd := m.dispatchToView(msg)
+	if bootstrapCmd == nil {
+		return next, cmd
+	}
+	if cmd == nil {
+		return next, bootstrapCmd
+	}
+	return next, tea.Batch(cmd, bootstrapCmd)
+}
+
+// maybeBootstrapSplitDetail auto-loads the highlighted list row into the
+// detail pane after the initial fetch lands in split layout with no
+// detail issue pinned yet. scheduleDetailFollow only fires from
+// cursor-motion otherwise, so without this hook the right-hand pane
+// stays empty on launch until the user nudges j/k.
+func (m Model) maybeBootstrapSplitDetail() (Model, tea.Cmd) {
+	if m.layout != layoutSplit {
+		return m, nil
+	}
+	if m.detail.issue != nil {
+		return m, nil
+	}
+	return m.scheduleDetailFollow()
 }
 
 // isStaleListFetch reports whether a list-fetch message was dispatched
@@ -585,13 +611,14 @@ func (m Model) routeTopLevel(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		prevLayout := m.layout
 		m.width, m.height = msg.Width, msg.Height
 		m.layout = m.resolveLayout()
+		var flipCmd tea.Cmd
 		if prevLayout != m.layout {
-			m = m.handleLayoutFlip(prevLayout)
+			m, flipCmd = m.handleLayoutFlip(prevLayout)
 		}
 		// Cache the terminal/detail viewport so PgDn can clamp body
 		// scroll against the same dimensions the renderer will use.
 		m.detail = m.applyDetailViewportCache(m.detail)
-		return m, nil, true
+		return m, flipCmd, true
 	case tea.KeyMsg:
 		// Modal owns input when active. Enter the modal-specific
 		// handler before falling through to input/global routing.
@@ -1496,7 +1523,8 @@ func (m Model) routeGlobalKey(msg tea.KeyMsg) (Model, tea.Cmd, bool) {
 		return next, cmd, true
 	}
 	if m.keymap.ToggleLayout.matches(msg) {
-		return m.toggleLayout(), nil, true
+		next, cmd := m.toggleLayout()
+		return next, cmd, true
 	}
 	if next, cmd, ok := m.routeLayoutFocusKey(msg); ok {
 		return next, cmd, true
