@@ -56,7 +56,7 @@ func TestBearerTransportInjectsHeader(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := &http.Client{Transport: withBearer(http.DefaultTransport, "secret", srv.URL)}
+	c := &http.Client{Transport: withBearer(http.DefaultTransport, "secret", srv.URL, false)}
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
 	require.NoError(t, err)
 	resp, err := c.Do(req) //nolint:gosec // G704: srv.URL is the test's own httptest.Server
@@ -74,7 +74,7 @@ func TestBearerTransportNoTokenPassthrough(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	rt := withBearer(http.DefaultTransport, "", srv.URL)
+	rt := withBearer(http.DefaultTransport, "", srv.URL, false)
 	assert.Equal(t, http.DefaultTransport, rt,
 		"empty token must return the base transport unchanged")
 
@@ -96,7 +96,7 @@ func TestBearerTransportPreservesCallerHeader(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := &http.Client{Transport: withBearer(http.DefaultTransport, "from-transport", srv.URL)}
+	c := &http.Client{Transport: withBearer(http.DefaultTransport, "from-transport", srv.URL, false)}
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer caller-supplied")
@@ -114,7 +114,7 @@ func TestBearerTransportDoesNotMutateRequest(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := &http.Client{Transport: withBearer(http.DefaultTransport, "secret", srv.URL)}
+	c := &http.Client{Transport: withBearer(http.DefaultTransport, "secret", srv.URL, false)}
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
 	require.NoError(t, err)
 	resp, err := c.Do(req) //nolint:gosec // G704: srv.URL is the test's own httptest.Server
@@ -189,10 +189,43 @@ func TestNewHTTPClient_RefusesBearerOnPlaintextNonLoopback(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("KATA_HOME", tmp)
 	t.Setenv("KATA_AUTH_TOKEN", "secret")
+	t.Setenv("KATA_TRUST_PRIVATE_NETWORK", "")
 
 	_, err := NewHTTPClient(context.Background(), "http://example.invalid:7373", Opts{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "plaintext")
+}
+
+func TestNewHTTPClient_AllowsBearerOnPlaintextNonLoopbackWhenTrustPrivateNetworkSet(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("KATA_HOME", tmp)
+	t.Setenv("KATA_AUTH_TOKEN", "secret")
+	t.Setenv("KATA_TRUST_PRIVATE_NETWORK", "1")
+
+	_, err := NewHTTPClient(context.Background(), "http://100.64.0.5:7373", Opts{})
+	require.NoError(t, err)
+}
+
+func TestNewHTTPClient_TrustPrivateNetworkRejectsPublicPlaintextTarget(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("KATA_HOME", tmp)
+	t.Setenv("KATA_AUTH_TOKEN", "secret")
+	t.Setenv("KATA_TRUST_PRIVATE_NETWORK", "1")
+
+	_, err := NewHTTPClient(context.Background(), "http://8.8.8.8:7373", Opts{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-public")
+}
+
+func TestNewHTTPClient_TrustPrivateNetworkRejectsPlaintextHostname(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("KATA_HOME", tmp)
+	t.Setenv("KATA_AUTH_TOKEN", "secret")
+	t.Setenv("KATA_TRUST_PRIVATE_NETWORK", "1")
+
+	_, err := NewHTTPClient(context.Background(), "http://example.internal:7373", Opts{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "literal IP")
 }
 
 // TestNewHTTPClient_AllowsBearerOnLoopback covers the safe-target arm of
@@ -237,11 +270,11 @@ func TestNewHTTPClient_AllowsBearerOverHTTPS(t *testing.T) {
 // path-bearing baseURLs must normalize to the same origin so the per-request
 // pin matches regardless of which API path triggered the check.
 func TestCheckBearerTargetSafe_UnixBase(t *testing.T) {
-	origin, err := checkBearerTargetSafe(UnixBase)
+	origin, err := checkBearerTargetSafe(UnixBase, false)
 	require.NoError(t, err)
 	assert.Equal(t, UnixBase, origin)
 
-	origin, err = checkBearerTargetSafe(UnixBase + "/api/v1/ping")
+	origin, err = checkBearerTargetSafe(UnixBase+"/api/v1/ping", false)
 	require.NoError(t, err)
 	assert.Equal(t, UnixBase, origin)
 }
@@ -264,7 +297,7 @@ func TestNewHTTPClient_NoTokenSkipsSafetyCheck(t *testing.T) {
 // pointed at a plaintext non-loopback URL must be refused before the
 // token reaches the wire.
 func TestBearerTransport_RefusesPlaintextNonLoopbackPerRequest(t *testing.T) {
-	rt := withBearer(http.DefaultTransport, "secret", "http://127.0.0.1:7373")
+	rt := withBearer(http.DefaultTransport, "secret", "http://127.0.0.1:7373", false)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 		"http://example.invalid:7373/api/v1/ping", nil)
 	require.NoError(t, err)
@@ -274,6 +307,48 @@ func TestBearerTransport_RefusesPlaintextNonLoopbackPerRequest(t *testing.T) {
 	}
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "plaintext")
+}
+
+func TestBearerTransport_AllowsPlaintextNonLoopbackWhenTrustPrivateNetworkSet(t *testing.T) {
+	var got string
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		got = req.Header.Get("Authorization")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	})
+	rt := withBearer(base, "secret", "http://100.64.0.5:7373", true)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"http://100.64.0.5:7373/api/v1/ping", nil)
+	require.NoError(t, err)
+
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, "Bearer secret", got)
+}
+
+func TestBearerTransport_TrustPrivateNetworkStillRefusesCrossOrigin(t *testing.T) {
+	called := false
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		called = true
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: req}, nil
+	})
+	rt := withBearer(base, "secret", "http://100.64.0.5:7373", true)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"http://100.64.0.6:7373/api/v1/ping", nil)
+	require.NoError(t, err)
+
+	resp, err := rt.RoundTrip(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cross-origin")
+	assert.False(t, called, "cross-origin request must not reach the base transport")
 }
 
 // TestBearerTransport_BlocksTokenOnRedirectToPlaintextNonLoopback is the
@@ -287,7 +362,7 @@ func TestBearerTransport_BlocksTokenOnRedirectToPlaintextNonLoopback(t *testing.
 	}))
 	t.Cleanup(srv.Close)
 
-	c := &http.Client{Transport: withBearer(http.DefaultTransport, "secret", srv.URL)}
+	c := &http.Client{Transport: withBearer(http.DefaultTransport, "secret", srv.URL, false)}
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
 	require.NoError(t, err)
 	resp, err := c.Do(req) //nolint:gosec // G704: srv.URL is the test's own httptest.Server
@@ -304,7 +379,7 @@ func TestBearerTransport_BlocksTokenOnRedirectToPlaintextNonLoopback(t *testing.
 // passes the HTTPS / loopback safety check on its own) must be refused
 // before the token reaches the wire.
 func TestBearerTransport_RefusesCrossOriginPerRequest(t *testing.T) {
-	rt := withBearer(http.DefaultTransport, "secret", "https://daemon.example")
+	rt := withBearer(http.DefaultTransport, "secret", "https://daemon.example", false)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 		"https://attacker.example/api/v1/ping", nil)
 	require.NoError(t, err)
@@ -333,7 +408,7 @@ func TestBearerTransport_BlocksTokenOnCrossOriginHTTPSRedirect(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	base := srv.Client().Transport
-	c := &http.Client{Transport: withBearer(base, "secret", srv.URL)}
+	c := &http.Client{Transport: withBearer(base, "secret", srv.URL, false)}
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
 	require.NoError(t, err)
 	resp, err := c.Do(req) //nolint:gosec // G704: srv.URL is the test's own httptest.Server
@@ -354,4 +429,10 @@ func writeAuthConfig(home, tok string) error {
 // writeRawConfig writes config.toml verbatim under home.
 func writeRawConfig(home, body string) error {
 	return os.WriteFile(filepath.Join(home, "config.toml"), []byte(body), 0o600)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

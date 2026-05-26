@@ -482,19 +482,24 @@ Future shared mode should be a distinct deployment:
 
 The local daemon should not be exposed directly to a LAN or public network.
 
-### Remote daemon (opt-in, no auth)
+### Remote daemon (opt-in private network)
 
 A kata daemon can serve clients on other hosts over a private network
 (loopback, RFC1918, CGNAT, link-local, ULA — public addresses are rejected):
 
 ```sh
-kata daemon start --listen 100.64.0.5:7777
+KATA_AUTH_TOKEN=change-me KATA_TRUST_PRIVATE_NETWORK=1 \
+  kata daemon start --listen 100.64.0.5:7777
 ```
 
-Or set the address persistently in `<KATA_HOME>/config.toml`:
+Or set the address and auth persistently in `<KATA_HOME>/config.toml`:
 
 ```toml
 listen = "100.64.0.5:7777"
+
+[auth]
+token = "change-me"
+trust_private_network = true
 ```
 
 The CLI flag wins over the config file when both are present. Auto-started
@@ -523,9 +528,21 @@ url = "http://100.64.0.5:7777"
 `kata init` adds `.kata.local.toml` to `.gitignore` automatically.
 `KATA_SERVER` wins over the file when both are set.
 
-There is no authentication in this mode — network ACLs (firewall, VPN,
-tailnet) are the access boundary. Default behavior (no flag, no env, no local
-file) is unchanged: a local Unix-socket daemon is auto-started on demand.
+The environment auth equivalents are `KATA_AUTH_TOKEN` and
+`KATA_TRUST_PRIVATE_NETWORK=1`. Clients use the same token sources. Mutable
+non-loopback HTTP requires both `token` and `trust_private_network`; without
+the trust flag, kata refuses the token-protected listener because the daemon
+does not terminate TLS. Plain HTTP with trusted bearer auth is limited to
+literal non-public addresses: loopback, RFC1918, CGNAT, link-local, and ULA.
+Public IPs and DNS hostnames are rejected; use HTTPS through a reverse proxy
+or an SSH tunnel for those shapes.
+
+For unauthenticated private-network experiments, `kata daemon start --listen
+100.64.0.5:7777 --insecure-readonly` permits GET requests only; mutations and
+the event stream still require authentication. Network ACLs (firewall, VPN,
+tailnet) are the access boundary in that read-only dev mode. Default behavior
+(no flag, no env, no local file) is unchanged: a local Unix-socket daemon is
+auto-started on demand.
 
 ## Backup and restore
 

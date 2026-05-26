@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"go.kenn.io/kata/internal/config"
+	"go.kenn.io/kata/internal/daemon"
 )
 
 // resolveAuthToken returns the auth token a client should attach to
@@ -25,14 +26,17 @@ import (
 // "no token" so the request fails with a clean 401 rather than a noisy
 // client-side decode error.
 func resolveAuthToken() string {
-	if v := strings.TrimSpace(os.Getenv("KATA_AUTH_TOKEN")); v != "" {
-		return v
-	}
+	return resolveAuthConfig().Token
+}
+
+func resolveAuthConfig() config.AuthConfig {
+	envToken := strings.TrimSpace(os.Getenv("KATA_AUTH_TOKEN"))
+	envTrust := config.EnvTruthy("KATA_TRUST_PRIVATE_NETWORK")
 	cfg, err := config.ReadDaemonConfig()
 	if err != nil || cfg == nil {
-		return ""
+		return config.AuthConfig{Token: envToken, TrustPrivateNetwork: envTrust}
 	}
-	return cfg.Auth.Token
+	return cfg.Auth
 }
 
 // bearerTransport wraps an http.RoundTripper and injects
@@ -56,9 +60,10 @@ func resolveAuthToken() string {
 // though the redirected request "looks safe" by transport-encryption
 // alone.
 type bearerTransport struct {
-	base   http.RoundTripper
-	token  string
-	origin string
+	base                http.RoundTripper
+	token               string
+	origin              string
+	trustPrivateNetwork bool
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -71,7 +76,7 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// the same transport, and we would attach the token to the redirected
 	// request. Re-validating req.URL here covers both initial requests and
 	// follow-up redirects without trusting the client redirect policy.
-	if err := checkBearerTargetSafeURL(req.URL); err != nil {
+	if err := checkBearerTargetSafeURL(req.URL, t.trustPrivateNetwork); err != nil {
 		return nil, err
 	}
 	if reqOrigin := req.URL.Scheme + "://" + req.URL.Host; reqOrigin != t.origin {
@@ -90,14 +95,19 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // A nil base falls back to http.DefaultTransport — matching net/http's
 // own zero-value behavior when *http.Client.Transport is nil. origin
 // is the scheme://host the bearer is pinned to (see bearerTransport).
-func withBearer(base http.RoundTripper, token, origin string) http.RoundTripper {
+func withBearer(base http.RoundTripper, token, origin string, trustPrivateNetwork bool) http.RoundTripper {
 	if token == "" {
 		return base
 	}
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	return &bearerTransport{base: base, token: token, origin: origin}
+	return &bearerTransport{
+		base:                base,
+		token:               token,
+		origin:              origin,
+		trustPrivateNetwork: trustPrivateNetwork,
+	}
 }
 
 // checkBearerTargetSafe refuses to attach a bearer token to a baseURL that
@@ -105,12 +115,12 @@ func withBearer(base http.RoundTripper, token, origin string) http.RoundTripper 
 // origin the bearer should be pinned to for subsequent requests. Thin wrapper
 // over checkBearerTargetSafeURL that accepts a string base URL — used at
 // client construction time to fail fast before any request is built.
-func checkBearerTargetSafe(baseURL string) (string, error) {
+func checkBearerTargetSafe(baseURL string, trustPrivateNetwork bool) (string, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return "", fmt.Errorf("parse base URL %q for bearer-token safety check: %w", baseURL, err)
 	}
-	if err := checkBearerTargetSafeURL(u); err != nil {
+	if err := checkBearerTargetSafeURL(u, trustPrivateNetwork); err != nil {
 		return "", err
 	}
 	return u.Scheme + "://" + u.Host, nil
@@ -122,11 +132,12 @@ func checkBearerTargetSafe(baseURL string) (string, error) {
 const unixSentinelHost = "kata.invalid"
 
 // checkBearerTargetSafeURL is the per-request form of the bearer-safety check.
-// Safe targets are the Unix-socket sentinel host, HTTPS schemes, and HTTP
-// loopback addresses (including "localhost", "127.0.0.1", "[::1]"). Defense
-// in depth on top of checkAuthStartup so a redirect-following client cannot
-// leak the token to a plaintext non-loopback URL.
-func checkBearerTargetSafeURL(u *url.URL) error {
+// Safe targets are the Unix-socket sentinel host, HTTPS schemes, HTTP loopback
+// addresses (including "localhost", "127.0.0.1", "[::1]"), and plaintext
+// private-IP URLs only when the operator opted into private-network trust.
+// Defense in depth on top of checkAuthStartup ensures a redirect-following
+// client cannot leak the token to an untrusted origin.
+func checkBearerTargetSafeURL(u *url.URL, trustPrivateNetwork bool) error {
 	if u == nil {
 		return fmt.Errorf("nil URL for bearer-token safety check")
 	}
@@ -144,6 +155,12 @@ func checkBearerTargetSafeURL(u *url.URL) error {
 		return nil
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	if trustPrivateNetwork {
+		if err := daemon.ValidateNonPublicAddress(net.JoinHostPort(host, u.Port())); err != nil {
+			return fmt.Errorf("plaintext trusted-private-network bearer target %q rejected: %w", u.Redacted(), err)
+		}
 		return nil
 	}
 	return fmt.Errorf("refusing to attach bearer token to plaintext non-loopback URL %q — "+
