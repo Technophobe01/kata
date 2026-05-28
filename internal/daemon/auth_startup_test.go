@@ -109,6 +109,23 @@ func TestAuthStartupGuard_TokenOnNonLoopback_InsecureReadonly_StillRefuses(t *te
 	assert.Contains(t, err.Error(), "plaintext HTTP")
 }
 
+func TestAuthStartupGuard_RejectsInsecureReadonlyWithIdentityMode(t *testing.T) {
+	err := checkAuthStartup("100.64.0.5:7777", authPolicy{
+		Token:                "bootstrap",
+		TrustPrivateNetwork:  true,
+		InsecureReadonly:     true,
+		RequireTokenIdentity: true,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "require_token_identity")
+}
+
+func TestAuthStartupGuard_RejectsIdentityModeWithoutBootstrapToken(t *testing.T) {
+	err := checkAuthStartup("", authPolicy{RequireTokenIdentity: true})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bootstrap")
+}
+
 // TestAuthStartupGuard_WildcardBindWithoutToken_Refuses covers the listen
 // shapes that bind every interface in Go's net.Listen — :port (empty host),
 // 0.0.0.0:port, and [::]:port. Each is reachable from anywhere on the
@@ -144,11 +161,12 @@ func TestAuthStartupGuard_LocalhostHostname_NoTokenOK(t *testing.T) {
 
 func TestServerConfig_AuthPolicyThreaded(t *testing.T) {
 	cfg := ServerConfig{
-		Auth:             config.AuthConfig{Token: "tok-123", TrustPrivateNetwork: true},
+		Auth:             config.AuthConfig{Token: "tok-123", TrustPrivateNetwork: true, RequireTokenIdentity: true},
 		InsecureReadonly: false,
 	}
 	got := cfg.authPolicy()
 	assert.Equal(t, "tok-123", got.Token)
 	assert.True(t, got.TrustPrivateNetwork)
+	assert.True(t, got.RequireTokenIdentity)
 	assert.False(t, got.InsecureReadonly)
 }

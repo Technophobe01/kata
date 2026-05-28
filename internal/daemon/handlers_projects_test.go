@@ -1,6 +1,7 @@
 package daemon_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 	"go.kenn.io/kata/internal/daemon"
 	"go.kenn.io/kata/internal/db"
+	"go.kenn.io/kata/internal/testenv"
 	"go.kenn.io/kata/internal/testfix"
 )
 
@@ -54,6 +56,90 @@ func TestInit_FromGitRemoteCreatesProject(t *testing.T) {
 	// .kata.toml must have been written
 	_, err := os.Stat(filepath.Join(h.dir, ".kata.toml"))
 	assert.NoError(t, err)
+}
+
+func TestProjectMutations_IdentityModeBootstrapTokenCannotWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		setup  func(t *testing.T, env *testenv.Env) (method, path string, body any)
+		verify func(t *testing.T, env *testenv.Env)
+	}{
+		{
+			name: "init",
+			setup: func(_ *testing.T, _ *testenv.Env) (string, string, any) {
+				return http.MethodPost, "/api/v1/projects", map[string]any{"name": "new-project"}
+			},
+			verify: func(t *testing.T, env *testenv.Env) {
+				_, err := env.DB.ProjectByName(context.Background(), "new-project")
+				assert.ErrorIs(t, err, db.ErrNotFound)
+			},
+		},
+		{
+			name: "merge",
+			setup: func(t *testing.T, env *testenv.Env) (string, string, any) {
+				source := mkProject(t, env, "github.com/test/source", "source")
+				target := mkProject(t, env, "github.com/test/target", "target")
+				return http.MethodPost, "/api/v1/projects/" + strconv.FormatInt(target, 10) + "/merge",
+					map[string]any{"source_project_id": source}
+			},
+			verify: func(t *testing.T, env *testenv.Env) {
+				_, err := env.DB.ProjectByName(context.Background(), "source")
+				require.NoError(t, err)
+				_, err = env.DB.ProjectByName(context.Background(), "target")
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "rename",
+			setup: func(t *testing.T, env *testenv.Env) (string, string, any) {
+				pid := mkProject(t, env, "github.com/test/old", "old-name")
+				return http.MethodPatch, "/api/v1/projects/" + strconv.FormatInt(pid, 10),
+					map[string]any{"name": "new-name"}
+			},
+			verify: func(t *testing.T, env *testenv.Env) {
+				_, err := env.DB.ProjectByName(context.Background(), "old-name")
+				require.NoError(t, err)
+				_, err = env.DB.ProjectByName(context.Background(), "new-name")
+				assert.ErrorIs(t, err, db.ErrNotFound)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testenv.New(t, testenv.WithAuthToken("bootstrap-token"), testenv.WithRequireTokenIdentity())
+			method, path, body := tc.setup(t, env)
+			resp, bs := envDoRaw(t, env, method, path, body,
+				map[string]string{"Authorization": "Bearer bootstrap-token"})
+			assertAPIError(t, resp.StatusCode, bs, http.StatusForbidden, "bootstrap_token_write_forbidden")
+			tc.verify(t, env)
+		})
+	}
+}
+
+func TestResolveProject_IdentityModeBootstrapCannotMutateAliases(t *testing.T) {
+	env := testenv.New(t, testenv.WithAuthToken("bootstrap-token"), testenv.WithRequireTokenIdentity())
+	project, err := env.DB.CreateProject(context.Background(), "target")
+	require.NoError(t, err)
+
+	resp, bs := envDoRaw(t, env, http.MethodPost, "/api/v1/projects/resolve",
+		map[string]any{
+			"name": "target",
+			"alias": map[string]any{
+				"identity":  "github.com/wesm/target",
+				"kind":      "git",
+				"root_path": "/client/target",
+			},
+		},
+		map[string]string{"Authorization": "Bearer bootstrap-token"})
+	assertAPIError(t, resp.StatusCode, bs, http.StatusForbidden, "bootstrap_token_write_forbidden")
+
+	aliases, err := env.DB.ProjectAliases(context.Background(), project.ID)
+	require.NoError(t, err)
+	assert.Empty(t, aliases)
+
+	resp, bs = envDoRaw(t, env, http.MethodPost, "/api/v1/projects/resolve",
+		map[string]any{"name": "target"},
+		map[string]string{"Authorization": "Bearer bootstrap-token"})
+	require.Equalf(t, http.StatusOK, resp.StatusCode, "body: %s", string(bs))
 }
 
 func TestInit_FreshCloneFromExistingKataToml(t *testing.T) {
@@ -959,6 +1045,25 @@ func TestMergeProject_SourceMovesIntoSurvivingTarget(t *testing.T) {
 	assert.Equal(t, beta.ID, issue.ProjectID, "issue moved onto target project")
 	_, err = store.ProjectByID(ctx, alpha.ID)
 	assert.ErrorIs(t, err, db.ErrNotFound)
+}
+
+func TestMergeProject_SystemProjectReturns404(t *testing.T) {
+	ts, h := startDefaultTestServer(t)
+	ctx := t.Context()
+	sys, err := h.db.SystemProject(ctx)
+	require.NoError(t, err)
+	target, err := h.db.CreateProject(ctx, "target")
+	require.NoError(t, err)
+
+	resp, bs := postJSON(t, ts, "/api/v1/projects/"+strconv.FormatInt(target.ID, 10)+"/merge", map[string]any{
+		"source_project_id": sys.ID,
+	})
+	assertAPIError(t, resp.StatusCode, bs, 404, "project_not_found")
+
+	resp, bs = postJSON(t, ts, "/api/v1/projects/"+strconv.FormatInt(sys.ID, 10)+"/merge", map[string]any{
+		"source_project_id": target.ID,
+	})
+	assertAPIError(t, resp.StatusCode, bs, 404, "project_not_found")
 }
 
 // TestRemoveProject_ArchivesAndDropsAliases pins #24's wire shape: DELETE

@@ -19,12 +19,32 @@ func TestAllSchemaTablesExist(t *testing.T) {
 	d := openTestDB(t)
 	wanted := []string{
 		"projects", "project_aliases", "issues", "comments",
-		"links", "issue_labels", "events", "purge_log",
+		"links", "issue_labels", "events", "api_tokens", "purge_log",
 		"meta", "issues_fts", "import_mappings", "recurrences",
 	}
 	for _, name := range wanted {
 		assertSchemaObject(t, d, name)
 	}
+
+	rows, err := d.QueryContext(context.Background(), `
+		SELECT name
+		  FROM sqlite_master
+		 WHERE type = 'table'
+		   AND name NOT LIKE 'sqlite_%'
+		   AND name NOT GLOB 'issues_fts_*'
+		 ORDER BY name`)
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+	expected := make(map[string]bool, len(wanted))
+	for _, name := range wanted {
+		expected[name] = true
+	}
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		assert.Truef(t, expected[name], "schema table %q is missing from TestAllSchemaTablesExist wanted list", name)
+	}
+	require.NoError(t, rows.Err())
 }
 
 func TestSchemaUIDColumnsIndexesAndTriggers(t *testing.T) {

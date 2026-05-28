@@ -88,7 +88,7 @@ func TestImportV1FillsUIDsDeterministically(t *testing.T) {
 	}
 	var schemaVersion string
 	require.NoError(t, first.QueryRow(`SELECT value FROM meta WHERE key='schema_version'`).Scan(&schemaVersion))
-	assert.Equal(t, "10", schemaVersion)
+	assert.Equal(t, "11", schemaVersion)
 }
 
 func TestImportLegacyEventSnapshotsUseFinalProjectName(t *testing.T) {
@@ -99,13 +99,13 @@ func TestImportLegacyEventSnapshotsUseFinalProjectName(t *testing.T) {
 
 	require.NoError(t, importJSONL(ctx, target,
 		validExportVersion,
-		`{"kind":"project","data":{"id":2,"identity":"github.com/example/kata","name":"kata","created_at":"2026-05-03T00:00:00.000Z","next_issue_number":2}}`,
-		`{"kind":"issue","data":{"id":1,"project_id":2,"number":1,"title":"legacy issue","body":"","status":"open","closed_reason":null,"owner":null,"author":"tester","created_at":"2026-05-03T00:00:01.000Z","updated_at":"2026-05-03T00:00:01.000Z","closed_at":null,"deleted_at":null}}`,
-		`{"kind":"event","data":{"id":1,"project_id":2,"project_identity":"github.com/example/kata","issue_id":1,"issue_number":1,"related_issue_id":null,"type":"issue.created","actor":"tester","payload":{},"created_at":"2026-05-03T00:00:01.000Z"}}`,
+		`{"kind":"project","data":{"id":3,"identity":"github.com/example/kata","name":"kata","created_at":"2026-05-03T00:00:00.000Z","next_issue_number":2}}`,
+		`{"kind":"issue","data":{"id":1,"project_id":3,"number":1,"title":"legacy issue","body":"","status":"open","closed_reason":null,"owner":null,"author":"tester","created_at":"2026-05-03T00:00:01.000Z","updated_at":"2026-05-03T00:00:01.000Z","closed_at":null,"deleted_at":null}}`,
+		`{"kind":"event","data":{"id":1,"project_id":3,"project_identity":"github.com/example/kata","issue_id":1,"issue_number":1,"related_issue_id":null,"type":"issue.created","actor":"tester","payload":{},"created_at":"2026-05-03T00:00:01.000Z"}}`,
 	))
 
 	var projectName, eventProjectName string
-	require.NoError(t, target.QueryRowContext(ctx, `SELECT name FROM projects WHERE id = 2`).Scan(&projectName))
+	require.NoError(t, target.QueryRowContext(ctx, `SELECT name FROM projects WHERE id = 3`).Scan(&projectName))
 	require.NoError(t, target.QueryRowContext(ctx, `SELECT project_name FROM events WHERE id = 1`).Scan(&eventProjectName))
 	assert.Equal(t, "kata-2", projectName)
 	assert.Equal(t, projectName, eventProjectName)
@@ -197,6 +197,84 @@ func TestImportRejectsForeignKeyViolationsListsEveryRow(t *testing.T) {
 	assert.Equal(t, 0, count)
 }
 
+func TestImportRejectsTokenCreatedMissingRequiredFields(t *testing.T) {
+	ctx := context.Background()
+	target := openImportTargetDB(t)
+
+	err := importJSONL(ctx, target,
+		`{"kind":"meta","data":{"key":"export_version","value":"11"}}`,
+		`{"kind":"project","data":{"id":1,"uid":"00000000000000000000000000","name":".kata-system","created_at":"2026-05-03T00:00:00.000Z","metadata":{},"revision":1}}`,
+		`{"kind":"event","data":{"id":1,"uid":"01HZNQ7VFPK1XGD8R5MABCD4EX","origin_instance_uid":"01HZNQ7VFPK1XGD8R5MABCD4EY","project_id":1,"project_name":".kata-system","issue_id":null,"issue_uid":null,"related_issue_id":null,"related_issue_uid":null,"type":"token.created","actor":"bootstrap","payload":{"token_id":1,"target_actor":"alice"},"created_at":"2026-05-03T00:00:01.000Z"}}`,
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "token.created")
+	assert.Contains(t, err.Error(), "missing required field")
+}
+
+func TestImportRejectsTokenRevokedForUnknownToken(t *testing.T) {
+	ctx := context.Background()
+	target := openImportTargetDB(t)
+
+	err := importJSONL(ctx, target,
+		`{"kind":"meta","data":{"key":"export_version","value":"11"}}`,
+		`{"kind":"project","data":{"id":1,"uid":"00000000000000000000000000","name":".kata-system","created_at":"2026-05-03T00:00:00.000Z","metadata":{},"revision":1}}`,
+		`{"kind":"event","data":{"id":1,"uid":"01HZNQ7VFPK1XGD8R5MABCD4EX","origin_instance_uid":"01HZNQ7VFPK1XGD8R5MABCD4EY","project_id":1,"project_name":".kata-system","issue_id":null,"issue_uid":null,"related_issue_id":null,"related_issue_uid":null,"type":"token.revoked","actor":"bootstrap","payload":{"token_id":99},"created_at":"2026-05-03T00:00:01.000Z"}}`,
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "token.revoked 99")
+	assert.Contains(t, err.Error(), "token not found")
+}
+
+func TestImportRejectsTokenEventsOutsideSystemProject(t *testing.T) {
+	ctx := context.Background()
+	target := openImportTargetDB(t)
+
+	err := importJSONL(ctx, target,
+		`{"kind":"meta","data":{"key":"export_version","value":"11"}}`,
+		`{"kind":"project","data":{"id":1,"uid":"01HZNQ7VFPK1XGD8R5MABCD4EZ","name":"normal","created_at":"2026-05-03T00:00:00.000Z","metadata":{},"revision":1}}`,
+		`{"kind":"event","data":{"id":1,"uid":"01HZNQ7VFPK1XGD8R5MABCD4EX","origin_instance_uid":"01HZNQ7VFPK1XGD8R5MABCD4EY","project_id":1,"project_name":"normal","issue_id":null,"issue_uid":null,"related_issue_id":null,"related_issue_uid":null,"type":"token.created","actor":"bootstrap","payload":{"token_id":1,"token_hash":"`+db.HashTokenForTest("evil-token")+`","target_actor":"mallory"},"created_at":"2026-05-03T00:00:01.000Z"}}`,
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "token.created")
+	assert.Contains(t, err.Error(), "system project")
+}
+
+func TestImportRejectsMalformedTokenReplayFields(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		payload     string
+		wantMessage string
+	}{
+		{
+			name:        "invalid hash",
+			payload:     `{"token_id":1,"token_hash":"not-hex","target_actor":"alice"}`,
+			wantMessage: "token_hash",
+		},
+		{
+			name:        "reserved actor",
+			payload:     `{"token_id":1,"token_hash":"` + db.HashTokenForTest("secret-token") + `","target_actor":"bootstrap"}`,
+			wantMessage: "reserved",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			target := openImportTargetDB(t)
+
+			err := importJSONL(ctx, target,
+				`{"kind":"meta","data":{"key":"export_version","value":"11"}}`,
+				`{"kind":"project","data":{"id":1,"uid":"00000000000000000000000000","name":".kata-system","created_at":"2026-05-03T00:00:00.000Z","metadata":{},"revision":1}}`,
+				`{"kind":"event","data":{"id":1,"uid":"01HZNQ7VFPK1XGD8R5MABCD4EX","origin_instance_uid":"01HZNQ7VFPK1XGD8R5MABCD4EY","project_id":1,"project_name":".kata-system","issue_id":null,"issue_uid":null,"related_issue_id":null,"related_issue_uid":null,"type":"token.created","actor":"bootstrap","payload":`+tc.payload+`,"created_at":"2026-05-03T00:00:01.000Z"}}`,
+			)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantMessage)
+		})
+	}
+}
+
 func openImportTargetDB(t *testing.T) *db.DB {
 	t.Helper()
 	d, err := db.Open(context.Background(), filepath.Join(t.TempDir(), "target.db"))
@@ -216,7 +294,11 @@ func assertTableCount(t *testing.T, src, dst *db.DB, table string) {
 func assertTableEmpty(t *testing.T, d *db.DB, table string) {
 	t.Helper()
 	var got int
-	require.NoError(t, d.QueryRow(`SELECT COUNT(*) FROM `+table).Scan(&got))
+	query := `SELECT COUNT(*) FROM ` + table
+	if table == "projects" {
+		query += ` WHERE name <> '` + db.SystemProjectName + `'`
+	}
+	require.NoError(t, d.QueryRow(query).Scan(&got))
 	assert.Equal(t, 0, got, table)
 }
 

@@ -72,6 +72,11 @@ func registerProjectsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		Method:      "POST",
 		Path:        "/api/v1/projects/resolve",
 	}, func(ctx context.Context, in *api.ResolveProjectRequest) (*api.ResolveProjectResponse, error) {
+		if resolveProjectRequestCanMutate(in) {
+			if err := ensureAttributedWriteAllowed(ctx); err != nil {
+				return nil, err
+			}
+		}
 		out, err := resolveProject(ctx, cfg.DB, in.Body.Alias, in.Body.Name, in.Body.StartPath)
 		if err != nil {
 			return nil, err
@@ -84,6 +89,9 @@ func registerProjectsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		Method:      "POST",
 		Path:        "/api/v1/projects",
 	}, func(ctx context.Context, in *api.InitProjectRequest) (*api.InitProjectResponse, error) {
+		if err := ensureAttributedWriteAllowed(ctx); err != nil {
+			return nil, err
+		}
 		out, created, err := initProject(ctx, cfg.DB, in)
 		if err != nil {
 			return nil, err
@@ -166,6 +174,9 @@ func registerProjectsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		Method:      "POST",
 		Path:        "/api/v1/projects/{project_id}/merge",
 	}, func(ctx context.Context, in *api.MergeProjectRequest) (*api.MergeProjectResponse, error) {
+		if err := ensureAttributedWriteAllowed(ctx); err != nil {
+			return nil, err
+		}
 		if in.Body.SourceProjectID == 0 {
 			return nil, api.NewError(400, "validation", "source_project_id required", "", nil)
 		}
@@ -228,11 +239,12 @@ func registerProjectsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		Method:      "DELETE",
 		Path:        "/api/v1/projects/{project_id}",
 	}, func(ctx context.Context, in *api.RemoveProjectRequest) (*api.RemoveProjectResponse, error) {
-		if err := validateActor(in.Actor); err != nil {
+		actor, err := attributedActor(ctx, in.Actor)
+		if err != nil {
 			return nil, err
 		}
 		project, evt, err := cfg.DB.RemoveProject(ctx, db.RemoveProjectParams{
-			ProjectID: in.ProjectID, Actor: in.Actor, Force: in.Force,
+			ProjectID: in.ProjectID, Actor: actor, Force: in.Force,
 		})
 		switch {
 		case errors.Is(err, db.ErrNotFound):
@@ -264,10 +276,11 @@ func registerProjectsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		Method:      "POST",
 		Path:        "/api/v1/projects/{project_id}/restore",
 	}, func(ctx context.Context, in *api.RestoreProjectRequest) (*api.RestoreProjectResponse, error) {
-		if err := validateActor(in.Actor); err != nil {
+		actor, err := attributedActor(ctx, in.Actor)
+		if err != nil {
 			return nil, err
 		}
-		project, evt, changed, err := cfg.DB.RestoreProject(ctx, in.ProjectID, in.Actor)
+		project, evt, changed, err := cfg.DB.RestoreProject(ctx, in.ProjectID, actor)
 		if errors.Is(err, db.ErrNotFound) {
 			return nil, api.NewError(404, "project_not_found", "project not found", "", nil)
 		}
@@ -290,14 +303,15 @@ func registerProjectsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		Method:      "DELETE",
 		Path:        "/api/v1/projects/{project_id}/aliases/{alias_id}",
 	}, func(ctx context.Context, in *api.DetachProjectAliasRequest) (*api.DetachProjectAliasResponse, error) {
-		if err := validateActor(in.Actor); err != nil {
+		actor, err := attributedActor(ctx, in.Actor)
+		if err != nil {
 			return nil, err
 		}
 		// (project_id, alias_id) is validated atomically inside the delete
 		// transaction so a reassignment between any preflight and the delete
 		// cannot drop an alias from a different project than the request named.
 		alias, evt, err := cfg.DB.DetachProjectAlias(ctx, db.DetachAliasParams{
-			ProjectID: in.ProjectID, AliasID: in.AliasID, Actor: in.Actor, Force: in.Force,
+			ProjectID: in.ProjectID, AliasID: in.AliasID, Actor: actor, Force: in.Force,
 		})
 		switch {
 		case errors.Is(err, db.ErrNotFound):
@@ -324,6 +338,9 @@ func registerProjectsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		Method:      "PATCH",
 		Path:        "/api/v1/projects/{project_id}",
 	}, func(ctx context.Context, in *api.RenameProjectRequest) (*api.ShowProjectResponse, error) {
+		if err := ensureAttributedWriteAllowed(ctx); err != nil {
+			return nil, err
+		}
 		name := strings.TrimSpace(in.Body.Name)
 		if err := config.ValidateProjectName(name); err != nil {
 			return nil, api.NewError(400, "validation", err.Error(), "", nil)
@@ -347,6 +364,10 @@ func registerProjectsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		out.Body.Aliases = aliases
 		return out, nil
 	})
+}
+
+func resolveProjectRequestCanMutate(in *api.ResolveProjectRequest) bool {
+	return in.Body.Alias != nil || strings.TrimSpace(in.Body.StartPath) != ""
 }
 
 // resolveProject implements project resolution. Inputs are tried in

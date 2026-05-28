@@ -39,8 +39,9 @@ type DaemonConfig struct {
 // ephemeral or CI-only tokens that should never be persisted to disk.
 // KATA_TRUST_PRIVATE_NETWORK=1 is equivalent to trust_private_network = true.
 type AuthConfig struct {
-	Token               string `toml:"token"`
-	TrustPrivateNetwork bool   `toml:"trust_private_network"`
+	Token                string `toml:"token"`
+	TrustPrivateNetwork  bool   `toml:"trust_private_network"`
+	RequireTokenIdentity bool   `toml:"require_token_identity"`
 }
 
 // TUIConfig holds TUI user preferences from <KATA_HOME>/config.toml.
@@ -113,7 +114,8 @@ func ReadDaemonConfig() (*DaemonConfig, error) {
 }
 
 func applyDaemonConfigEnv(cfg *DaemonConfig) {
-	if v := strings.TrimSpace(os.Getenv("KATA_AUTH_TOKEN")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("KATA_AUTH_TOKEN")); v != "" &&
+		(!cfg.Auth.RequireTokenIdentity || !EnvTruthy("KATA_AUTOSTART")) {
 		cfg.Auth.Token = v
 	}
 	if EnvTruthy("KATA_TRUST_PRIVATE_NETWORK") {
