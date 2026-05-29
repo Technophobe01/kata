@@ -63,6 +63,9 @@ func registerImportsHandlers(humaAPI huma.API, cfg ServerConfig) {
 			}
 			items = append(items, item)
 		}
+		if err := requireFederatedImportClaims(ctx, cfg, in.ProjectID, in.Body.Source, actor, items); err != nil {
+			return nil, err
+		}
 
 		result, events, err := cfg.DB.ImportBatch(ctx, db.ImportBatchParams{
 			ProjectID: in.ProjectID,
@@ -73,6 +76,8 @@ func registerImportsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		switch {
 		case errors.Is(err, db.ErrImportValidation):
 			return nil, api.NewError(400, "validation", err.Error(), "", nil)
+		case errors.Is(err, db.ErrFederatedReadOnly):
+			return nil, federationReadOnlyError(err)
 		case errors.Is(err, db.ErrNotFound):
 			return nil, api.NewError(404, "issue_not_found", err.Error(), "", nil)
 		case err != nil:
@@ -89,4 +94,78 @@ func registerImportsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		out.Body = result
 		return out, nil
 	})
+}
+
+func requireFederatedImportClaims(
+	ctx context.Context,
+	cfg ServerConfig,
+	projectID int64,
+	source string,
+	actor string,
+	items []db.ImportItem,
+) error {
+	binding, err := cfg.DB.FederationBindingByProject(ctx, projectID)
+	if errors.Is(err, db.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return api.NewError(500, "internal", err.Error(), "", nil)
+	}
+	if !binding.Enabled {
+		return nil
+	}
+	for _, item := range items {
+		issue, needsClaim, err := importItemNeedsFederatedClaim(ctx, cfg.DB, projectID, source, item)
+		if err != nil {
+			return err
+		}
+		if needsClaim {
+			if err := requireFederatedIssueClaim(ctx, cfg, projectID, issue, actor); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func importItemNeedsFederatedClaim(
+	ctx context.Context,
+	store *db.DB,
+	projectID int64,
+	source string,
+	item db.ImportItem,
+) (db.Issue, bool, error) {
+	mapping, err := store.ImportMappingBySource(ctx, projectID, source, "issue", item.ExternalID)
+	if errors.Is(err, db.ErrNotFound) {
+		return db.Issue{}, false, nil
+	}
+	if err != nil {
+		return db.Issue{}, false, api.NewError(500, "internal", err.Error(), "", nil)
+	}
+	if mapping.IssueID == nil {
+		return db.Issue{}, false, api.NewError(404, "issue_not_found", "import issue mapping is missing issue id", "", nil)
+	}
+	issue, err := store.IssueByID(ctx, *mapping.IssueID)
+	if errors.Is(err, db.ErrNotFound) {
+		return db.Issue{}, false, api.NewError(404, "issue_not_found", err.Error(), "", nil)
+	}
+	if err != nil {
+		return db.Issue{}, false, api.NewError(500, "internal", err.Error(), "", nil)
+	}
+	if issue.DeletedAt != nil {
+		return db.Issue{}, false, api.NewError(404, "issue_not_found", "mapped import issue is deleted", "", nil)
+	}
+	if item.UpdatedAt.After(issue.UpdatedAt) {
+		return issue, true, nil
+	}
+	for _, comment := range item.Comments {
+		_, err := store.ImportMappingBySource(ctx, projectID, source, "comment", comment.ExternalID)
+		if errors.Is(err, db.ErrNotFound) {
+			return issue, true, nil
+		}
+		if err != nil {
+			return db.Issue{}, false, api.NewError(500, "internal", err.Error(), "", nil)
+		}
+	}
+	return issue, false, nil
 }

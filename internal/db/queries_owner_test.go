@@ -20,7 +20,13 @@ func TestUpdateOwner_AssignFromNil(t *testing.T) {
 	assert.Equal(t, "alice", *updated.Owner)
 	require.NotNil(t, evt)
 	assert.Equal(t, "issue.assigned", evt.Type)
-	assert.Equal(t, `{"owner":"alice"}`, evt.Payload)
+	var payload struct {
+		Owner     string `json:"owner"`
+		UpdatedAt string `json:"updated_at"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(evt.Payload), &payload))
+	assert.Equal(t, "alice", payload.Owner)
+	assert.Equal(t, updated.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"), payload.UpdatedAt)
 }
 
 func TestUpdateOwner_UnassignFromValue(t *testing.T) {
@@ -32,7 +38,10 @@ func TestUpdateOwner_UnassignFromValue(t *testing.T) {
 	assert.Nil(t, updated.Owner)
 	require.NotNil(t, evt)
 	assert.Equal(t, "issue.unassigned", evt.Type)
-	assert.Equal(t, "{}", evt.Payload)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(evt.Payload), &payload))
+	assert.Contains(t, payload, "owner")
+	assert.Nil(t, payload["owner"])
 }
 
 func TestUpdateOwner_NoOpSameOwner(t *testing.T) {
@@ -121,4 +130,22 @@ func TestClaimOwner_ForceReassign(t *testing.T) {
 	assert.Equal(t, "agent2", *result.Issue.Owner)
 	require.NotNil(t, result.PreviousOwner)
 	assert.Equal(t, "agent1", *result.PreviousOwner)
+}
+
+func TestClaimOwner_ReadOnlyFederatedSpokeRejected(t *testing.T) {
+	d, ctx, p, i := setupTestIssue(t)
+	_, err := d.UpsertFederationBinding(ctx, db.FederationBinding{
+		ProjectID:            p.ID,
+		Role:                 db.FederationRoleSpoke,
+		HubURL:               "http://127.0.0.1:7787",
+		HubProjectID:         p.ID,
+		HubProjectUID:        p.UID,
+		ReplayHorizonEventID: 1,
+		Enabled:              true,
+		PushEnabled:          false,
+	})
+	require.NoError(t, err)
+
+	_, err = d.ClaimOwner(ctx, i.ID, "agent1", false)
+	require.ErrorIs(t, err, db.ErrFederatedReadOnly)
 }

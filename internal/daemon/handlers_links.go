@@ -33,6 +33,23 @@ func registerLinksHandlers(humaAPI huma.API, cfg ServerConfig) {
 	}, deleteLinkHandler(cfg))
 }
 
+func requireFederatedLinkClaims(ctx context.Context, cfg ServerConfig, projectID int64, actor string, issues ...db.Issue) error {
+	seen := make(map[int64]struct{}, len(issues))
+	for _, issue := range issues {
+		if _, ok := seen[issue.ID]; ok {
+			continue
+		}
+		if issue.DeletedAt != nil {
+			continue
+		}
+		seen[issue.ID] = struct{}{}
+		if err := requireFederatedIssueClaim(ctx, cfg, projectID, issue, actor); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func createLinkHandler(cfg ServerConfig) func(context.Context, *api.CreateLinkRequest) (*api.CreateLinkResponse, error) {
 	return func(ctx context.Context, in *api.CreateLinkRequest) (*api.CreateLinkResponse, error) {
 		actor, err := attributedActor(ctx, in.Body.Actor)
@@ -45,6 +62,9 @@ func createLinkHandler(cfg ServerConfig) func(context.Context, *api.CreateLinkRe
 		}
 		to, err := resolveIssueRef(ctx, cfg.DB, in.ProjectID, in.Body.ToRef, db.IncludeDeletedNo)
 		if err != nil {
+			return nil, err
+		}
+		if err := requireFederatedIssueClaim(ctx, cfg, in.ProjectID, from, actor); err != nil {
 			return nil, err
 		}
 
@@ -70,6 +90,14 @@ func createLinkHandler(cfg ServerConfig) func(context.Context, *api.CreateLinkRe
 			storageFromID, storageToID = storageToID, storageFromID
 			canonicalFromPeer, canonicalToPeer = canonicalToPeer, canonicalFromPeer
 		}
+		if existing, lookupErr := cfg.DB.LinkByEndpoints(ctx, storageFromID, storageToID, in.Body.Type); lookupErr == nil {
+			return mutationLinkResponse(from, existing, canonicalFromPeer, canonicalToPeer, nil, false), nil
+		} else if !errors.Is(lookupErr, db.ErrNotFound) {
+			return nil, api.NewError(500, "internal", lookupErr.Error(), "", nil)
+		}
+		if err := requireFederatedIssueClaim(ctx, cfg, in.ProjectID, to, actor); err != nil {
+			return nil, err
+		}
 
 		// Parent --replace path: delete the existing parent link in its own TX
 		// (emitting issue.unlinked) before inserting the new parent link. Parent
@@ -86,6 +114,9 @@ func createLinkHandler(cfg ServerConfig) func(context.Context, *api.CreateLinkRe
 				if err != nil {
 					return nil, api.NewError(500, "internal", err.Error(), "", nil)
 				}
+				if err := requireFederatedLinkClaims(ctx, cfg, in.ProjectID, actor, oldParentIssue); err != nil {
+					return nil, err
+				}
 				unlinkEv := db.LinkEventParams{
 					EventType:    "issue.unlinked",
 					EventIssueID: from.ID,
@@ -97,6 +128,9 @@ func createLinkHandler(cfg ServerConfig) func(context.Context, *api.CreateLinkRe
 				}
 				unlinkEvt, err := cfg.DB.DeleteLinkAndEvent(ctx, existing, unlinkEv)
 				if err != nil {
+					if apiErr := federationReadOnlyError(err); apiErr != nil {
+						return nil, apiErr
+					}
 					return nil, api.NewError(500, "internal", err.Error(), "", nil)
 				}
 				cfg.Broadcaster.Broadcast(StreamMsg{Kind: "event", Event: &unlinkEvt, ProjectID: in.ProjectID})
@@ -139,6 +173,8 @@ func createLinkHandler(cfg ServerConfig) func(context.Context, *api.CreateLinkRe
 			return nil, api.NewError(400, "validation", "cannot link an issue to itself", "", nil)
 		case errors.Is(err, db.ErrCrossProjectLink):
 			return nil, api.NewError(400, "validation", "cross-project links are not allowed", "", nil)
+		case errors.Is(err, db.ErrFederatedReadOnly):
+			return nil, federationReadOnlyError(err)
 		case err != nil:
 			return nil, api.NewError(500, "internal", err.Error(), "", nil)
 		}
@@ -206,6 +242,9 @@ func deleteLinkHandler(cfg ServerConfig) func(context.Context, *api.DeleteLinkRe
 		if link.FromIssueID != from.ID {
 			linkFrom, linkTo = linkTo, linkFrom
 		}
+		if err := requireFederatedLinkClaims(ctx, cfg, in.ProjectID, actor, linkFrom, linkTo); err != nil {
+			return nil, err
+		}
 		ev := db.LinkEventParams{
 			EventType:    "issue.unlinked",
 			EventIssueID: from.ID,
@@ -223,6 +262,9 @@ func deleteLinkHandler(cfg ServerConfig) func(context.Context, *api.DeleteLinkRe
 			out.Body.Event = nil
 			out.Body.Changed = false
 			return out, nil
+		}
+		if errors.Is(err, db.ErrFederatedReadOnly) {
+			return nil, federationReadOnlyError(err)
 		}
 		if err != nil {
 			return nil, api.NewError(500, "internal", err.Error(), "", nil)

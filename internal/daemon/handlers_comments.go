@@ -26,12 +26,18 @@ func registerCommentsHandlers(humaAPI huma.API, cfg ServerConfig) {
 		if err != nil {
 			return nil, err
 		}
+		if err := requireFederatedIssueClaim(ctx, cfg, in.ProjectID, issue, actor); err != nil {
+			return nil, err
+		}
 		c, evt, err := cfg.DB.CreateComment(ctx, db.CreateCommentParams{
 			IssueID: issue.ID,
 			Author:  actor,
 			Body:    in.Body.Body,
 		})
 		if err != nil {
+			if apiErr := federationReadOnlyError(err); apiErr != nil {
+				return nil, apiErr
+			}
 			return nil, api.NewError(500, "internal", err.Error(), "", nil)
 		}
 		cfg.Broadcaster.Broadcast(StreamMsg{Kind: "event", Event: &evt, ProjectID: in.ProjectID})
