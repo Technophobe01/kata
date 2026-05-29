@@ -39,9 +39,17 @@ type DaemonConfig struct {
 // ephemeral or CI-only tokens that should never be persisted to disk.
 // KATA_TRUST_PRIVATE_NETWORK=1 is equivalent to trust_private_network = true.
 type AuthConfig struct {
-	Token                string `toml:"token"`
-	TrustPrivateNetwork  bool   `toml:"trust_private_network"`
-	RequireTokenIdentity bool   `toml:"require_token_identity"`
+	Token                string      `toml:"token"`
+	TrustPrivateNetwork  bool        `toml:"trust_private_network"`
+	RequireTokenIdentity bool        `toml:"require_token_identity"`
+	Proxy                ProxyConfig `toml:"proxy"`
+}
+
+// ProxyConfig is the [auth.proxy] sub-table. Both keys empty/absent means
+// trusted-proxy actor mode is off; this is the default.
+type ProxyConfig struct {
+	TrustedActorHeader    string   `toml:"trusted_actor_header"`
+	TrustedProxyListeners []string `toml:"trusted_proxy_listeners"`
 }
 
 // TUIConfig holds TUI user preferences from <KATA_HOME>/config.toml.
@@ -86,31 +94,52 @@ func ReadDaemonConfig() (*DaemonConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	var cfg DaemonConfig
 	data, err := os.ReadFile(path) //nolint:gosec // path is derived from KATA_HOME, not user input
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			var cfg DaemonConfig
-			applyDaemonConfigEnv(&cfg)
-			return &cfg, nil
+	switch {
+	case err == nil:
+		meta, err := toml.Decode(string(data), &cfg)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
+		if u := meta.Undecoded(); len(u) > 0 {
+			keys := make([]string, len(u))
+			for i, k := range u {
+				keys[i] = k.String()
+			}
+			return nil, fmt.Errorf("parse %s: unknown key(s): %s", path, strings.Join(keys, ", "))
+		}
+		cfg.Listen = strings.TrimSpace(cfg.Listen)
+		cfg.Auth.Token = strings.TrimSpace(cfg.Auth.Token)
+		cfg.Auth.Proxy.TrustedActorHeader = strings.TrimSpace(cfg.Auth.Proxy.TrustedActorHeader)
+	case errors.Is(err, os.ErrNotExist):
+		// Absent file: fall through with zero-value cfg. Env merge and
+		// validation below still apply so an env-only misconfig is
+		// caught the same way a TOML-only one is.
+	default:
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	var cfg DaemonConfig
-	meta, err := toml.Decode(string(data), &cfg)
-	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
-	}
-	if u := meta.Undecoded(); len(u) > 0 {
-		keys := make([]string, len(u))
-		for i, k := range u {
-			keys[i] = k.String()
-		}
-		return nil, fmt.Errorf("parse %s: unknown key(s): %s", path, strings.Join(keys, ", "))
-	}
-	cfg.Listen = strings.TrimSpace(cfg.Listen)
-	cfg.Auth.Token = strings.TrimSpace(cfg.Auth.Token)
 	applyDaemonConfigEnv(&cfg)
+	if err := validateAuthProxy(cfg.Auth.Proxy); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+// validateAuthProxy rejects the dangerous partial-config case where the
+// operator names a trusted-proxy header but forgets to enumerate any trusted
+// listeners. A silent no-op there would look like proxy attribution is enabled
+// while the daemon still trusts whatever body actor a client supplied.
+//
+// The inverse (listeners without a header) is dead config — the mode stays off
+// because the header name is empty — and is accepted silently.
+func validateAuthProxy(p ProxyConfig) error {
+	if p.TrustedActorHeader != "" && len(p.TrustedProxyListeners) == 0 {
+		return errors.New(
+			"auth.proxy: trusted_actor_header is set but trusted_proxy_listeners is empty. " +
+				"Set both to enable proxy attribution, or unset the header to disable")
+	}
+	return nil
 }
 
 func applyDaemonConfigEnv(cfg *DaemonConfig) {
@@ -120,6 +149,19 @@ func applyDaemonConfigEnv(cfg *DaemonConfig) {
 	}
 	if EnvTruthy("KATA_TRUST_PRIVATE_NETWORK") {
 		cfg.Auth.TrustPrivateNetwork = true
+	}
+	if v := strings.TrimSpace(os.Getenv("KATA_TRUSTED_ACTOR_HEADER")); v != "" {
+		cfg.Auth.Proxy.TrustedActorHeader = v
+	}
+	if raw := os.Getenv("KATA_TRUSTED_PROXY_LISTENERS"); raw != "" {
+		parts := strings.Split(raw, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if t := strings.TrimSpace(p); t != "" {
+				out = append(out, t)
+			}
+		}
+		cfg.Auth.Proxy.TrustedProxyListeners = out
 	}
 }
 

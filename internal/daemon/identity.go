@@ -19,6 +19,15 @@ const (
 	// identity mode. It is not an attributed actor, but token-admin routes
 	// audit it as bootstrap/admin rather than as the target actor.
 	PrincipalStaticToken PrincipalKind = "static_token"
+	// PrincipalTrustedProxy is set by the trusted-proxy middleware when an
+	// accepted request on a trusted listener carries the configured actor
+	// header. The Principal.Actor field holds the verified header value.
+	PrincipalTrustedProxy PrincipalKind = "trusted_proxy"
+	// PrincipalTrustedProxyAbsent is set by the trusted-proxy middleware
+	// when a request on a trusted listener is missing the configured actor
+	// header (or its value is empty). Writes against this principal are
+	// rejected; reads pass through.
+	PrincipalTrustedProxyAbsent PrincipalKind = "trusted_proxy_absent"
 )
 
 // Principal is the request-local identity derived by auth middleware.
@@ -62,11 +71,19 @@ func attributedActor(ctx context.Context, requestActor string) (string, error) {
 
 func ensureAttributedWriteAllowed(ctx context.Context) error {
 	p, ok := PrincipalFromContext(ctx)
-	if !ok || p.Kind != PrincipalBootstrap {
+	if !ok {
 		return nil
 	}
-	return api.NewError(403, "bootstrap_token_write_forbidden",
-		"bootstrap token cannot perform attributed writes; use a user token", "", nil)
+	switch p.Kind {
+	case PrincipalBootstrap:
+		return api.NewError(403, "bootstrap_token_write_forbidden",
+			"bootstrap token cannot perform attributed writes; use a user token", "", nil)
+	case PrincipalTrustedProxyAbsent:
+		return api.NewError(400, "actor_header_required",
+			"actor header required on this listener but was missing or empty", "", nil)
+	default:
+		return nil
+	}
 }
 
 func ensureTokenAdminAllowed(ctx context.Context) error {
@@ -90,8 +107,11 @@ func tuiBypassAllowed(ctx context.Context, source, reason string) bool {
 	if source != "tui" || reason != "done" {
 		return false
 	}
-	if p, ok := PrincipalFromContext(ctx); ok && p.Kind == PrincipalDBToken {
-		return false
+	if p, ok := PrincipalFromContext(ctx); ok {
+		switch p.Kind {
+		case PrincipalDBToken, PrincipalTrustedProxy, PrincipalTrustedProxyAbsent:
+			return false
+		}
 	}
 	return true
 }
