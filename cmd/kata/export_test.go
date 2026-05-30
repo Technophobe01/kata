@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -36,6 +37,74 @@ func TestExportWritesJSONLToOutput(t *testing.T) {
 	assert.Contains(t, string(bs), `"kind":"meta"`)
 	assert.Contains(t, string(bs), "exported issue")
 	assert.Contains(t, out, outPath)
+}
+
+func TestExportDoesNotReplaceExistingOutputOnFailure(t *testing.T) {
+	home := setupKataEnv(t)
+	dbPath := filepath.Join(home, "kata.db")
+	ctx := context.Background()
+	d, err := db.Open(ctx, dbPath)
+	require.NoError(t, err)
+	p, err := d.CreateProject(ctx, "kata")
+	require.NoError(t, err)
+	issue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: p.ID,
+		Title:     "invalid metadata",
+		Author:    "tester",
+	})
+	require.NoError(t, err)
+	conn, err := d.Conn(ctx)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(ctx, `PRAGMA ignore_check_constraints = ON`)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(ctx, `UPDATE issues SET metadata = '{' WHERE id = ?`, issue.ID)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(ctx, `PRAGMA ignore_check_constraints = OFF`)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	require.NoError(t, d.Close())
+
+	outPath := filepath.Join(home, "export.jsonl")
+	require.NoError(t, os.WriteFile(outPath, []byte("previous backup\n"), 0o600))
+	_, err = runCmdOutput(t, nil, "export", "--output", outPath)
+	require.Error(t, err)
+
+	bs, readErr := os.ReadFile(outPath) //nolint:gosec // test fixture under TempDir
+	require.NoError(t, readErr)
+	assert.Equal(t, "previous backup\n", string(bs))
+}
+
+func TestExportReplaceOutputDoesNotDeleteExistingOutput(t *testing.T) {
+	bs, err := os.ReadFile("export.go")
+	require.NoError(t, err)
+
+	re := regexp.MustCompile(`os\.Remove\(\s*output\s*\)`)
+	assert.NotRegexp(t, re, string(bs),
+		"export replacement must not delete the existing backup before replacement succeeds")
+}
+
+func TestExportReplaceOutputUsesWindowsReplacePrimitive(t *testing.T) {
+	bs, err := os.ReadFile("export_replace_windows.go")
+	require.NoError(t, err)
+
+	assert.Contains(t, string(bs), "windows.MoveFileEx")
+	assert.Contains(t, string(bs), "windows.MOVEFILE_REPLACE_EXISTING")
+}
+
+func TestReplaceExportOutputReplacesExistingOutput(t *testing.T) {
+	dir := t.TempDir()
+	output := filepath.Join(dir, "export.jsonl")
+	tmp := filepath.Join(dir, ".export.jsonl.tmp")
+	require.NoError(t, os.WriteFile(output, []byte("old\n"), 0o600))
+	require.NoError(t, os.WriteFile(tmp, []byte("new\n"), 0o600))
+
+	require.NoError(t, replaceExportOutput(tmp, output))
+
+	bs, err := os.ReadFile(output) //nolint:gosec // test fixture under TempDir
+	require.NoError(t, err)
+	assert.Equal(t, "new\n", string(bs))
+	_, err = os.Stat(tmp)
+	assert.True(t, os.IsNotExist(err), "successful replacement must consume the temp file")
 }
 
 func TestExportAgentOutput(t *testing.T) {
