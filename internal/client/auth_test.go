@@ -223,12 +223,12 @@ func TestNewHTTPClientForTargetAllowsBearerForPrivateIPWhenAllowInsecureSet(t *t
 	assert.NotNil(t, c)
 }
 
-func TestNewHTTPClientForTargetRefusesPlaintextHostnameWithAllowInsecure(t *testing.T) {
-	_, err := NewHTTPClientForTarget(context.Background(), "http://daemon.internal:7373",
+func TestNewHTTPClientForTargetAllowsTailscaleHostnameWithAllowInsecure(t *testing.T) {
+	c, err := NewHTTPClientForTarget(context.Background(), "http://tailscale-host:7777",
 		TargetAuth{Token: "target-token", AllowInsecure: true}, Opts{})
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "literal IP")
+	require.NoError(t, err)
+	assert.NotNil(t, c)
 }
 
 func TestNewHTTPClientForTargetRefusesPlaintextHostnameWithoutAllowInsecure(t *testing.T) {
@@ -350,6 +350,39 @@ func TestNewHTTPClient_TrustPrivateNetworkRejectsPlaintextHostname(t *testing.T)
 	_, err := NewHTTPClient(context.Background(), "http://example.internal:7373", Opts{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "literal IP")
+}
+
+func TestNewHTTPClient_EnvRemoteAllowInsecureAllowsBearerOnPlaintextHostname(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("KATA_HOME", tmp)
+	t.Setenv("KATA_AUTH_TOKEN", "secret")
+	t.Setenv("KATA_TRUST_PRIVATE_NETWORK", "")
+	t.Setenv("KATA_SERVER", "http://tailscale-host:7777")
+	t.Setenv("KATA_ALLOW_INSECURE", "1")
+
+	_, err := NewHTTPClient(context.Background(), "http://tailscale-host:7777", Opts{})
+	require.NoError(t, err)
+}
+
+func TestNewHTTPClient_FileRemoteAllowInsecureAllowsBearerOnPlaintextHostname(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("KATA_HOME", tmp)
+	t.Setenv("KATA_AUTH_TOKEN", "secret")
+	t.Setenv("KATA_TRUST_PRIVATE_NETWORK", "")
+	t.Setenv("KATA_SERVER", "")
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeWorkspaceMarker(t, dir)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".kata.local.toml"),
+		[]byte(`version = 1
+[server]
+url = "http://tailscale-host:7777"
+allow_insecure = true
+`), 0o600))
+
+	_, err := NewHTTPClient(context.Background(), "http://tailscale-host:7777", Opts{})
+	require.NoError(t, err)
 }
 
 // TestNewHTTPClient_AllowsBearerOnLoopback covers the safe-target arm of
