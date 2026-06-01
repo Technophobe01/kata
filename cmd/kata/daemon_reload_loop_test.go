@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -47,7 +46,7 @@ func TestRunReloadLoop_DispatchesOnSignal(t *testing.T) {
 	path := filepath.Join(dir, "hooks.toml")
 	require.NoError(t, os.WriteFile(path, []byte(`[[hook]]
 event = "issue.created"
-command = "/bin/true"
+command = "true"
 `), 0o600))
 	rec := &recordingDispatcher{}
 	sigs := make(chan os.Signal, 1)
@@ -60,7 +59,7 @@ command = "/bin/true"
 		close(done)
 	}()
 
-	sigs <- syscall.SIGHUP
+	sigs <- os.Interrupt
 	require.Eventually(t, func() bool {
 		rec.mu.Lock()
 		defer rec.mu.Unlock()

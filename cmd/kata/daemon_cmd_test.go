@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -378,6 +380,50 @@ func TestDaemonStart_FlagWinsOverConfigFile(t *testing.T) {
 		"config.toml value must NOT win when --listen is set")
 }
 
+func TestDefaultEndpointForOS(t *testing.T) {
+	ns := &daemon.Namespace{SocketDir: t.TempDir()}
+
+	t.Run("windows uses loopback TCP", func(t *testing.T) {
+		ep := defaultEndpointForOS(ns, "windows")
+		assert.Equal(t, "tcp", ep.Kind())
+		assert.Equal(t, "127.0.0.1:0", ep.Address())
+	})
+
+	t.Run("unix uses runtime socket", func(t *testing.T) {
+		ep := defaultEndpointForOS(ns, "linux")
+		assert.Equal(t, "unix", ep.Kind())
+		assert.Equal(t, "unix://"+filepath.Join(ns.SocketDir, "daemon.sock"), ep.Address())
+	})
+}
+
+func TestRuntimeAddressForListener_UsesActualTCPPort(t *testing.T) {
+	ep := daemon.TCPEndpoint("127.0.0.1:0")
+	l, err := ep.Listen()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+
+	got := runtimeAddressForListener(ep, l)
+
+	require.NotEqual(t, ep.Address(), got)
+	host, port, err := net.SplitHostPort(got)
+	require.NoError(t, err)
+	assert.Equal(t, "127.0.0.1", host)
+	assert.NotEqual(t, "0", port)
+}
+
+func TestRuntimeAddressForListener_KeepsExplicitTCPAddress(t *testing.T) {
+	ep := daemon.TCPEndpoint("127.0.0.1:0")
+	l, err := ep.Listen()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+
+	_, actualPort, err := net.SplitHostPort(runtimeAddressForListener(ep, l))
+	require.NoError(t, err)
+	explicit := daemon.TCPEndpoint("127.0.0.1:" + actualPort)
+
+	assert.Equal(t, explicit.Address(), runtimeAddressForListener(explicit, l))
+}
+
 func TestEnsureDaemon_ReturnsExistingURL(t *testing.T) {
 	if testing.Short() {
 		t.Skip()
@@ -395,15 +441,31 @@ func TestEnsureDaemon_ReturnsExistingURL(t *testing.T) {
 
 func startSleepProcess(t *testing.T) *exec.Cmd {
 	t.Helper()
-	cmd := exec.Command("sleep", "60") //nolint:gosec // test helper starts a controlled local process
+	cmd := exec.Command(os.Args[0], "-test.run=TestDaemonCommandSleepHelperProcess", "--") //nolint:gosec // test helper starts this test binary
+	cmd.Env = append(os.Environ(), "KATA_DAEMON_CMD_SLEEP_HELPER=1")
+	stdin, err := cmd.StdinPipe()
+	require.NoError(t, err)
 	require.NoError(t, cmd.Start())
 	t.Cleanup(func() {
-		if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
+		_ = stdin.Close()
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
 			_ = cmd.Process.Kill()
+			<-done
 		}
-		_ = cmd.Wait()
 	})
 	return cmd
+}
+
+func TestDaemonCommandSleepHelperProcess(_ *testing.T) {
+	if os.Getenv("KATA_DAEMON_CMD_SLEEP_HELPER") != "1" {
+		return
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	os.Exit(0)
 }
 
 func writeRuntimePID(t *testing.T, home string, pid int) {
@@ -419,4 +481,9 @@ func writeRuntimePID(t *testing.T, home string, pid int) {
 		StartedAt: time.Now().UTC(),
 	})
 	require.NoError(t, err)
+	// On Windows, daemon stop/reload signal via per-daemon named events that
+	// a real daemon creates at startup (installStopWatcher/installReloadSource).
+	// A faked daemon PID has none, so create them here; no-op on Unix, where
+	// stop/reload deliver SIGTERM/SIGHUP straight to the PID.
+	registerDaemonSignalEndpoints(t, ns.DBHash, pid)
 }

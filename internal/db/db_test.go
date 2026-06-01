@@ -16,6 +16,8 @@ import (
 )
 
 func TestOpen_AppliesPragmasAndMigrations(t *testing.T) {
+	t.Setenv("KATA_TEST_FAST_SQLITE", "")
+
 	d := openTestDB(t)
 
 	var fk int
@@ -142,6 +144,8 @@ func TestOpen_TimestampColumnsScanIntoTime(t *testing.T) {
 }
 
 func TestCheckpointTruncatesWAL(t *testing.T) {
+	t.Setenv("KATA_TEST_FAST_SQLITE", "")
+
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "kata.db")
 	d, err := db.Open(ctx, path)
@@ -175,4 +179,26 @@ func TestCheckpointTruncatesWAL(t *testing.T) {
 	}
 	require.NoError(t, err)
 	assert.Zero(t, after.Size(), "TRUNCATE checkpoint should leave no WAL bytes")
+}
+
+func TestOpenUsesFastSQLitePragmasWhenTestHarnessRequestsIt(t *testing.T) {
+	t.Setenv("KATA_TEST_FAST_SQLITE", "1")
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "kata.db")
+	d, err := db.Open(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+
+	var mode string
+	require.NoError(t, d.QueryRow("PRAGMA journal_mode").Scan(&mode))
+	assert.Equal(t, "wal", mode)
+
+	var sync int
+	require.NoError(t, d.QueryRow("PRAGMA synchronous").Scan(&sync))
+	assert.Zero(t, sync)
+
+	var tempStore int
+	require.NoError(t, d.QueryRow("PRAGMA temp_store").Scan(&tempStore))
+	assert.Equal(t, 2, tempStore)
 }

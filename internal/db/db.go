@@ -10,7 +10,10 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver registered as "sqlite"
@@ -22,6 +25,8 @@ import (
 var schemaSQL string
 
 const currentSchemaVersion = 12
+
+const testFastSQLiteEnv = "KATA_TEST_FAST_SQLITE"
 
 // CurrentSchemaVersion returns the schema version expected by this binary.
 func CurrentSchemaVersion() int { return currentSchemaVersion }
@@ -47,9 +52,25 @@ type DB struct {
 // if the row is absent it generates one via uid.New(). The cached value is
 // exposed via InstanceUID for insert paths.
 func Open(ctx context.Context, path string) (*DB, error) {
+	synchronous := "NORMAL"
+	pragmas := []string{
+		"_pragma=foreign_keys(1)",
+		"_pragma=journal_mode(WAL)",
+	}
+	if fastSQLiteForTestHarness() {
+		synchronous = "OFF"
+		pragmas = append(pragmas,
+			"_pragma=temp_store(MEMORY)",
+		)
+	}
+	pragmas = append(pragmas,
+		fmt.Sprintf("_pragma=synchronous(%s)", synchronous),
+		"_pragma=busy_timeout(5000)",
+	)
 	dsn := fmt.Sprintf(
-		"file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)",
+		"file:%s?%s",
 		path,
+		strings.Join(pragmas, "&"),
 	)
 	sdb, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -188,6 +209,18 @@ func (d *DB) Close() error {
 		cancel()
 	}
 	return errors.Join(checkpointErr, d.DB.Close())
+}
+
+func fastSQLiteForTestHarness() bool {
+	return testHarnessEnvEnabled(testFastSQLiteEnv)
+}
+
+func testHarnessEnvEnabled(name string) bool {
+	if os.Getenv(name) != "1" {
+		return false
+	}
+	bin := strings.ToLower(filepath.Base(os.Args[0]))
+	return strings.HasSuffix(bin, ".test") || strings.HasSuffix(bin, ".test.exe")
 }
 
 // Path returns the resolved database path.

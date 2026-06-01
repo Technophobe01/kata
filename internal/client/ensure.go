@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"go.kenn.io/kata/internal/daemon"
@@ -29,6 +28,7 @@ var (
 	currentVersionForEnsure     = func() string { return version.Version }
 	startDaemonForEnsure        = autoStart
 	stopRunningDaemonsForEnsure = stopRunningDaemons
+	signalDaemonStopForEnsure   = daemon.SignalDaemonStop
 )
 
 // EnsureRunning returns a live daemon's base URL, auto-starting the daemon
@@ -86,7 +86,7 @@ func ensureLocalRunning(ctx context.Context) (string, error) {
 		if compatible {
 			return url, nil
 		}
-		if err := stopRunningDaemonsForEnsure(ctx, ns.DataDir); err != nil {
+		if err := stopRunningDaemonsForEnsure(ctx, ns.DataDir, ns.DBHash); err != nil {
 			return "", err
 		}
 		return startDaemonForEnsure(ctx, ns.DataDir)
@@ -129,7 +129,7 @@ func daemonVersionCompatible(info PingInfo) bool {
 	return info.Service == daemonServiceName && info.Version == currentVersionForEnsure()
 }
 
-func stopRunningDaemons(ctx context.Context, dataDir string) error {
+func stopRunningDaemons(ctx context.Context, dataDir, dbhash string) error {
 	recs, err := daemon.ListRuntimeFiles(dataDir)
 	if err != nil {
 		return err
@@ -145,11 +145,9 @@ func stopRunningDaemons(ctx context.Context, dataDir string) error {
 		if info.PID == 0 || info.PID != r.PID {
 			return fmt.Errorf("daemon at %s is running but its PID could not be verified; stop it manually", r.Address)
 		}
-		p, err := os.FindProcess(r.PID)
-		if err != nil {
-			continue
+		if err := signalDaemonStopForEnsure(r, dbhash); err != nil {
+			return fmt.Errorf("stop old daemon pid %d: %w", r.PID, err)
 		}
-		_ = p.Signal(syscall.SIGTERM)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -176,8 +174,18 @@ func autoStart(ctx context.Context, dataDir string) (string, error) {
 	}
 	//nolint:gosec // G204: exe is os.Executable()
 	cmd := exec.Command(exe, "daemon", "start")
-	cmd.Stdout = nil
-	cmd.Stderr = os.Stderr
+	// The auto-started daemon outlives this process, so it must not inherit
+	// our stdio. Inheriting the caller's stderr keeps that handle open after
+	// the daemon detaches, which hangs any parent that captures our output
+	// (command substitution, CI, pipelines). Send the daemon's stdout/stderr
+	// to a daemon.log file under the data dir; if that can't be opened, leave
+	// them nil so exec connects the child to the null device. Either way we
+	// never hand the daemon the caller's stderr.
+	if logw := daemonLogWriter(dataDir); logw != nil {
+		cmd.Stdout = logw
+		cmd.Stderr = logw
+		defer func() { _ = logw.Close() }() // child keeps its own handle after Start
+	}
 	// Mark the child as an implicit auto-start so it skips the PORT-env
 	// listen path (see listenFromPortEnv). The child inherits the
 	// parent's environment, so a stray PORT in a developer's shell would
@@ -205,7 +213,26 @@ func autoStart(ctx context.Context, dataDir string) (string, error) {
 	return "", errors.New("daemon failed to start within 5s")
 }
 
+// daemonLogWriter opens <dataDir>/daemon.log for the auto-started daemon's
+// stdout+stderr. Returns nil (so exec falls back to the null device) if the
+// directory or file cannot be created — the caller must never substitute its
+// own stderr, which a detached daemon would hold open and hang the caller.
+func daemonLogWriter(dataDir string) *os.File {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return nil
+	}
+	//nolint:gosec // G304: dataDir is the daemon's own data dir; filename is the fixed constant "daemon.log".
+	f, err := os.OpenFile(filepath.Join(dataDir, "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil
+	}
+	return f
+}
+
 func shouldRefuseAutoStartDaemon(exe string) bool {
 	base := filepath.Base(exe)
-	return strings.HasSuffix(base, ".test") || strings.Contains(exe, string(filepath.Separator)+"go-build")
+	// Normalize separators: on Windows the go-build temp dir is "\go-build…",
+	// but callers (and tests) may pass forward-slash paths. ToSlash makes the
+	// check work regardless of how the path was formed.
+	return strings.HasSuffix(base, ".test") || strings.Contains(filepath.ToSlash(exe), "/go-build")
 }
