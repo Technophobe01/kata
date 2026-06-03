@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.kenn.io/kata/internal/api"
 )
 
 // Issue is a strict subset of the daemon's wire shape. Labels rides on
@@ -172,6 +174,58 @@ type ResolveResp struct {
 type ProjectSummary struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
+}
+
+// InstanceInfo is the daemon instance identity returned by /api/v1/instance.
+type InstanceInfo struct {
+	InstanceUID   string   `json:"instance_uid"`
+	Version       string   `json:"version"`
+	SchemaVersion int64    `json:"schema_version"`
+	Auth          AuthInfo `json:"auth"`
+}
+
+// AuthInfo is redacted request-auth metadata returned by the daemon.
+type AuthInfo = api.AuthInfoOut
+
+// FederationStatusBody is the daemon federation status response.
+type FederationStatusBody = api.FederationStatusBody
+
+// FederationProjectStatus is one project row from the federation status API.
+type FederationProjectStatus = api.FederationProjectStatus
+
+// FederationEnrollment is the hub-created temporary enrollment token response.
+type FederationEnrollment = api.FederationEnrollmentOut
+
+// ProjectFederationMetadata is hub metadata needed to join a spoke replica.
+type ProjectFederationMetadata = api.ProjectFederationBody
+
+// FederationReplicaResult is the spoke join/adoption result response.
+type FederationReplicaResult = api.CreateFederationReplicaBody
+
+// CreateFederationReplicaInput is the spoke join/adoption request body.
+type CreateFederationReplicaInput struct {
+	HubURL                 string `json:"hub_url"`
+	HubProjectID           int64  `json:"hub_project_id"`
+	HubProjectUID          string `json:"hub_project_uid"`
+	ProjectName            string `json:"project_name"`
+	ReplayHorizonEventID   int64  `json:"replay_horizon_event_id"`
+	BaselineThroughEventID int64  `json:"baseline_through_event_id,omitempty"`
+	Token                  string `json:"token,omitempty"`
+	Capabilities           string `json:"capabilities,omitempty"`
+	Actor                  string `json:"actor,omitempty"`
+	AllowInsecure          bool   `json:"allow_insecure,omitempty"`
+	PushEnabled            bool   `json:"push_enabled,omitempty"`
+	AdoptExisting          bool   `json:"adopt_existing,omitempty"`
+}
+
+// CreateFederationEnrollmentInput is the hub enrollment creation request body.
+type CreateFederationEnrollmentInput struct {
+	SpokeInstanceUID             string `json:"spoke_instance_uid"`
+	ProjectID                    *int64 `json:"project_id"`
+	Capabilities                 string `json:"capabilities"`
+	Token                        string `json:"token,omitempty"`
+	Actor                        string `json:"actor,omitempty"`
+	AllowAdoptionSnapshotAuthors bool   `json:"allow_adoption_snapshot_authors,omitempty"`
 }
 
 // ProjectStatsSummary is the per-project aggregate carried by

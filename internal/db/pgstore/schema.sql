@@ -60,11 +60,8 @@ CREATE TABLE project_aliases (
   project_id      BIGINT NOT NULL REFERENCES projects(id),
   alias_identity  TEXT UNIQUE NOT NULL,
   alias_kind      TEXT NOT NULL CHECK(alias_kind IN ('git','local')),
-  root_path       TEXT NOT NULL,
   created_at      TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-  last_seen_at    TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-  CHECK (length(trim(alias_identity)) > 0),
-  CHECK (length(trim(root_path)) > 0)
+  CHECK (length(trim(alias_identity)) > 0)
 );
 CREATE INDEX idx_project_aliases_project ON project_aliases(project_id);
 
@@ -414,12 +411,15 @@ CREATE TABLE federation_enrollments (
   spoke_instance_uid  TEXT NOT NULL,
   project_id          BIGINT REFERENCES projects(id),
   capabilities        TEXT NOT NULL,
+  bound_actor         TEXT NOT NULL,
+  allow_adoption_snapshot_authors INTEGER NOT NULL DEFAULT 0 CHECK(allow_adoption_snapshot_authors IN (0,1)),
   created_at          TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
   updated_at          TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
   revoked_at          TEXT,
   CHECK (length(token_hash) = 64),
   CHECK (length(spoke_instance_uid) = 26),
-  CHECK (length(trim(capabilities)) > 0)
+  CHECK (length(trim(capabilities)) > 0),
+  CHECK (length(trim(bound_actor)) > 0)
 );
 CREATE INDEX idx_federation_enrollments_scope
   ON federation_enrollments(project_id, revoked_at);

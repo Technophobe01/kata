@@ -76,7 +76,7 @@ func exportSnapshot(ctx context.Context, d exportQuerier, w io.Writer, opts Expo
 		}
 	}
 	if sourceSchemaVersion >= 12 {
-		if err := exportFederationBindings(ctx, d, enc, opts); err != nil {
+		if err := exportFederationBindings(ctx, d, enc, opts, sourceSchemaVersion); err != nil {
 			return err
 		}
 	}
@@ -91,7 +91,7 @@ func exportSnapshot(ctx context.Context, d exportQuerier, w io.Writer, opts Expo
 		}
 	}
 	if sourceSchemaVersion >= 12 {
-		if err := exportFederationEnrollments(ctx, d, enc, opts); err != nil {
+		if err := exportFederationEnrollments(ctx, d, enc, opts, sourceSchemaVersion); err != nil {
 			return err
 		}
 	}
@@ -362,12 +362,10 @@ func exportProjectAliases(ctx context.Context, d exportQuerier, enc *Encoder, op
 		ProjectID     int64  `json:"project_id"`
 		AliasIdentity string `json:"alias_identity"`
 		AliasKind     string `json:"alias_kind"`
-		RootPath      string `json:"root_path"`
 		CreatedAt     string `json:"created_at"`
-		LastSeenAt    string `json:"last_seen_at"`
 	}
-	query := `SELECT id, project_id, alias_identity, alias_kind, root_path,
-	                 CAST(created_at AS TEXT), CAST(last_seen_at AS TEXT)
+	query := `SELECT id, project_id, alias_identity, alias_kind,
+	                 CAST(created_at AS TEXT)
 	          FROM project_aliases`
 	args := []any{}
 	if opts.ProjectID > 0 {
@@ -382,7 +380,7 @@ func exportProjectAliases(ctx context.Context, d exportQuerier, enc *Encoder, op
 	return scanRecords(rows, KindProjectAlias, enc, func(rows *sql.Rows) (record, error) {
 		var rec record
 		err := rows.Scan(&rec.ID, &rec.ProjectID, &rec.AliasIdentity, &rec.AliasKind,
-			&rec.RootPath, &rec.CreatedAt, &rec.LastSeenAt)
+			&rec.CreatedAt)
 		return rec, err
 	})
 }
@@ -876,7 +874,13 @@ func exportImportMappings(ctx context.Context, d exportQuerier, enc *Encoder, op
 	})
 }
 
-func exportFederationBindings(ctx context.Context, d exportQuerier, enc *Encoder, opts ExportOptions) error {
+func exportFederationBindings(
+	ctx context.Context,
+	d exportQuerier,
+	enc *Encoder,
+	opts ExportOptions,
+	sourceSchemaVersion int,
+) error {
 	type record struct {
 		ProjectID            int64   `json:"project_id"`
 		Role                 string  `json:"role"`
@@ -887,14 +891,19 @@ func exportFederationBindings(ctx context.Context, d exportQuerier, enc *Encoder
 		PullCursorEventID    int64   `json:"pull_cursor_event_id"`
 		PushEnabled          bool    `json:"push_enabled"`
 		PushCursorEventID    int64   `json:"push_cursor_event_id"`
+		Actor                string  `json:"bound_actor,omitempty"`
 		Enabled              bool    `json:"enabled"`
 		CreatedAt            string  `json:"created_at"`
 		UpdatedAt            string  `json:"updated_at"`
 		LastSyncAt           *string `json:"last_sync_at,omitempty"`
 	}
+	actorSelect := `''`
+	if sourceSchemaVersion >= 13 {
+		actorSelect = `bound_actor`
+	}
 	query := `SELECT project_id, role, hub_url, hub_project_id, hub_project_uid,
 	                 replay_horizon_event_id, pull_cursor_event_id, push_enabled,
-	                 push_cursor_event_id, enabled,
+	                 push_cursor_event_id, ` + actorSelect + `, enabled,
 	                 CAST(created_at AS TEXT), CAST(updated_at AS TEXT),
 	                 CAST(last_sync_at AS TEXT)
 	          FROM federation_bindings`
@@ -913,7 +922,7 @@ func exportFederationBindings(ctx context.Context, d exportQuerier, enc *Encoder
 		var enabled, pushEnabled int
 		err := rows.Scan(&rec.ProjectID, &rec.Role, &rec.HubURL, &rec.HubProjectID,
 			&rec.HubProjectUID, &rec.ReplayHorizonEventID, &rec.PullCursorEventID,
-			&pushEnabled, &rec.PushCursorEventID, &enabled, &rec.CreatedAt,
+			&pushEnabled, &rec.PushCursorEventID, &rec.Actor, &enabled, &rec.CreatedAt,
 			&rec.UpdatedAt, &rec.LastSyncAt)
 		rec.PushEnabled = pushEnabled == 1
 		rec.Enabled = enabled == 1
@@ -1001,18 +1010,35 @@ func exportFederationQuarantine(ctx context.Context, d exportQuerier, enc *Encod
 	})
 }
 
-func exportFederationEnrollments(ctx context.Context, d exportQuerier, enc *Encoder, opts ExportOptions) error {
+func exportFederationEnrollments(
+	ctx context.Context,
+	d exportQuerier,
+	enc *Encoder,
+	opts ExportOptions,
+	sourceSchemaVersion int,
+) error {
 	type record struct {
-		ID               int64   `json:"id"`
-		TokenHash        string  `json:"token_hash"`
-		SpokeInstanceUID string  `json:"spoke_instance_uid"`
-		ProjectID        *int64  `json:"project_id,omitempty"`
-		Capabilities     string  `json:"capabilities"`
-		CreatedAt        string  `json:"created_at"`
-		UpdatedAt        string  `json:"updated_at"`
-		RevokedAt        *string `json:"revoked_at,omitempty"`
+		ID                           int64   `json:"id"`
+		TokenHash                    string  `json:"token_hash"`
+		SpokeInstanceUID             string  `json:"spoke_instance_uid"`
+		ProjectID                    *int64  `json:"project_id,omitempty"`
+		Capabilities                 string  `json:"capabilities"`
+		Actor                        string  `json:"bound_actor,omitempty"`
+		AllowAdoptionSnapshotAuthors bool    `json:"allow_adoption_snapshot_authors,omitempty"`
+		CreatedAt                    string  `json:"created_at"`
+		UpdatedAt                    string  `json:"updated_at"`
+		RevokedAt                    *string `json:"revoked_at,omitempty"`
+	}
+	actorSelect := `''`
+	if sourceSchemaVersion >= 13 {
+		actorSelect = `bound_actor`
+	}
+	allowAdoptionSnapshotAuthorsSelect := `0`
+	if sourceSchemaVersion >= 14 {
+		allowAdoptionSnapshotAuthorsSelect = `allow_adoption_snapshot_authors`
 	}
 	query := `SELECT id, token_hash, spoke_instance_uid, project_id, capabilities,
+	                 ` + actorSelect + `, ` + allowAdoptionSnapshotAuthorsSelect + `,
 	                 CAST(created_at AS TEXT), CAST(updated_at AS TEXT), CAST(revoked_at AS TEXT)
 	          FROM federation_enrollments`
 	args := []any{}
@@ -1027,8 +1053,11 @@ func exportFederationEnrollments(ctx context.Context, d exportQuerier, enc *Enco
 	}
 	return scanRecords(rows, KindFederationEnrollment, enc, func(rows *sql.Rows) (record, error) {
 		var rec record
+		var allowAdoptionSnapshotAuthors int
 		err := rows.Scan(&rec.ID, &rec.TokenHash, &rec.SpokeInstanceUID, &rec.ProjectID,
-			&rec.Capabilities, &rec.CreatedAt, &rec.UpdatedAt, &rec.RevokedAt)
+			&rec.Capabilities, &rec.Actor, &allowAdoptionSnapshotAuthors, &rec.CreatedAt,
+			&rec.UpdatedAt, &rec.RevokedAt)
+		rec.AllowAdoptionSnapshotAuthors = allowAdoptionSnapshotAuthors != 0
 		return rec, err
 	})
 }

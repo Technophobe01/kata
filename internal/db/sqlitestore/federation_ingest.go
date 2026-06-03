@@ -58,10 +58,17 @@ func (d *Store) ingestFederationEventsOnce(
 	if err != nil {
 		return db.FederationIngestResult{}, err
 	}
+	allowSnapshotAuthorPreservation, err := allowFederationIngestSnapshotAuthorPreservation(ctx, tx,
+		p.ProjectID, p.FederationEnrollmentID, p.SpokeInstanceUID,
+		p.AllowSnapshotAuthorPreservation, p.Events)
+	if err != nil {
+		return db.FederationIngestResult{}, err
+	}
 	prepared := make([]preparedFederationIngestEvent, 0, len(p.Events))
 	result := db.FederationIngestResult{}
 	seenBatch := map[string]string{}
 	freshSnapshotSeen := false
+	boundActor := strings.TrimSpace(p.BoundActor)
 	for _, in := range p.Events {
 		if in.SourceEventID <= 0 {
 			return db.FederationIngestResult{}, fmt.Errorf("%w: source event id must be positive", db.ErrFederationIngestValidation)
@@ -75,6 +82,10 @@ func (d *Store) ingestFederationEventsOnce(
 		}
 		if err := validateFederationProjectEvent(projectUID, p.SpokeInstanceUID, ev, knownIssueUIDs, batchCreateSnapshotUIDs); err != nil {
 			return db.FederationIngestResult{}, err
+		}
+		if boundActor != "" && ev.Actor != boundActor {
+			return db.FederationIngestResult{}, fmt.Errorf("%w: event %s actor %q does not match bound actor",
+				db.ErrFederationIngestValidation, ev.EventUID, ev.Actor)
 		}
 		if err := validateFederationEventHash(ev); err != nil {
 			return db.FederationIngestResult{}, err
@@ -106,6 +117,9 @@ func (d *Store) ingestFederationEventsOnce(
 			continue
 		}
 		if !errors.Is(err, db.ErrNotFound) {
+			return db.FederationIngestResult{}, err
+		}
+		if err := validateFederationBoundActorPayload(ev, boundActor, allowSnapshotAuthorPreservation); err != nil {
 			return db.FederationIngestResult{}, err
 		}
 		if freshSnapshotSeen && ev.Type != "issue.snapshot" {
@@ -156,6 +170,10 @@ func (d *Store) ingestFederationEventsOnce(
 		if err := d.materializeFederatedProjectTx(ctx, tx, p.ProjectID); err != nil {
 			return db.FederationIngestResult{}, err
 		}
+		if err := consumeFederationAdoptionSnapshotAuthorMarker(ctx, tx,
+			p.ProjectID, p.FederationEnrollmentID, p.SpokeInstanceUID); err != nil {
+			return db.FederationIngestResult{}, err
+		}
 	}
 	if err := federationFailpoint("before_federation_ingest_commit"); err != nil {
 		return db.FederationIngestResult{}, err
@@ -164,6 +182,170 @@ func (d *Store) ingestFederationEventsOnce(
 		return db.FederationIngestResult{}, fmt.Errorf("commit federation ingest: %w", err)
 	}
 	return result, nil
+}
+
+func validateFederationBoundActorPayload(
+	ev db.RemoteEvent,
+	boundActor string,
+	allowSnapshotAuthorPreservation bool,
+) error {
+	boundActor = strings.TrimSpace(boundActor)
+	if boundActor == "" {
+		return nil
+	}
+	switch ev.Type {
+	case "issue.snapshot":
+		if allowSnapshotAuthorPreservation {
+			return nil
+		}
+		if err := validateFederationPayloadAuthor(ev, boundActor); err != nil {
+			return err
+		}
+		return validateFederationPayloadCommentAuthors(ev, boundActor)
+	case "issue.created":
+		if err := validateFederationPayloadAuthor(ev, boundActor); err != nil {
+			return err
+		}
+		return validateFederationPayloadCommentAuthors(ev, boundActor)
+	case "issue.commented":
+		return validateFederationPayloadAuthor(ev, boundActor)
+	}
+	return nil
+}
+
+func allowFederationIngestSnapshotAuthorPreservation(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID int64,
+	enrollmentID int64,
+	spokeInstanceUID string,
+	allowExplicit bool,
+	events []db.FederationIngestEvent,
+) (bool, error) {
+	// Adoption emits an initial baseline: optional project metadata followed by
+	// issue.snapshot events that preserve historical issue/comment authors. That
+	// exception must be explicitly attached to the enrollment token and is
+	// consumed with the accepted ingest transaction.
+	if !allowExplicit || enrollmentID <= 0 {
+		return false, nil
+	}
+	hasSnapshot := false
+	for _, in := range events {
+		switch in.Event.Type {
+		case "project.metadata_updated":
+			if hasSnapshot {
+				return false, nil
+			}
+		case "issue.snapshot":
+			hasSnapshot = true
+		default:
+			return false, nil
+		}
+	}
+	if !hasSnapshot {
+		return false, nil
+	}
+	prior, err := federationIngestHasPriorEvents(ctx, tx, projectID, spokeInstanceUID)
+	if err != nil {
+		return false, err
+	}
+	if prior {
+		return false, nil
+	}
+	var marker int
+	err = tx.QueryRowContext(ctx, `
+		SELECT allow_adoption_snapshot_authors
+		  FROM federation_enrollments
+		 WHERE id = ?
+		   AND spoke_instance_uid = ?
+		   AND revoked_at IS NULL
+		   AND (project_id = ? OR project_id IS NULL)`,
+		enrollmentID, spokeInstanceUID, projectID).Scan(&marker)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lookup federation adoption snapshot author marker: %w", err)
+	}
+	return marker != 0, nil
+}
+
+func federationIngestHasPriorEvents(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID int64,
+	spokeInstanceUID string,
+) (bool, error) {
+	var one int
+	err := tx.QueryRowContext(ctx, `
+		SELECT 1
+		  FROM events
+		 WHERE project_id = ?
+		   AND origin_instance_uid = ?
+		 LIMIT 1`,
+		projectID, spokeInstanceUID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lookup prior federation ingest events: %w", err)
+	}
+	return true, nil
+}
+
+func consumeFederationAdoptionSnapshotAuthorMarker(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID int64,
+	enrollmentID int64,
+	spokeInstanceUID string,
+) error {
+	if enrollmentID <= 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `
+		UPDATE federation_enrollments
+		   SET allow_adoption_snapshot_authors = 0,
+		       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		 WHERE id = ?
+		   AND spoke_instance_uid = ?
+		   AND revoked_at IS NULL
+		   AND (project_id = ? OR project_id IS NULL)
+		   AND allow_adoption_snapshot_authors = 1`,
+		enrollmentID, spokeInstanceUID, projectID)
+	if err != nil {
+		return fmt.Errorf("consume federation adoption snapshot author marker: %w", err)
+	}
+	return nil
+}
+
+func validateFederationPayloadAuthor(ev db.RemoteEvent, boundActor string) error {
+	payload := db.PayloadMap(ev.Payload)
+	author, ok := db.StringValue(payload["author"])
+	if !ok || strings.TrimSpace(author) != boundActor {
+		return fmt.Errorf("%w: event %s %s payload author %q does not match bound actor",
+			db.ErrFederationIngestValidation, ev.EventUID, ev.Type, author)
+	}
+	return nil
+}
+
+func validateFederationPayloadCommentAuthors(ev db.RemoteEvent, boundActor string) error {
+	var payload struct {
+		Comments []struct {
+			Author string `json:"author"`
+		} `json:"comments"`
+	}
+	if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+		return fmt.Errorf("%w: event %s %s payload is invalid JSON",
+			db.ErrFederationIngestValidation, ev.EventUID, ev.Type)
+	}
+	for _, comment := range payload.Comments {
+		if strings.TrimSpace(comment.Author) != boundActor {
+			return fmt.Errorf("%w: event %s %s comment payload author %q does not match bound actor",
+				db.ErrFederationIngestValidation, ev.EventUID, ev.Type, comment.Author)
+		}
+	}
+	return nil
 }
 
 func insertFederationEventTx(

@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -13,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kata/internal/api"
 	"go.kenn.io/kata/internal/config"
 	"go.kenn.io/kata/internal/db"
 	"go.kenn.io/kata/internal/testenv"
@@ -223,6 +227,31 @@ func TestFederationEnableCLIResolvesExplicitProjectFlag(t *testing.T) {
 	assert.Equal(t, db.FederationRoleHub, binding.Role)
 }
 
+func TestFederationEnableCLIRequiresExactProjectFlagName(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	project, err := env.DB.CreateProject(ctx, "team/hub-project")
+	require.NoError(t, err)
+
+	_, _, err = runCmdCapture(t, env, "federation", "enable", "--project", "hub-project")
+
+	ce := requireCLIError(t, err, ExitNotFound)
+	assert.Contains(t, ce.Message, "project hub-project is not registered")
+	_, err = env.DB.FederationBindingByProject(ctx, project.ID)
+	assert.ErrorIs(t, err, db.ErrNotFound)
+}
+
+func TestFederationEnableCLIDoesNotCreateProjectFromProjectFlag(t *testing.T) {
+	env := testenv.New(t)
+
+	_, _, err := runCmdCapture(t, env, "federation", "enable", "--project", "missing-project")
+
+	ce := requireCLIError(t, err, ExitNotFound)
+	assert.Contains(t, ce.Message, "project missing-project is not registered")
+	_, err = env.DB.ProjectByName(context.Background(), "missing-project")
+	assert.ErrorIs(t, err, db.ErrNotFound)
+}
+
 func TestFederationEnableCLIRejectsSpokeProject(t *testing.T) {
 	env := testenv.New(t)
 	ctx := context.Background()
@@ -248,27 +277,395 @@ func TestFederationEnableCLIRejectsSpokeProject(t *testing.T) {
 func TestFederationEnrollCLIPrintsJoinCommand(t *testing.T) {
 	env, dir, pid := setupCLIWorkspace(t)
 	runCLI(t, env, dir, "federation", "enable")
-	spokeUID := "01HZNQ7VFPK1XGD8R5MABCD4EF"
+	spokeUID := env.DB.InstanceUID()
 	savedArgs := os.Args
 	os.Args = []string{"/opt/kata-fedlab"}
 	t.Cleanup(func() { os.Args = savedArgs })
 
 	out := runCLI(t, env, dir, "federation", "enroll",
 		"--spoke-instance", spokeUID,
-		"--hub-url", "http://100.64.0.5:7787")
+		"--hub-url", env.URL,
+		"--actor", "wesm")
 
 	assert.Contains(t, out, "enrolled "+spokeUID+" for kata")
 	assert.Contains(t, out, "kata-fedlab federation join")
 	assert.NotContains(t, out, "/opt/kata-fedlab federation join")
 	assert.NotContains(t, out, "join: kata federation join")
-	assert.Contains(t, out, "--hub-url http://100.64.0.5:7787")
+	assert.Contains(t, out, "--hub-url "+env.URL)
 	assert.Contains(t, out, "--hub-project-id "+strconv.FormatInt(pid, 10))
 	assert.Contains(t, out, "--project kata")
+	assert.Contains(t, out, "--actor wesm")
 	assert.NotContains(t, out, "--hub-project-uid")
 	assert.NotContains(t, out, "--replay-horizon")
 	assert.NotContains(t, out, "--baseline-through")
 	assert.Contains(t, out, "--push")
+	assert.Contains(t, out, "--adopt-existing")
 	assert.Contains(t, out, "--token ")
+}
+
+func TestFederationEnrollCLIUsesHubURLForEnrollmentAndDefaultDaemonForAdoption(t *testing.T) {
+	resetFlags(t)
+	hub := testenv.New(t, testenv.WithAuthToken("hub-token"))
+	spoke := testenv.New(t)
+	ctx := context.Background()
+	spokeProject, err := spoke.DB.CreateProject(ctx, "fedlab")
+	require.NoError(t, err)
+	spokeUID := spoke.DB.InstanceUID()
+
+	cmd := newRootCmd()
+	var buf strings.Builder
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--project", "fedlab",
+		"federation", "enroll",
+		"--spoke-instance", spokeUID,
+		"--hub-url", hub.URL,
+		"--actor", "wesm",
+	})
+	cmd.SetContext(contextWithBaseURL(ctx, spoke.URL))
+
+	require.NoError(t, cmd.Execute())
+	out := buf.String()
+	assert.Contains(t, out, "--hub-url "+hub.URL)
+	assert.Contains(t, out, "--adopt-existing")
+
+	hubProject, err := hub.DB.ProjectByName(ctx, "fedlab")
+	require.NoError(t, err)
+	hubBinding, err := hub.DB.FederationBindingByProject(ctx, hubProject.ID)
+	require.NoError(t, err)
+	assert.Equal(t, db.FederationRoleHub, hubBinding.Role)
+	enrollments, err := hub.DB.ListFederationEnrollments(ctx)
+	require.NoError(t, err)
+	require.Len(t, enrollments, 1)
+	require.NotNil(t, enrollments[0].ProjectID)
+	assert.Equal(t, hubProject.ID, *enrollments[0].ProjectID)
+	assert.True(t, enrollments[0].AllowAdoptionSnapshotAuthors)
+
+	_, err = spoke.DB.FederationBindingByProject(ctx, spokeProject.ID)
+	assert.ErrorIs(t, err, db.ErrNotFound)
+}
+
+func TestFederationEnrollCLIUsesKATAServerAsSpokeForAdoption(t *testing.T) {
+	resetFlags(t)
+	hub := testenv.New(t, testenv.WithAuthToken("hub-token"))
+	spoke := testenv.New(t)
+	t.Setenv("KATA_SERVER", spoke.URL)
+	ctx := context.Background()
+	_, err := spoke.DB.CreateProject(ctx, "fedlab")
+	require.NoError(t, err)
+
+	cmd := newRootCmd()
+	var buf strings.Builder
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--project", "fedlab",
+		"federation", "enroll",
+		"--spoke-instance", spoke.DB.InstanceUID(),
+		"--hub-url", hub.URL,
+		"--actor", "wesm",
+	})
+
+	require.NoError(t, cmd.Execute())
+	out := buf.String()
+	assert.Contains(t, out, "--hub-url "+hub.URL)
+	assert.Contains(t, out, "--adopt-existing")
+
+	hubProject, err := hub.DB.ProjectByName(ctx, "fedlab")
+	require.NoError(t, err)
+	enrollments, err := hub.DB.ListFederationEnrollments(ctx)
+	require.NoError(t, err)
+	require.Len(t, enrollments, 1)
+	require.NotNil(t, enrollments[0].ProjectID)
+	assert.Equal(t, hubProject.ID, *enrollments[0].ProjectID)
+	assert.True(t, enrollments[0].AllowAdoptionSnapshotAuthors)
+}
+
+func TestFederationEnrollCLISameNameAutoAdoptionRequiresMatchingSpokeInstance(t *testing.T) {
+	resetFlags(t)
+	hub := testenv.New(t, testenv.WithAuthToken("hub-token"))
+	spoke := testenv.New(t)
+	t.Setenv("KATA_SERVER", spoke.URL)
+	ctx := context.Background()
+	_, err := spoke.DB.CreateProject(ctx, "fedlab")
+	require.NoError(t, err)
+	otherSpokeUID, err := katauid.New()
+	require.NoError(t, err)
+	require.NotEqual(t, spoke.DB.InstanceUID(), otherSpokeUID)
+
+	cmd := newRootCmd()
+	var buf strings.Builder
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--project", "fedlab",
+		"federation", "enroll",
+		"--spoke-instance", otherSpokeUID,
+		"--hub-url", hub.URL,
+		"--actor", "operator",
+	})
+
+	require.NoError(t, cmd.Execute())
+	out := buf.String()
+	assert.NotContains(t, out, "--adopt-existing")
+
+	enrollments, err := hub.DB.ListFederationEnrollments(ctx)
+	require.NoError(t, err)
+	require.Len(t, enrollments, 1)
+	assert.False(t, enrollments[0].AllowAdoptionSnapshotAuthors)
+}
+
+func TestFederationEnrollCLIAutoAdoptionRequiresExactSpokeProjectName(t *testing.T) {
+	resetFlags(t)
+	hub := testenv.New(t, testenv.WithAuthToken("hub-token"))
+	spoke := testenv.New(t)
+	t.Setenv("KATA_SERVER", spoke.URL)
+	ctx := context.Background()
+	_, err := spoke.DB.CreateProject(ctx, "workspace:fedlab")
+	require.NoError(t, err)
+
+	cmd := newRootCmd()
+	var buf strings.Builder
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--project", "fedlab",
+		"federation", "enroll",
+		"--spoke-instance", spoke.DB.InstanceUID(),
+		"--hub-url", hub.URL,
+		"--actor", "operator",
+	})
+
+	require.NoError(t, cmd.Execute())
+	out := buf.String()
+	assert.NotContains(t, out, "--adopt-existing")
+
+	enrollments, err := hub.DB.ListFederationEnrollments(ctx)
+	require.NoError(t, err)
+	require.Len(t, enrollments, 1)
+	assert.False(t, enrollments[0].AllowAdoptionSnapshotAuthors)
+}
+
+func TestFederationEnrollCLIExplicitAdoptExistingMarksEnrollmentWithoutSameNameSpokeProject(t *testing.T) {
+	resetFlags(t)
+	hub := testenv.New(t, testenv.WithAuthToken("hub-token"))
+	spoke := testenv.New(t)
+	t.Setenv("KATA_SERVER", spoke.URL)
+	ctx := context.Background()
+	_, err := spoke.DB.CreateProject(ctx, "local-project")
+	require.NoError(t, err)
+
+	cmd := newRootCmd()
+	var buf strings.Builder
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--project", "hub-project",
+		"federation", "enroll",
+		"--spoke-instance", spoke.DB.InstanceUID(),
+		"--hub-url", hub.URL,
+		"--actor", "wesm",
+		"--adopt-existing",
+	})
+
+	require.NoError(t, cmd.Execute())
+	out := buf.String()
+	assert.Contains(t, out, "--project hub-project")
+	assert.Contains(t, out, "--adopt-existing")
+
+	hubProject, err := hub.DB.ProjectByName(ctx, "hub-project")
+	require.NoError(t, err)
+	enrollments, err := hub.DB.ListFederationEnrollments(ctx)
+	require.NoError(t, err)
+	require.Len(t, enrollments, 1)
+	require.NotNil(t, enrollments[0].ProjectID)
+	assert.Equal(t, hubProject.ID, *enrollments[0].ProjectID)
+	assert.True(t, enrollments[0].AllowAdoptionSnapshotAuthors)
+}
+
+func TestFederationEnrollCLIAdoptExistingRequiresPushCapability(t *testing.T) {
+	resetFlags(t)
+	hub := testenv.New(t, testenv.WithAuthToken("hub-token"))
+	spoke := testenv.New(t)
+	t.Setenv("KATA_SERVER", spoke.URL)
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{
+		"--project", "hub-project",
+		"federation", "enroll",
+		"--spoke-instance", spoke.DB.InstanceUID(),
+		"--hub-url", hub.URL,
+		"--actor", "wesm",
+		"--capabilities", "pull",
+		"--adopt-existing",
+	})
+
+	err := cmd.Execute()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--adopt-existing requires push capability")
+}
+
+func TestFederationEnrollCLICreatesMissingProjectFromProjectFlag(t *testing.T) {
+	env := testenv.New(t)
+	dir := t.TempDir()
+	spokeUID := "01HZNQ7VFPK1XGD8R5MABCD4EF"
+
+	out := runCLI(t, env, dir,
+		"--project", "new-hub-project",
+		"federation", "enroll",
+		"--spoke-instance", spokeUID,
+		"--hub-url", env.URL,
+		"--actor", "wesm")
+
+	assert.Contains(t, out, "enrolled "+spokeUID+" for new-hub-project")
+	assert.Contains(t, out, "--project new-hub-project")
+	project, err := env.DB.ProjectByName(context.Background(), "new-hub-project")
+	require.NoError(t, err)
+	binding, err := env.DB.FederationBindingByProject(context.Background(), project.ID)
+	require.NoError(t, err)
+	assert.Equal(t, db.FederationRoleHub, binding.Role)
+	enrollments, err := env.DB.ListFederationEnrollments(context.Background())
+	require.NoError(t, err)
+	require.Len(t, enrollments, 1)
+	require.NotNil(t, enrollments[0].ProjectID)
+	assert.Equal(t, project.ID, *enrollments[0].ProjectID)
+	assert.Equal(t, "wesm", enrollments[0].Actor)
+}
+
+func TestFederationEnrollHTTPClientRequiresExplicitAllowInsecureForPlaintextHostname(t *testing.T) {
+	t.Setenv("KATA_AUTH_TOKEN", "hub-token")
+
+	client, err := federationEnrollHTTPClient(context.Background(), "http://hub.internal:7787", false)
+
+	require.Error(t, err)
+	assert.Nil(t, client)
+	assert.Contains(t, err.Error(), "refusing to attach bearer token")
+}
+
+func TestFederationEnrollCLIExplicitAllowInsecurePrintsJoinFlag(t *testing.T) {
+	env, dir, _ := setupCLIWorkspace(t)
+	spokeUID := "01HZNQ7VFPK1XGD8R5MABCD4EF"
+
+	out := runCLI(t, env, dir,
+		"federation", "enroll",
+		"--spoke-instance", spokeUID,
+		"--hub-url", env.URL,
+		"--actor", "wesm",
+		"--allow-insecure")
+
+	assert.Contains(t, out, "--allow-insecure")
+}
+
+func TestFederationEnrollCLIPlaintextBearerErrorMentionsAllowInsecure(t *testing.T) {
+	env, dir, _ := setupCLIWorkspace(t)
+	t.Setenv("KATA_AUTH_TOKEN", "hub-token")
+
+	_, err := runCLICapture(t, env, dir,
+		"--project", "fedlab",
+		"federation", "enroll",
+		"--spoke-instance", "01HZNQ7VFPK1XGD8R5MABCD4EF",
+		"--hub-url", "http://8.8.8.8:7787",
+		"--actor", "wesm")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to attach bearer token")
+	assert.Contains(t, err.Error(), "--allow-insecure")
+}
+
+func TestFederationEnrollHTTPClientAllowsExplicitInsecurePlaintext(t *testing.T) {
+	t.Setenv("KATA_AUTH_TOKEN", "hub-token")
+
+	client, err := federationEnrollHTTPClient(context.Background(), "http://8.8.8.8:7787", true)
+
+	require.NoError(t, err)
+	require.NotNil(t, client)
+}
+
+func TestResolveFederationProjectUsesProvidedClientForWorkspaceResolution(t *testing.T) {
+	resetFlags(t)
+	t.Setenv("KATA_AUTH_TOKEN", "hub-token")
+	flags.Workspace = t.TempDir()
+	baseURL := "http://hub.internal:7777"
+	called := false
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		called = true
+		assert.Equal(t, http.MethodPost, req.Method)
+		assert.Equal(t, baseURL+"/api/v1/projects/resolve", req.URL.String())
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"project":{"id":42,"name":"spoke-project"},"workspace_root":""}`)),
+			Request: req,
+		}, nil
+	})}
+
+	project, err := resolveFederationProject(context.Background(), client, baseURL, nil, false)
+
+	require.NoError(t, err)
+	assert.True(t, called)
+	assert.Equal(t, projectRef{ID: 42, Name: "spoke-project"}, project)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func TestFederationSpokeProjectExistsDoesNotAttachHubTokenToSpokeProbe(t *testing.T) {
+	t.Setenv("KATA_AUTH_TOKEN", "hub-token")
+	var seenAuth []string
+	spoke := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/ping":
+			_, _ = w.Write([]byte(`{"ok":true,"service":"kata","version":"test"}`))
+		case "/api/v1/projects":
+			seenAuth = append(seenAuth, r.Header.Get("Authorization"))
+			_, _ = w.Write([]byte(`{"projects":[{"id":1,"name":"fedlab"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(spoke.Close)
+
+	exists := federationSpokeProjectExists(contextWithBaseURL(context.Background(), spoke.URL), "fedlab", "")
+
+	require.True(t, exists)
+	require.NotEmpty(t, seenAuth)
+	assert.Equal(t, []string{""}, seenAuth)
+}
+
+func TestFederationSpokeProjectExistsUsesReadonlyGETProbe(t *testing.T) {
+	spokeUID := "01HZNQ7VFPK1XGD8R5MABCD4EF"
+	var seenMethods []string
+	spoke := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethods = append(seenMethods, r.Method+" "+r.URL.Path)
+		if r.Method != http.MethodGet {
+			http.Error(w, "readonly", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/v1/ping":
+			_, _ = w.Write([]byte(`{"ok":true,"service":"kata","version":"test"}`))
+		case "/api/v1/instance":
+			_, _ = w.Write([]byte(`{"instance_uid":"` + spokeUID + `"}`))
+		case "/api/v1/projects":
+			_, _ = w.Write([]byte(`{"projects":[{"id":1,"name":"fedlab"},{"id":2,"name":"workspace:other"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(spoke.Close)
+
+	exists := federationSpokeProjectExists(contextWithBaseURL(context.Background(), spoke.URL), "fedlab", spokeUID)
+
+	require.True(t, exists)
+	assert.Equal(t, []string{
+		"GET /api/v1/instance",
+		"GET /api/v1/projects",
+	}, seenMethods)
 }
 
 func TestFederationEnrollCLIRequiresPullCapabilityForJoinCommand(t *testing.T) {
@@ -288,7 +685,8 @@ func TestFederationEnrollCLIUsesResolvedActorWhenAutoEnabling(t *testing.T) {
 
 	runCLI(t, env, dir, "--as", "alice", "federation", "enroll",
 		"--spoke-instance", "01HZNQ7VFPK1XGD8R5MABCD4EF",
-		"--hub-url", "http://100.64.0.5:7787")
+		"--hub-url", env.URL,
+		"--actor", "alice")
 
 	events, err := env.DB.EventsAfter(context.Background(), db.EventsAfterParams{
 		ProjectID: pid,
@@ -310,6 +708,7 @@ func TestFederationJoinCLIRequiresPullCapability(t *testing.T) {
 		"--hub-project-uid", "01HZNQ7VFPK1XGD8R5MABCD4EG",
 		"--replay-horizon", "7",
 		"--token", "join-token",
+		"--actor", "tester",
 		"--capabilities", "lease")
 
 	require.Error(t, err)
@@ -326,6 +725,7 @@ func TestFederationJoinCLIRequiresPushCapabilityWhenPushEnabled(t *testing.T) {
 		"--hub-project-uid", "01HZNQ7VFPK1XGD8R5MABCD4EG",
 		"--replay-horizon", "7",
 		"--token", "join-token",
+		"--actor", "tester",
 		"--capabilities", "pull,lease",
 		"--push")
 
@@ -343,6 +743,7 @@ func TestFederationJoinCLIAdoptExistingRequiresPush(t *testing.T) {
 		"--hub-project-uid", "01HZNQ7VFPK1XGD8R5MABCD4EG",
 		"--replay-horizon", "7",
 		"--token", "join-token",
+		"--actor", "tester",
 		"--adopt-existing")
 
 	require.Error(t, err)
@@ -359,6 +760,7 @@ func TestFederationJoinCLIAdoptExistingRequiresPushCapability(t *testing.T) {
 		"--hub-project-uid", "01HZNQ7VFPK1XGD8R5MABCD4EG",
 		"--replay-horizon", "7",
 		"--token", "join-token",
+		"--actor", "tester",
 		"--adopt-existing",
 		"--push",
 		"--capabilities", "pull,lease")
@@ -379,6 +781,7 @@ func TestFederationJoinCLICreatesPushEnabledReplicaAndCredential(t *testing.T) {
 		"--replay-horizon", "7",
 		"--baseline-through", "9",
 		"--token", "join-token",
+		"--actor", "wesm",
 		"--push")
 
 	assert.Contains(t, out, "joined federation project fedlab")
@@ -389,11 +792,63 @@ func TestFederationJoinCLICreatesPushEnabledReplicaAndCredential(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, db.FederationRoleSpoke, binding.Role)
 	assert.True(t, binding.PushEnabled)
+	assert.Equal(t, "wesm", binding.Actor)
 	assert.Equal(t, int64(42), binding.HubProjectID)
 	creds, err := config.ReadFederationCredentials()
 	require.NoError(t, err)
 	assert.Equal(t, "join-token", creds.Projects[project.UID].Token)
 	assert.Equal(t, "claim,pull,push", creds.Projects[project.UID].Capabilities)
+	assert.Equal(t, "wesm", creds.Projects[project.UID].Actor)
+}
+
+func TestFederationJoinCLIPersistsAllowInsecureCredential(t *testing.T) {
+	env := testenv.New(t)
+	hubProjectUID := "01HZNQ7VFPK1XGD8R5MABCD4EG"
+
+	out := requireCmdOutput(t, env, "federation", "join",
+		"--project", "fedlab",
+		"--hub-url", "http://tailnet-hub.internal:7787",
+		"--hub-project-id", "42",
+		"--hub-project-uid", hubProjectUID,
+		"--replay-horizon", "7",
+		"--token", "join-token",
+		"--actor", "wesm",
+		"--allow-insecure")
+
+	assert.Contains(t, out, "joined federation project fedlab")
+	creds, err := config.ReadFederationCredentials()
+	require.NoError(t, err)
+	got := creds.Projects[hubProjectUID]
+	assert.Equal(t, "http://tailnet-hub.internal:7787", got.HubURL)
+	assert.True(t, got.AllowInsecure)
+}
+
+func TestHydrateFederationJoinMetadataAllowsPlaintextHostnameWithOptIn(t *testing.T) {
+	orig := fetchFederationJoinMetadata
+	t.Cleanup(func() { fetchFederationJoinMetadata = orig })
+	fetchFederationJoinMetadata = func(_ context.Context, bundle federationJoinBundle) (api.ProjectFederationBody, error) {
+		assert.Equal(t, "http://tailnet-hub.internal:7787", bundle.HubURL)
+		assert.Equal(t, int64(42), bundle.HubProjectID)
+		assert.Equal(t, "join-token", bundle.Token)
+		assert.True(t, bundle.AllowInsecure)
+		return api.ProjectFederationBody{
+			ProjectID:              42,
+			ProjectUID:             "01HZNQ7VFPK1XGD8R5MABCD4EG",
+			ProjectName:            "fedlab",
+			ReplayHorizonEventID:   7,
+			BaselineThroughEventID: 9,
+		}, nil
+	}
+
+	bundle := federationJoinBundle{
+		HubURL:        "http://tailnet-hub.internal:7787",
+		HubProjectID:  42,
+		Token:         "join-token",
+		AllowInsecure: true,
+	}
+	err := hydrateFederationJoinMetadata(context.Background(), &bundle)
+	require.NoError(t, err)
+	assert.Equal(t, "01HZNQ7VFPK1XGD8R5MABCD4EG", bundle.HubProjectUID)
 }
 
 func TestFederationJoinCLIAdoptExistingOutput(t *testing.T) {
@@ -417,6 +872,7 @@ func TestFederationJoinCLIAdoptExistingOutput(t *testing.T) {
 		"--replay-horizon", "7",
 		"--baseline-through", "9",
 		"--token", "join-token",
+		"--actor", "tester",
 		"--push",
 		"--adopt-existing")
 
@@ -447,6 +903,7 @@ func TestFederationJoinCLIAgentOutputIncludesAdoptionFields(t *testing.T) {
 		"--replay-horizon", "7",
 		"--baseline-through", "9",
 		"--token", "join-token",
+		"--actor", "tester",
 		"--push",
 		"--adopt-existing")
 
@@ -467,6 +924,7 @@ func TestFederationJoinCLIFetchesMissingHubMetadata(t *testing.T) {
 		SpokeInstanceUID: spoke.DB.InstanceUID(),
 		ProjectID:        &hubProject.ID,
 		Capabilities:     "pull,push,claim",
+		Actor:            "tester",
 	})
 	require.NoError(t, err)
 
@@ -475,6 +933,7 @@ func TestFederationJoinCLIFetchesMissingHubMetadata(t *testing.T) {
 		"--hub-url", hub.URL,
 		"--hub-project-id", strconv.FormatInt(hubProject.ID, 10),
 		"--token", created.Token,
+		"--actor", "tester",
 		"--push")
 
 	assert.Contains(t, out, "joined federation project fedlab")
@@ -498,6 +957,7 @@ func TestFederationJoinCLIWarnsWhenPushCapabilityIsNotEnabledLocally(t *testing.
 		"--replay-horizon", "7",
 		"--baseline-through", "9",
 		"--token", "join-token",
+		"--actor", "tester",
 		"--capabilities", "pull,push,lease")
 
 	require.NoError(t, err)
@@ -516,6 +976,7 @@ func TestFederationEnrollmentsListCLIShowsHubEnrollments(t *testing.T) {
 		SpokeInstanceUID: "01HZNQ7VFPK1XGD8R5MABCD4EF",
 		ProjectID:        &project.ID,
 		Capabilities:     "pull,push,claim",
+		Actor:            "tester",
 	})
 	require.NoError(t, err)
 
@@ -523,7 +984,7 @@ func TestFederationEnrollmentsListCLIShowsHubEnrollments(t *testing.T) {
 
 	assert.Contains(t, out, "01HZNQ7VFPK1XGD8R5MABCD4EF")
 	assert.Contains(t, out, "project: "+strconv.FormatInt(project.ID, 10))
-	assert.Contains(t, out, "capabilities: lease,pull,push")
+	assert.Contains(t, out, "capabilities: pull,push,lease")
 	assert.Contains(t, out, "active")
 	assert.NotContains(t, out, "list-token")
 }
@@ -535,6 +996,7 @@ func TestFederationRevokeCLIRevokesEnrollment(t *testing.T) {
 		Token:            "revoke-token",
 		SpokeInstanceUID: "01HZNQ7VFPK1XGD8R5MABCD4EF",
 		Capabilities:     "pull",
+		Actor:            "tester",
 	})
 	require.NoError(t, err)
 
@@ -561,6 +1023,7 @@ func setupFederationStatusCLIState(t *testing.T) (*testenv.Env, db.Project) {
 		ReplayHorizonEventID: 9,
 		PullCursorEventID:    12,
 		PushEnabled:          true,
+		Actor:                "tester",
 		PushCursorEventID:    0,
 		Enabled:              true,
 	})

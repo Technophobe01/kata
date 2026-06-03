@@ -37,10 +37,18 @@ type HealthResponse struct {
 // further calls.
 type InstanceResponse struct {
 	Body struct {
-		InstanceUID   string `json:"instance_uid"`
-		Version       string `json:"version"`
-		SchemaVersion int64  `json:"schema_version"`
+		InstanceUID   string      `json:"instance_uid"`
+		Version       string      `json:"version"`
+		SchemaVersion int64       `json:"schema_version"`
+		Auth          AuthInfoOut `json:"auth"`
 	}
+}
+
+// AuthInfoOut is redacted request-auth metadata for the current request.
+// It never includes bearer token plaintext or token hashes.
+type AuthInfoOut struct {
+	Kind  string `json:"kind"`
+	Actor string `json:"actor,omitempty"`
 }
 
 // CreateTokenRequest is POST /api/v1/tokens.
@@ -198,7 +206,6 @@ type ResolveProjectResponse struct {
 type AliasInput struct {
 	Identity string `json:"identity" doc:"alias identity (normalized git remote or local://<abs>)"`
 	Kind     string `json:"kind" doc:"\"git\" or \"local\""`
-	RootPath string `json:"root_path" doc:"client-side path the alias roots at; daemon stores but never stats"`
 }
 
 // InitProjectRequest is POST /api/v1/projects (used by `kata init`).

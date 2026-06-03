@@ -25,6 +25,13 @@ type Client struct {
 // base is the daemon URL — "http://kata.invalid" for unix-socket transport.
 func NewClient(base string, hc *http.Client) *Client { return &Client{base: base, hc: hc} }
 
+// GetInstance returns the daemon instance identity and schema version.
+func (c *Client) GetInstance(ctx context.Context) (InstanceInfo, error) {
+	var resp InstanceInfo
+	err := c.do(ctx, http.MethodGet, "/api/v1/instance", nil, &resp)
+	return resp, err
+}
+
 // ListIssues returns the issues for projectID filtered by f.
 func (c *Client) ListIssues(ctx context.Context, projectID int64, f ListFilter) ([]Issue, error) {
 	return c.listIssuesAt(ctx, fmt.Sprintf("/api/v1/projects/%d/issues", projectID), f)
@@ -290,9 +297,8 @@ func buildResolveRequest(ctx context.Context, startPath string) (map[string]any,
 // this file).
 func aliasInputBody(info config.AliasInfo) map[string]any {
 	return map[string]any{
-		"identity":  info.Identity,
-		"kind":      info.Kind,
-		"root_path": info.RootPath,
+		"identity": info.Identity,
+		"kind":     info.Kind,
 	}
 }
 
@@ -319,6 +325,55 @@ func (c *Client) ListProjects(ctx context.Context) ([]ProjectSummary, error) {
 		return nil, err
 	}
 	return resp.Projects, nil
+}
+
+// EnsureProject creates or returns a project by name on the target daemon.
+func (c *Client) EnsureProject(ctx context.Context, name string) (ProjectSummary, error) {
+	var resp struct {
+		Project ProjectSummary `json:"project"`
+	}
+	err := c.do(ctx, http.MethodPost, "/api/v1/projects", map[string]string{"name": name}, &resp)
+	return resp.Project, err
+}
+
+// FederationStatus returns redacted federation status for all local bindings.
+func (c *Client) FederationStatus(ctx context.Context) (FederationStatusBody, error) {
+	var resp FederationStatusBody
+	err := c.do(ctx, http.MethodGet, "/api/v1/federation/status", nil, &resp)
+	return resp, err
+}
+
+// EnableFederation enables federation metadata for an existing project.
+func (c *Client) EnableFederation(
+	ctx context.Context,
+	projectID int64,
+	actor string,
+) (ProjectFederationMetadata, error) {
+	var resp ProjectFederationMetadata
+	err := c.do(ctx, http.MethodPost,
+		fmt.Sprintf("/api/v1/projects/%d/federation/enable", projectID),
+		map[string]string{"actor": actor}, &resp)
+	return resp, err
+}
+
+// CreateFederationEnrollment creates a temporary hub enrollment token.
+func (c *Client) CreateFederationEnrollment(
+	ctx context.Context,
+	body CreateFederationEnrollmentInput,
+) (FederationEnrollment, error) {
+	var resp FederationEnrollment
+	err := c.do(ctx, http.MethodPost, "/api/v1/federation/enrollments", body, &resp)
+	return resp, err
+}
+
+// CreateFederationReplica joins or adopts a local project as a spoke.
+func (c *Client) CreateFederationReplica(
+	ctx context.Context,
+	body CreateFederationReplicaInput,
+) (FederationReplicaResult, error) {
+	var resp FederationReplicaResult
+	err := c.do(ctx, http.MethodPost, "/api/v1/federation/replicas", body, &resp)
+	return resp, err
 }
 
 // ListProjectsWithStats returns every active project with per-project

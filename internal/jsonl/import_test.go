@@ -133,6 +133,44 @@ func TestImportV11JSONLDefaultsWithoutFederationSyncStatus(t *testing.T) {
 	assert.Equal(t, fmt.Sprint(db.CurrentSchemaVersion()), schemaVersion)
 }
 
+func TestImportLegacyFederationBindingWithoutActorDisablesPush(t *testing.T) {
+	ctx := context.Background()
+	target := openImportTargetDB(t)
+	require.NoError(t, importJSONL(ctx, target,
+		`{"kind":"meta","data":{"key":"export_version","value":"12"}}`,
+		`{"kind":"meta","data":{"key":"schema_version","value":"12"}}`,
+		`{"kind":"meta","data":{"key":"instance_uid","value":"01HZZZZZZZZZZZZZZZZZZZZZ10"}}`,
+		`{"kind":"project","data":{"id":1,"uid":"01HZZZZZZZZZZZZZZZZZZZZZ11","name":"spoke","metadata":{},"revision":1,"created_at":"2026-05-23T00:00:00.000Z"}}`,
+		`{"kind":"federation_binding","data":{"project_id":1,"role":"spoke","hub_url":"http://100.64.0.5:7787","hub_project_id":7,"hub_project_uid":"01HZZZZZZZZZZZZZZZZZZZZZ12","replay_horizon_event_id":3,"pull_cursor_event_id":2,"push_enabled":true,"push_cursor_event_id":9,"enabled":true,"created_at":"2026-05-23T00:00:01.000Z","updated_at":"2026-05-23T00:00:02.000Z"}}`,
+	))
+
+	got, err := target.FederationBindingByProject(ctx, 1)
+	require.NoError(t, err)
+	assert.False(t, got.PushEnabled)
+	assert.Equal(t, int64(9), got.PushCursorEventID)
+	assert.Empty(t, got.Actor)
+}
+
+func TestImportLegacyFederationEnrollmentWithoutActorKeepsPullOnlyAccess(t *testing.T) {
+	ctx := context.Background()
+	target := openImportTargetDB(t)
+	require.NoError(t, importJSONL(ctx, target,
+		`{"kind":"meta","data":{"key":"export_version","value":"12"}}`,
+		`{"kind":"meta","data":{"key":"schema_version","value":"12"}}`,
+		`{"kind":"meta","data":{"key":"instance_uid","value":"01HZZZZZZZZZZZZZZZZZZZZZ10"}}`,
+		`{"kind":"project","data":{"id":1,"uid":"01HZZZZZZZZZZZZZZZZZZZZZ11","name":"hub","metadata":{},"revision":1,"created_at":"2026-05-23T00:00:00.000Z"}}`,
+		`{"kind":"federation_enrollment","data":{"id":1,"token_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","spoke_instance_uid":"01HZZZZZZZZZZZZZZZZZZZZZ02","project_id":1,"capabilities":"pull,push","created_at":"2026-05-23T00:00:01.000Z","updated_at":"2026-05-23T00:00:02.000Z"}}`,
+	))
+
+	var capabilities, actor string
+	require.NoError(t, target.QueryRow(`
+		SELECT capabilities, bound_actor
+		  FROM federation_enrollments
+		 WHERE id = 1`).Scan(&capabilities, &actor))
+	assert.Equal(t, "pull", capabilities)
+	assert.Equal(t, "legacy-federation", actor)
+}
+
 func TestImportV1FillsUIDsDeterministically(t *testing.T) {
 	ctx := context.Background()
 	rows := []string{

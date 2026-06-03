@@ -234,8 +234,8 @@ func (d *Store) ExportLinks(ctx context.Context, f db.ExportFilter) iter.Seq2[db
 // ExportProjectAliases streams aliases ordered by id, scoped to f.ProjectID
 // when set. There is no soft-delete clause.
 func (d *Store) ExportProjectAliases(ctx context.Context, f db.ExportFilter) iter.Seq2[db.AliasExport, error] {
-	query := `SELECT id, project_id, alias_identity, alias_kind, root_path,
-	                 CAST(created_at AS TEXT), CAST(last_seen_at AS TEXT)
+	query := `SELECT id, project_id, alias_identity, alias_kind,
+	                 CAST(created_at AS TEXT)
 	          FROM project_aliases`
 	query, args := withProjectIDFilter(query, f, "project_id")
 	query += ` ORDER BY id ASC`
@@ -243,7 +243,7 @@ func (d *Store) ExportProjectAliases(ctx context.Context, f db.ExportFilter) ite
 		func(rows *sql.Rows) (db.AliasExport, error) {
 			var rec db.AliasExport
 			if err := rows.Scan(&rec.ID, &rec.ProjectID, &rec.AliasIdentity, &rec.AliasKind,
-				&rec.RootPath, &rec.CreatedAt, &rec.LastSeenAt); err != nil {
+				&rec.CreatedAt); err != nil {
 				return db.AliasExport{}, scanError("project_alias", err)
 			}
 			return rec, nil
@@ -328,7 +328,7 @@ func (d *Store) ExportImportMappings(ctx context.Context, f db.ExportFilter) ite
 func (d *Store) ExportFederationBindings(ctx context.Context, f db.ExportFilter) iter.Seq2[db.FederationBindingExport, error] {
 	query := `SELECT project_id, role, hub_url, hub_project_id, hub_project_uid,
 	                 replay_horizon_event_id, pull_cursor_event_id, push_enabled,
-	                 push_cursor_event_id, enabled,
+	                 push_cursor_event_id, bound_actor, enabled,
 	                 CAST(created_at AS TEXT), CAST(updated_at AS TEXT),
 	                 CAST(last_sync_at AS TEXT)
 	          FROM federation_bindings`
@@ -340,7 +340,7 @@ func (d *Store) ExportFederationBindings(ctx context.Context, f db.ExportFilter)
 			var enabled, pushEnabled int
 			if err := rows.Scan(&rec.ProjectID, &rec.Role, &rec.HubURL, &rec.HubProjectID,
 				&rec.HubProjectUID, &rec.ReplayHorizonEventID, &rec.PullCursorEventID,
-				&pushEnabled, &rec.PushCursorEventID, &enabled, &rec.CreatedAt,
+				&pushEnabled, &rec.PushCursorEventID, &rec.Actor, &enabled, &rec.CreatedAt,
 				&rec.UpdatedAt, &rec.LastSyncAt); err != nil {
 				return db.FederationBindingExport{}, scanError("federation_binding", err)
 			}
@@ -398,7 +398,8 @@ func (d *Store) ExportFederationQuarantine(ctx context.Context, f db.ExportFilte
 
 // ExportFederationEnrollments streams federation_enrollments rows ordered by id.
 func (d *Store) ExportFederationEnrollments(ctx context.Context, f db.ExportFilter) iter.Seq2[db.FederationEnrollmentExport, error] {
-	query := `SELECT id, token_hash, spoke_instance_uid, project_id, capabilities,
+	query := `SELECT id, token_hash, spoke_instance_uid, project_id, capabilities, bound_actor,
+	                 allow_adoption_snapshot_authors,
 	                 CAST(created_at AS TEXT), CAST(updated_at AS TEXT), CAST(revoked_at AS TEXT)
 	          FROM federation_enrollments`
 	query, args := withProjectIDFilter(query, f, "project_id")
@@ -406,10 +407,12 @@ func (d *Store) ExportFederationEnrollments(ctx context.Context, f db.ExportFilt
 	return streamRows(ctx, d.readQ, "federation_enrollments", query, args,
 		func(rows *sql.Rows) (db.FederationEnrollmentExport, error) {
 			var rec db.FederationEnrollmentExport
+			var allow int
 			if err := rows.Scan(&rec.ID, &rec.TokenHash, &rec.SpokeInstanceUID, &rec.ProjectID,
-				&rec.Capabilities, &rec.CreatedAt, &rec.UpdatedAt, &rec.RevokedAt); err != nil {
+				&rec.Capabilities, &rec.Actor, &allow, &rec.CreatedAt, &rec.UpdatedAt, &rec.RevokedAt); err != nil {
 				return db.FederationEnrollmentExport{}, scanError("federation_enrollment", err)
 			}
+			rec.AllowAdoptionSnapshotAuthors = allow != 0
 			return rec, nil
 		})
 }

@@ -273,7 +273,6 @@ type LabelEventParams struct {
 type AliasRow struct {
 	Identity string
 	Kind     string
-	RootPath string
 }
 
 // EventsAfterParams selects events with id strictly greater than AfterID,
@@ -529,9 +528,12 @@ type FederationIngestEvent struct {
 // FederationIngestParams is the all-or-nothing DB ingest boundary used by the
 // hub transport handler.
 type FederationIngestParams struct {
-	ProjectID        int64
-	SpokeInstanceUID string
-	Events           []FederationIngestEvent
+	ProjectID                       int64
+	FederationEnrollmentID          int64
+	SpokeInstanceUID                string
+	BoundActor                      string
+	AllowSnapshotAuthorPreservation bool
+	Events                          []FederationIngestEvent
 }
 
 // FederationIngestResult summarizes an accepted batch. InsertedEventUIDs lists
@@ -547,10 +549,12 @@ type FederationIngestResult struct {
 // CreateFederationEnrollmentParams carries the plaintext token at creation
 // time only. The database stores only its SHA-256 hash.
 type CreateFederationEnrollmentParams struct {
-	Token            string
-	SpokeInstanceUID string
-	ProjectID        *int64
-	Capabilities     string
+	Token                        string
+	SpokeInstanceUID             string
+	ProjectID                    *int64
+	Capabilities                 string
+	Actor                        string
+	AllowAdoptionSnapshotAuthors bool
 }
 
 // CreatedFederationEnrollment returns the created row plus the plaintext token

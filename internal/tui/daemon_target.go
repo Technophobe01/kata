@@ -55,9 +55,13 @@ var (
 		kind clientOptsKind,
 	) (*http.Client, error) {
 		opts := optsForKind(kind)
-		if (target.Local || target.Implicit) && target.Token == "" {
+		if target.Local || target.Implicit {
 			if target.Implicit {
-				opts.AllowInsecure = client.RemoteAllowInsecureForBaseURL(endpoint, "")
+				opts.AllowInsecure = target.AllowInsecure ||
+					client.RemoteAllowInsecureForBaseURL(endpoint, "")
+			}
+			if target.Token != "" {
+				return client.NewHTTPClientWithBearer(ctx, endpoint, target.Token, opts)
 			}
 			return client.NewHTTPClient(ctx, endpoint, opts)
 		}
@@ -155,6 +159,7 @@ func resolveDaemonTargetToken(target daemonTarget) (daemonTarget, error) {
 }
 
 func connectResolvedDaemonTarget(ctx context.Context, target daemonTarget, endpoint string) (daemonConnection, error) {
+	target = resolvedDaemonTarget(target, endpoint)
 	hc, err := newHTTPClientForTUI(ctx, endpoint, target, clientOptsNormal)
 	if err != nil {
 		return daemonConnection{}, err
@@ -173,7 +178,7 @@ func connectResolvedDaemonTarget(ctx context.Context, target daemonTarget, endpo
 		api:      c,
 		sseHC:    sseHC,
 		endpoint: endpoint,
-		target:   resolvedDaemonTarget(target, endpoint),
+		target:   target,
 		init:     bi,
 	}, nil
 }
@@ -196,8 +201,25 @@ func resolvedDaemonTarget(target daemonTarget, endpoint string) daemonTarget {
 	target.URL = endpoint
 	if target.Local {
 		target.URL = ""
+	} else if target.Implicit {
+		target.AllowInsecure = client.RemoteAllowInsecureForBaseURL(endpoint, "")
+	}
+	if (target.Local || target.Implicit) && target.Token == "" {
+		target.Token = effectiveGlobalAuthTokenForTUI()
 	}
 	return target
+}
+
+func effectiveGlobalAuthTokenForTUI() string {
+	envToken := strings.TrimSpace(os.Getenv("KATA_AUTH_TOKEN"))
+	if envToken != "" {
+		return envToken
+	}
+	auth, err := config.ReadAuthConfig()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.Token)
 }
 
 func implicitDaemonTarget(endpoint string) daemonTarget {

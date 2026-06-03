@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -170,6 +172,91 @@ func TestBootDaemonConnectionWithoutActiveLabelsImplicitRemoteEndpoint(t *testin
 	assert.False(t, conn.target.Local)
 	assert.Equal(t, "http://100.64.0.5:7777", conn.target.URL)
 	assert.Equal(t, "100.64.0.5:7777", daemonTargetDisplay(conn.target))
+}
+
+func TestResolvedImplicitRemoteTargetCarriesEnvAllowInsecure(t *testing.T) {
+	endpoint := "http://spoke.internal:7777"
+	t.Setenv("KATA_SERVER", endpoint)
+	t.Setenv("KATA_ALLOW_INSECURE", "1")
+
+	target := resolvedDaemonTarget(implicitDaemonTarget(endpoint), endpoint)
+
+	assert.True(t, target.AllowInsecure)
+}
+
+func TestResolvedImplicitRemoteTargetCarriesGlobalAuthToken(t *testing.T) {
+	endpoint := "http://spoke.internal:7777"
+	t.Setenv("KATA_SERVER", endpoint)
+	t.Setenv("KATA_ALLOW_INSECURE", "1")
+	t.Setenv("KATA_AUTH_TOKEN", "global-token")
+
+	target := resolvedDaemonTarget(implicitDaemonTarget(endpoint), endpoint)
+
+	assert.Equal(t, "global-token", target.Token)
+}
+
+func TestResolvedImplicitRemoteTargetEnvTokenOverridesAuthConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_AUTH_TOKEN", "client-db-token")
+	t.Setenv("KATA_AUTOSTART", "1")
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"),
+		[]byte("[auth]\ntoken = \"bootstrap-token\"\nrequire_token_identity = true\n"), 0o600))
+
+	endpoint := "http://spoke.internal:7777"
+	target := resolvedDaemonTarget(implicitDaemonTarget(endpoint), endpoint)
+
+	assert.Equal(t, "client-db-token", target.Token)
+}
+
+func TestConnectResolvedImplicitRemoteUsesEnvTokenForHTTPClient(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_AUTH_TOKEN", "client-db-token")
+	t.Setenv("KATA_AUTOSTART", "1")
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"),
+		[]byte("[auth]\ntoken = \"bootstrap-token\"\nrequire_token_identity = true\n"), 0o600))
+
+	oldBootScope := bootResolveScopeForTUI
+	t.Cleanup(func() {
+		bootResolveScopeForTUI = oldBootScope
+	})
+
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"instance_uid":"01HZZZZZZZZZZZZZZZZZZZZZ00","schema_version":14}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	bootResolveScopeForTUI = func(ctx context.Context, c *Client, _ string) (bootInit, error) {
+		_, err := c.GetInstance(ctx)
+		if err != nil {
+			return bootInit{}, err
+		}
+		return bootInit{view: viewEmpty, scope: scope{empty: true}}, nil
+	}
+
+	conn, err := connectResolvedDaemonTarget(t.Context(), implicitDaemonTarget(srv.URL), srv.URL)
+
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer client-db-token", gotAuth)
+	assert.Equal(t, "client-db-token", conn.target.Token)
+}
+
+func TestNewHTTPClientForTUIResolvedImplicitRemoteHonorsTrustPrivateNetwork(t *testing.T) {
+	t.Setenv("KATA_HOME", t.TempDir())
+	t.Setenv("KATA_AUTH_TOKEN", "global-token")
+	t.Setenv("KATA_TRUST_PRIVATE_NETWORK", "1")
+	endpoint := "http://100.64.0.5:7777"
+	target := resolvedDaemonTarget(implicitDaemonTarget(endpoint), endpoint)
+	require.Equal(t, "global-token", target.Token)
+	require.False(t, target.AllowInsecure)
+
+	_, err := newHTTPClientForTUI(t.Context(), endpoint, target, clientOptsNormal)
+
+	require.NoError(t, err)
 }
 
 func TestNewHTTPClientForTUILocalFallsBackToGlobalAuth(t *testing.T) {

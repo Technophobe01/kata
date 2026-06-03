@@ -114,6 +114,73 @@ func TestProjectsView_RendersTable(t *testing.T) {
 	}
 }
 
+func TestProjectsView_FooterUsesAdaptiveHelpTable(t *testing.T) {
+	m := setupProjectsView(mockProject{ID: 1, Name: "alpha", Ident: "..."})
+
+	out := stripANSI(m.View())
+
+	assert.Contains(t, out, "▕")
+	assert.Contains(t, out, "F federation")
+	assert.NotContains(t, out, "[F] federation")
+}
+
+func TestProjectsView_FTransitionsToFederationWithHighlightedProjectSelected(t *testing.T) {
+	m := setupProjectsView(
+		mockProject{ID: 11, Name: "alpha-project", Ident: "..."},
+		mockProject{ID: 22, Name: "beta-project", Ident: "..."},
+	)
+	m.scope = homedScope(99, "previous-project")
+	m.projectsCursor = 2
+
+	out, cmd := updateModel(m, keyRune('F'))
+
+	assert.Equal(t, viewFederation, out.view)
+	require.NotNil(t, cmd)
+	rendered := stripANSI(renderFederation(out))
+	assert.Contains(t, rendered, "selected project: beta-project")
+
+	out, cmd = out.routeFederationViewKey(keyRune('n'))
+
+	require.Nil(t, cmd)
+	assert.Equal(t, federationModeSelectHub, out.federationMode)
+	assert.Equal(t, int64(22), out.federationDraft.SpokeProjectID)
+	assert.Equal(t, "beta-project", out.federationDraft.SpokeProjectName)
+}
+
+func TestProjectsView_FTransitionSelectedProjectIgnoresStaleFederationDraft(t *testing.T) {
+	m := setupProjectsView(
+		mockProject{ID: 11, Name: "alpha-project", Ident: "..."},
+		mockProject{ID: 22, Name: "beta-project", Ident: "..."},
+	)
+	m.projectsCursor = 2
+	m.federationDraft.SpokeProjectName = "stale-project"
+
+	out, cmd := updateModel(m, keyRune('F'))
+
+	assert.Equal(t, viewFederation, out.view)
+	require.NotNil(t, cmd)
+	rendered := stripANSI(renderFederation(out))
+	assert.Contains(t, rendered, "selected project: beta-project")
+	assert.NotContains(t, rendered, "selected project: stale-project")
+}
+
+func TestProjectsView_FFromAllProjectsHasNoSelectedFederationProject(t *testing.T) {
+	m := setupProjectsView(mockProject{ID: 11, Name: "alpha-project", Ident: "..."})
+	m.scope = homedScope(99, "previous-project")
+	m.projectsCursor = 0
+
+	out, cmd := updateModel(m, keyRune('F'))
+
+	assert.Equal(t, viewFederation, out.view)
+	require.NotNil(t, cmd)
+	assert.Contains(t, stripANSI(renderFederation(out)), "selected project: none")
+
+	out, cmd = out.routeFederationViewKey(keyRune('n'))
+
+	require.Nil(t, cmd)
+	assert.Equal(t, federationModeSelectLocalProject, out.federationMode)
+}
+
 // TestProjectsView_ViewportClipsRowsToHeight pins that with many
 // projects and a small terminal, the footer + key-hint line stay on
 // screen. Without clipping, every row renders and the chrome falls
@@ -133,7 +200,8 @@ func TestProjectsView_ViewportClipsRowsToHeight(t *testing.T) {
 	out := m.View()
 	lines := strings.Split(out, "\n")
 	assert.LessOrEqual(t, len(lines), m.height, "render must fit within m.height")
-	assert.Contains(t, out, "[↑/↓ k/j] move", "key-hint must remain visible")
+	assert.Contains(t, out, "F federation", "footer help table must remain visible")
+	assert.Contains(t, out, "▕", "footer help table must use adaptive separators")
 	assert.Contains(t, out, "All projects", "sentinel must remain visible")
 }
 

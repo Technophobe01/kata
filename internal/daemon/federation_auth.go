@@ -11,9 +11,11 @@ import (
 )
 
 type federationPrincipal struct {
-	EnrollmentID     int64
-	SpokeInstanceUID string
-	Capabilities     string
+	EnrollmentID                 int64
+	SpokeInstanceUID             string
+	Capabilities                 string
+	Actor                        string
+	AllowAdoptionSnapshotAuthors bool
 }
 
 func authorizeFederationRequest(
@@ -25,12 +27,12 @@ func authorizeFederationRequest(
 ) (federationPrincipal, error) {
 	if !strings.HasPrefix(authHeader, authBearerPrefix) {
 		return federationPrincipal{}, api.NewError(http.StatusUnauthorized, "auth_required",
-			"Authorization: Bearer <token> required", "", nil)
+			"Authorization bearer required", "", nil)
 	}
 	token := strings.TrimPrefix(authHeader, authBearerPrefix)
 	if token == "" {
 		return federationPrincipal{}, api.NewError(http.StatusUnauthorized, "auth_required",
-			"Authorization: Bearer <token> required", "", nil)
+			"Authorization bearer required", "", nil)
 	}
 
 	enrollment, err := store.AuthorizeFederationToken(ctx, token, projectID, capability)
@@ -42,8 +44,10 @@ func authorizeFederationRequest(
 		return federationPrincipal{}, api.NewError(http.StatusInternalServerError, "internal", err.Error(), "", nil)
 	}
 	return federationPrincipal{
-		EnrollmentID:     enrollment.ID,
-		SpokeInstanceUID: enrollment.SpokeInstanceUID,
-		Capabilities:     enrollment.Capabilities,
+		EnrollmentID:                 enrollment.ID,
+		SpokeInstanceUID:             enrollment.SpokeInstanceUID,
+		Capabilities:                 enrollment.Capabilities,
+		Actor:                        enrollment.Actor,
+		AllowAdoptionSnapshotAuthors: enrollment.AllowAdoptionSnapshotAuthors,
 	}, nil
 }

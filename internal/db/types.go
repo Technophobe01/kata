@@ -88,6 +88,7 @@ type FederationBinding struct {
 	PullCursorEventID    int64
 	PushEnabled          bool
 	PushCursorEventID    int64
+	Actor                string
 	Enabled              bool
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
@@ -123,14 +124,16 @@ type FederationQuarantine struct {
 // FederationEnrollment mirrors federation_enrollments. TokenHash stores only
 // the hash of an enrollment token; plaintext tokens are never persisted.
 type FederationEnrollment struct {
-	ID               int64
-	TokenHash        string
-	SpokeInstanceUID string
-	ProjectID        *int64
-	Capabilities     string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	RevokedAt        *time.Time
+	ID                           int64
+	TokenHash                    string
+	SpokeInstanceUID             string
+	ProjectID                    *int64
+	Capabilities                 string
+	Actor                        string
+	AllowAdoptionSnapshotAuthors bool
+	CreatedAt                    time.Time
+	UpdatedAt                    time.Time
+	RevokedAt                    *time.Time
 }
 
 // IssueClaim mirrors issue_claims. Active claims have ReleasedAt == nil.
@@ -281,9 +284,7 @@ type ProjectAlias struct {
 	ProjectID     int64     `json:"project_id"`
 	AliasIdentity string    `json:"alias_identity"`
 	AliasKind     string    `json:"alias_kind"`
-	RootPath      string    `json:"root_path"`
 	CreatedAt     time.Time `json:"created_at"`
-	LastSeenAt    time.Time `json:"last_seen_at"`
 }
 
 // Issue mirrors a row in issues. Priority is 0..4 with 0 = highest priority

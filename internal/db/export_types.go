@@ -83,9 +83,7 @@ type AliasExport struct {
 	ProjectID     int64  `json:"project_id"`
 	AliasIdentity string `json:"alias_identity"`
 	AliasKind     string `json:"alias_kind"`
-	RootPath      string `json:"root_path"`
 	CreatedAt     string `json:"created_at"`
-	LastSeenAt    string `json:"last_seen_at"`
 }
 
 // CommentExport is one comment row in export shape.
@@ -132,6 +130,7 @@ type FederationBindingExport struct {
 	PullCursorEventID    int64   `json:"pull_cursor_event_id"`
 	PushEnabled          bool    `json:"push_enabled"`
 	PushCursorEventID    int64   `json:"push_cursor_event_id"`
+	Actor                string  `json:"bound_actor,omitempty"`
 	Enabled              bool    `json:"enabled"`
 	CreatedAt            string  `json:"created_at"`
 	UpdatedAt            string  `json:"updated_at"`
@@ -167,14 +166,16 @@ type FederationQuarantineExport struct {
 
 // FederationEnrollmentExport is one federation_enrollments row in export shape.
 type FederationEnrollmentExport struct {
-	ID               int64   `json:"id"`
-	TokenHash        string  `json:"token_hash"`
-	SpokeInstanceUID string  `json:"spoke_instance_uid"`
-	ProjectID        *int64  `json:"project_id,omitempty"`
-	Capabilities     string  `json:"capabilities"`
-	CreatedAt        string  `json:"created_at"`
-	UpdatedAt        string  `json:"updated_at"`
-	RevokedAt        *string `json:"revoked_at,omitempty"`
+	ID                           int64   `json:"id"`
+	TokenHash                    string  `json:"token_hash"`
+	SpokeInstanceUID             string  `json:"spoke_instance_uid"`
+	ProjectID                    *int64  `json:"project_id,omitempty"`
+	Capabilities                 string  `json:"capabilities"`
+	Actor                        string  `json:"bound_actor,omitempty"`
+	AllowAdoptionSnapshotAuthors bool    `json:"allow_adoption_snapshot_authors,omitempty"`
+	CreatedAt                    string  `json:"created_at"`
+	UpdatedAt                    string  `json:"updated_at"`
+	RevokedAt                    *string `json:"revoked_at,omitempty"`
 }
 
 // IssueClaimExport is one issue_claims row in export shape.

@@ -175,9 +175,9 @@ func importProject(ctx context.Context, tx *sql.Tx, p *db.ProjectExport) error {
 
 func importAlias(ctx context.Context, tx *sql.Tx, a *db.AliasExport) error {
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO project_aliases(id, project_id, alias_identity, alias_kind, root_path, created_at, last_seen_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.ProjectID, a.AliasIdentity, a.AliasKind, a.RootPath, a.CreatedAt, a.LastSeenAt)
+		`INSERT INTO project_aliases(id, project_id, alias_identity, alias_kind, created_at)
+		 VALUES(?, ?, ?, ?, ?)`,
+		a.ID, a.ProjectID, a.AliasIdentity, a.AliasKind, a.CreatedAt)
 	return wrapImportErr(db.ImportKindProjectAlias, err)
 }
 
@@ -293,17 +293,21 @@ func importFederationBinding(ctx context.Context, tx *sql.Tx, b *db.FederationBi
 	if b.PushEnabled {
 		pushEnabled = 1
 	}
+	actor := strings.TrimSpace(b.Actor)
+	if b.Role == string(db.FederationRoleSpoke) && pushEnabled == 1 && actor == "" {
+		pushEnabled = 0
+	}
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO federation_bindings(
 		   project_id, role, hub_url, hub_project_id, hub_project_uid,
 		   replay_horizon_event_id, pull_cursor_event_id, push_enabled,
-		   push_cursor_event_id, enabled,
+		   push_cursor_event_id, bound_actor, enabled,
 		   created_at, updated_at, last_sync_at
 		 )
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		b.ProjectID, b.Role, b.HubURL, b.HubProjectID, b.HubProjectUID,
 		b.ReplayHorizonEventID, b.PullCursorEventID, pushEnabled,
-		b.PushCursorEventID, enabled,
+		b.PushCursorEventID, actor, enabled,
 		b.CreatedAt, b.UpdatedAt, b.LastSyncAt)
 	return wrapImportErr(db.ImportKindFederationBinding, err)
 }
@@ -335,14 +339,19 @@ func importFederationQuarantine(ctx context.Context, tx *sql.Tx, q *db.Federatio
 }
 
 func importFederationEnrollment(ctx context.Context, tx *sql.Tx, e *db.FederationEnrollmentExport) error {
+	actor := strings.TrimSpace(e.Actor)
+	if actor == "" {
+		actor = "legacy-federation"
+		e.Capabilities = "pull"
+	}
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO federation_enrollments(
 		   id, token_hash, spoke_instance_uid, project_id, capabilities,
-		   created_at, updated_at, revoked_at
+		   bound_actor, allow_adoption_snapshot_authors, created_at, updated_at, revoked_at
 		 )
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.ID, e.TokenHash, e.SpokeInstanceUID, e.ProjectID, e.Capabilities,
-		e.CreatedAt, e.UpdatedAt, e.RevokedAt)
+		actor, e.AllowAdoptionSnapshotAuthors, e.CreatedAt, e.UpdatedAt, e.RevokedAt)
 	return wrapImportErr(db.ImportKindFederationEnrollment, err)
 }
 

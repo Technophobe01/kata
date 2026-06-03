@@ -22,6 +22,7 @@ const (
 	viewEmpty
 	viewProjects
 	viewDaemons
+	viewFederation
 )
 
 // Model is the top-level Bubble Tea model. Sub-views are embedded by
@@ -132,10 +133,32 @@ type Model struct {
 	projectIdentByID map[int64]string
 	// projectsCursor is the highlighted row in viewProjects. Reset when
 	// transitioning into the view; preserved across re-renders.
-	projectsCursor int
-	activeDaemon   daemonTarget
-	daemonTargets  []daemonTarget
-	daemonCursor   int
+	projectsCursor                int
+	activeDaemon                  daemonTarget
+	daemonTargets                 []daemonTarget
+	daemonCursor                  int
+	federationInstance            InstanceInfo
+	federationStatuses            []FederationProjectStatus
+	federationCursor              int
+	federationLoading             bool
+	federationErr                 error
+	federationGen                 uint64
+	federationSelectedProjectSet  bool
+	federationSelectedProjectID   int64
+	federationSelectedProjectName string
+	federationMode                federationMode
+	federationDraft               federationDraft
+	federationLocalProjectCursor  int
+	federationHubCursor           int
+	federationHubProjectCursor    int
+	federationHubProjects         []ProjectSummary
+	federationHubProjectsLoading  bool
+	federationEnrollErr           error
+	federationEnrollGen           uint64
+	federationEnrollAttempt       uint64
+	federationEnrollRunning       bool
+	federationResult              federationEnrollResult
+	federationRecovery            federationRecovery
 	// layout is the EFFECTIVE rendered layout — what the View functions
 	// actually draw. Re-evaluated on every WindowSizeMsg via
 	// resolveLayout, which consults preferredLayout + layoutLocked +
@@ -203,12 +226,13 @@ func initialModel(opts Options) Model {
 	}
 }
 
-// resolveTUIActor mirrors cmd/kata's actor precedence (env → fallback)
-// minus the --as flag and git fallback: the TUI has no flag plumbing
-// here and we keep the dependency surface small. Tasks 9/10 re-evaluate
-// once the broader mutation path lands and may add a git fallback.
+// resolveTUIActor mirrors cmd/kata's actor precedence without --as or the
+// final git lookup: KATA_AUTHOR > USER > anonymous.
 func resolveTUIActor() string {
 	if v := os.Getenv("KATA_AUTHOR"); v != "" {
+		return v
+	}
+	if v := os.Getenv("USER"); v != "" {
 		return v
 	}
 	return "anonymous"
@@ -433,6 +457,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.projectsCursor = 0
 		}
 		return m, nil
+	}
+	if fl, ok := msg.(federationLoadedMsg); ok {
+		next := m.handleFederationLoaded(fl)
+		return next, nil
+	}
+	if fhp, ok := msg.(federationHubProjectsLoadedMsg); ok {
+		next := m.handleFederationHubProjectsLoaded(fhp)
+		return next, nil
+	}
+	if fer, ok := msg.(federationEnrollResultMsg); ok {
+		next, cmd := m.handleFederationEnrollResult(fer)
+		return next, cmd
 	}
 	if _, ok := msg.(projectsDebounceFireMsg); ok {
 		m.projectsRefetchPending = false
@@ -664,6 +700,10 @@ func (m Model) routeTopLevel(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		}
 		if m.view == viewDaemons {
 			next, cmd := m.routeDaemonsViewKey(msg)
+			return next, cmd, true
+		}
+		if m.view == viewFederation {
+			next, cmd := m.routeFederationViewKey(msg)
 			return next, cmd, true
 		}
 		// Detail-view `e` and `c` open M4 centered forms instead of
@@ -1553,6 +1593,10 @@ func (m Model) routeGlobalKey(msg tea.KeyMsg) (Model, tea.Cmd, bool) {
 	}
 	if m.keymap.Daemons.matches(msg) {
 		next, cmd := m.transitionToDaemons()
+		return next, cmd, true
+	}
+	if m.keymap.Federation.matches(msg) {
+		next, cmd := m.transitionToFederation()
 		return next, cmd, true
 	}
 	if m.view == viewEmpty {
@@ -2494,7 +2538,7 @@ func (m Model) View() string {
 	// modal would silently disappear and the user would be stuck —
 	// pressing q again would only re-trigger the (invisible) modal.
 	if m.width > 0 && m.width < 80 {
-		// viewProjects renders its own narrow-friendly body; every other
+		// viewProjects/viewFederation render their own narrow-friendly body; every other
 		// view falls back to the "too narrow" hint. Either way an active
 		// modal/form must layer on top — without that, a quit-confirm
 		// opened at full width would silently disappear under the
@@ -2504,6 +2548,8 @@ func (m Model) View() string {
 		switch m.view {
 		case viewProjects:
 			body = renderProjects(m)
+		case viewFederation:
+			body = renderFederation(m)
 		default:
 			body = renderTooNarrow(m.width, m.height)
 		}
@@ -2636,6 +2682,8 @@ func (m Model) viewBody() string {
 		return renderProjects(m)
 	case viewDaemons:
 		return renderDaemons(m)
+	case viewFederation:
+		return renderFederation(m)
 	}
 	if m.layout == layoutSplit {
 		return renderSplit(m)
