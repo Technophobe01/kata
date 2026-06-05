@@ -93,8 +93,8 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 
 	mux := http.NewServeMux()
-	humaConfig := huma.DefaultConfig("kata", "0.1.0")
-	humaConfig.OpenAPIPath = "" // Plan 1: no /openapi.json
+	humaConfig := huma.DefaultConfig("kata", APISchemaVersion)
+	humaConfig.OpenAPIPath = "" // Plan 1: no /openapi.json served at runtime; see `kata openapi` + OpenAPIDocument
 	// Drop DefaultConfig's SchemaLinkTransformer: it rebuilds response structs
 	// via reflection (adding a $schema field), which silently bypasses any
 	// MarshalJSON. Our APIError relies on MarshalJSON to emit the wire-spec
@@ -192,8 +192,8 @@ func isMutation(method string) bool {
 // registerRoutes installs the per-resource handler groups onto humaAPI. Each
 // group lives in its own file (handlers_health.go, handlers_projects.go, etc.)
 // and replaces the matching stub below as it lands. The events handler also
-// receives mux so it can register the SSE endpoint as a raw http.HandlerFunc
-// (Huma doesn't model streaming responses).
+// receives mux so it can preserve the SSE endpoint's method-not-allowed
+// contract around the Huma streaming route.
 func registerRoutes(humaAPI huma.API, mux *http.ServeMux, cfg ServerConfig) {
 	registerHealth(humaAPI, cfg)
 	registerInstanceHandlers(humaAPI, cfg)
