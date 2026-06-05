@@ -30,6 +30,23 @@ func newTestClient(t *testing.T, handler http.HandlerFunc) *Client {
 	return NewClient(srv.URL, srv.Client())
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func jsonResponse(t *testing.T, body any) *http.Response {
+	t.Helper()
+	bs, err := json.Marshal(body)
+	require.NoError(t, err)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(string(bs))),
+	}
+}
+
 // respondJSON writes body as a JSON response with the right Content-Type.
 func respondJSON(t *testing.T, w http.ResponseWriter, body any) {
 	t.Helper()
@@ -257,6 +274,121 @@ func TestClient_ListIssues_SendsLimit(t *testing.T) {
 	if strings.Contains(gotQuery, "status=") {
 		t.Fatalf("empty status must not be sent: %q", gotQuery)
 	}
+}
+
+func TestClient_LocalUnixTransportFailureRetriesWithRefreshedClient(t *testing.T) {
+	oldRefresh := refreshLocalHTTPClientForTUI
+	t.Cleanup(func() { refreshLocalHTTPClientForTUI = oldRefresh })
+	var refreshed atomic.Bool
+	refreshLocalHTTPClientForTUI = func(context.Context) (*http.Client, error) {
+		refreshed.Store(true)
+		return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(t, map[string]any{
+				"issues": []map[string]any{
+					{"short_id": "aaa1", "title": "recovered", "status": "open"},
+				},
+			}), nil
+		})}, nil
+	}
+
+	c := NewClient(clientpkg.UnixBase, &http.Client{Transport: roundTripFunc(
+		func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("dial unix /tmp/missing.sock: connect: no such file or directory")
+		},
+	)})
+
+	got, err := c.ListIssues(context.Background(), 7, ListFilter{Limit: 2001})
+	require.NoError(t, err)
+	require.True(t, refreshed.Load(), "local socket failure should refresh the daemon client")
+	require.Len(t, got, 1)
+	assert.Equal(t, "aaa1", got[0].ShortID)
+}
+
+func TestClient_LocalUnixTransportFailureDoesNotRetryMutationWithoutIdempotencyKey(t *testing.T) {
+	oldRefresh := refreshLocalHTTPClientForTUI
+	t.Cleanup(func() { refreshLocalHTTPClientForTUI = oldRefresh })
+	var refreshed atomic.Bool
+	refreshLocalHTTPClientForTUI = func(context.Context) (*http.Client, error) {
+		refreshed.Store(true)
+		return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatal("non-idempotent mutation should not be retried")
+			return nil, nil
+		})}, nil
+	}
+
+	c := NewClient(clientpkg.UnixBase, &http.Client{Transport: roundTripFunc(
+		func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("read unix /tmp/kata.sock: connection reset by peer")
+		},
+	)})
+
+	_, err := c.AddComment(context.Background(), 7, "abc4", "note", "alice")
+	require.Error(t, err)
+	require.True(t, refreshed.Load(), "non-idempotent mutation should refresh the stale client")
+	assert.Contains(t, err.Error(), "local kata daemon connection failed")
+}
+
+func TestClient_LocalUnixTransportFailureRetriesMutationWithIdempotencyKey(t *testing.T) {
+	oldRefresh := refreshLocalHTTPClientForTUI
+	t.Cleanup(func() { refreshLocalHTTPClientForTUI = oldRefresh })
+	var refreshed atomic.Bool
+	var gotKey string
+	refreshLocalHTTPClientForTUI = func(context.Context) (*http.Client, error) {
+		refreshed.Store(true)
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotKey = r.Header.Get("Idempotency-Key")
+			return jsonResponse(t, map[string]any{
+				"issue":   map[string]any{"short_id": "aaa1", "title": "created", "status": "open"},
+				"changed": true,
+			}), nil
+		})}, nil
+	}
+
+	c := NewClient(clientpkg.UnixBase, &http.Client{Transport: roundTripFunc(
+		func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("read unix /tmp/kata.sock: connection reset by peer")
+		},
+	)})
+
+	_, err := c.CreateIssue(context.Background(), 7, CreateIssueBody{
+		Title: "created", Actor: "alice", IdempotencyKey: "create-issue-key",
+	})
+	require.NoError(t, err)
+	require.True(t, refreshed.Load(), "idempotent mutation should refresh and retry")
+	assert.Equal(t, "create-issue-key", gotKey)
+}
+
+func TestClient_LocalUnixTransportFailureLogsAndHidesSyntheticHost(t *testing.T) {
+	oldRefresh := refreshLocalHTTPClientForTUI
+	oldLogPath := tuiClientLogPathForTUI
+	t.Cleanup(func() {
+		refreshLocalHTTPClientForTUI = oldRefresh
+		tuiClientLogPathForTUI = oldLogPath
+	})
+	logPath := filepath.Join(t.TempDir(), "tui.log")
+	tuiClientLogPathForTUI = func() (string, error) { return logPath, nil }
+	refreshLocalHTTPClientForTUI = func(context.Context) (*http.Client, error) {
+		return nil, errors.New("no unix-socket daemon found")
+	}
+	c := NewClient(clientpkg.UnixBase, &http.Client{Transport: roundTripFunc(
+		func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("dial unix /tmp/missing.sock: connect: no such file or directory")
+		},
+	)})
+
+	_, err := c.ListIssues(context.Background(), 7, ListFilter{Limit: 2001})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "local kata daemon connection failed")
+	assert.NotContains(t, err.Error(), "kata.invalid")
+
+	//nolint:gosec // logPath is a test-controlled file under t.TempDir().
+	bs, readErr := os.ReadFile(logPath)
+	require.NoError(t, readErr)
+	logged := string(bs)
+	assert.Contains(t, logged, "GET")
+	assert.Contains(t, logged, "/api/v1/projects/7/issues?limit=2001")
+	assert.Contains(t, logged, "dial unix /tmp/missing.sock")
+	assert.Contains(t, logged, "retry")
 }
 
 func TestModel_FetchInitialUsesQueueFetchFilter(t *testing.T) {

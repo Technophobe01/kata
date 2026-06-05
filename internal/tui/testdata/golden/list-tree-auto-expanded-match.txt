@@ -18,5 +18,5 @@
 
 
                                                                                                                   [1/3]
- ↑↓ move   ▕ ↵ open   ▕ space expand▕ n new   ▕ N child▕ / search▕ f filter▕ s status▕ o order▕ c clear▕ x close
- ! priority▕ D daemons▕ F federation▕ L layout▕ ? help ▕ q quit
+ ↑↓ move▕ ↵ open ▕ space expand▕ E all    ▕ n new       ▕ N child ▕ / search▕ f filter▕ s status▕ v view▕ o order
+ c clear▕ x close▕ ! priority  ▕ D daemons▕ F federation▕ L layout▕ ? help  ▕ q quit

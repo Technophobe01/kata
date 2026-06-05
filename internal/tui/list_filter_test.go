@@ -522,6 +522,182 @@ func TestList_ArrowExpandCollapse_LeafNoOp(t *testing.T) {
 	}
 }
 
+func TestList_ExpandAll(t *testing.T) {
+	api, km, sc := newListEnv()
+	parentSID := "p001"
+	childSID := "c002"
+	lm := listModel{
+		issues: []Issue{
+			testIssue(parentSID, withCounts(1, 2)),
+			testIssue(childSID, withParent(parentSID), withCounts(1, 1)),
+			testIssue("g003", withParent(childSID)),
+			testIssue("solo"),
+		},
+	}
+
+	lm, cmd := lm.Update(runeKey('E'), km, api, sc)
+	if cmd != nil {
+		t.Fatalf("expand all should not dispatch a command, got %T", cmd)
+	}
+	assertQueueShortIDs(t, lm.visibleRows(), []string{parentSID, childSID, "g003", "solo"})
+	for _, shortID := range []string{parentSID, childSID} {
+		if !lm.expanded[issueKey{projectID: testIssueProjectID, shortID: shortID}] {
+			t.Fatalf("expanded missing %s: %+v", shortID, lm.expanded)
+		}
+	}
+}
+
+func TestList_ExpandAllCollapsesWhenEverythingIsExpanded(t *testing.T) {
+	api, km, sc := newListEnv()
+	parentSID := "p001"
+	childSID := "c002"
+	lm := listModel{
+		issues: []Issue{
+			testIssue(parentSID, withCounts(1, 2)),
+			testIssue(childSID, withParent(parentSID), withCounts(1, 1)),
+			testIssue("g003", withParent(childSID)),
+		},
+		expanded: expansionSet{
+			{projectID: testIssueProjectID, shortID: parentSID}: true,
+			{projectID: testIssueProjectID, shortID: childSID}:  true,
+		},
+		cursor: 2,
+	}
+
+	lm, cmd := lm.Update(runeKey('E'), km, api, sc)
+	if cmd != nil {
+		t.Fatalf("collapse all should not dispatch a command, got %T", cmd)
+	}
+	if len(lm.expanded) != 0 {
+		t.Fatalf("expanded = %+v, want empty after all-expanded toggle", lm.expanded)
+	}
+	assertQueueShortIDs(t, lm.visibleRows(), []string{parentSID})
+	if lm.cursor != 0 {
+		t.Fatalf("cursor = %d, want 0 after selected child collapsed out of view", lm.cursor)
+	}
+}
+
+func TestList_ExpandAllCollapseRestoresHiddenChildToNearestVisibleParent(t *testing.T) {
+	api, km, sc := newListEnv()
+	parentSID := "p001"
+	childSID := "c002"
+	lm := listModel{
+		issues: []Issue{
+			testIssue("aaa1"),
+			testIssue(parentSID, withCounts(1, 1)),
+			testIssue(childSID, withParent(parentSID)),
+			testIssue("solo"),
+		},
+		expanded: expansionSet{
+			{projectID: testIssueProjectID, shortID: parentSID}: true,
+		},
+		cursor: 2,
+	}
+
+	lm, cmd := lm.Update(runeKey('E'), km, api, sc)
+	if cmd != nil {
+		t.Fatalf("collapse all should not dispatch a command, got %T", cmd)
+	}
+	assertQueueShortIDs(t, lm.visibleRows(), []string{"aaa1", parentSID, "solo"})
+	if lm.cursor != 1 {
+		t.Fatalf("cursor = %d, want selected child restored to visible parent", lm.cursor)
+	}
+	if lm.selectedUID != "01TEST-"+parentSID {
+		t.Fatalf("selectedUID = %q, want parent UID", lm.selectedUID)
+	}
+}
+
+func TestList_ViewToggleShowsFlatPeersAndPreservesSelection(t *testing.T) {
+	api, km, sc := newListEnv()
+	parentSID := "p001"
+	lm := listModel{
+		issues: []Issue{
+			testIssue("aaa1"),
+			testIssue("p001", withCounts(1, 1)),
+			testIssue("c002", withParent(parentSID)),
+		},
+		cursor: 1,
+	}
+
+	lm, cmd := lm.Update(runeKey('v'), km, api, sc)
+	if cmd != nil {
+		t.Fatalf("view toggle should not dispatch a command, got %T", cmd)
+	}
+	if lm.viewMode != issueListViewFlat {
+		t.Fatalf("viewMode = %v, want flat", lm.viewMode)
+	}
+	assertQueueShortIDs(t, lm.visibleRows(), []string{"aaa1", "p001", "c002"})
+	if lm.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1 on selected parent", lm.cursor)
+	}
+
+	lm, _ = lm.Update(runeKey('v'), km, api, sc)
+	if lm.viewMode != issueListViewNested {
+		t.Fatalf("viewMode = %v, want nested", lm.viewMode)
+	}
+	assertQueueShortIDs(t, lm.visibleRows(), []string{"aaa1", "p001"})
+	if lm.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1 after returning to nested", lm.cursor)
+	}
+}
+
+func TestList_ViewToggleFromFlatCollapsesNestedView(t *testing.T) {
+	api, km, sc := newListEnv()
+	parentSID := "p001"
+	lm := listModel{
+		issues: []Issue{
+			testIssue(parentSID, withCounts(1, 1)),
+			testIssue("c002", withParent(parentSID)),
+			testIssue("solo"),
+		},
+		viewMode: issueListViewFlat,
+		expanded: expansionSet{{projectID: testIssueProjectID, shortID: parentSID}: true},
+	}
+
+	lm, cmd := lm.Update(runeKey('v'), km, api, sc)
+	if cmd != nil {
+		t.Fatalf("view toggle should not dispatch a command, got %T", cmd)
+	}
+	if lm.viewMode != issueListViewNested {
+		t.Fatalf("viewMode = %v, want nested", lm.viewMode)
+	}
+	if len(lm.expanded) != 0 {
+		t.Fatalf("expanded = %+v, want collapsed after returning to nested", lm.expanded)
+	}
+	assertQueueShortIDs(t, lm.visibleRows(), []string{parentSID, "solo"})
+}
+
+func TestList_ViewToggleFromFlatRestoresHiddenChildToNearestVisibleParent(t *testing.T) {
+	api, km, sc := newListEnv()
+	parentSID := "p001"
+	childSID := "c002"
+	lm := listModel{
+		issues: []Issue{
+			testIssue("aaa1"),
+			testIssue(parentSID, withCounts(1, 1)),
+			testIssue(childSID, withParent(parentSID)),
+			testIssue("solo"),
+		},
+		viewMode: issueListViewFlat,
+		cursor:   2,
+	}
+
+	lm, cmd := lm.Update(runeKey('v'), km, api, sc)
+	if cmd != nil {
+		t.Fatalf("view toggle should not dispatch a command, got %T", cmd)
+	}
+	if lm.viewMode != issueListViewNested {
+		t.Fatalf("viewMode = %v, want nested", lm.viewMode)
+	}
+	assertQueueShortIDs(t, lm.visibleRows(), []string{"aaa1", parentSID, "solo"})
+	if lm.cursor != 1 {
+		t.Fatalf("cursor = %d, want selected child restored to visible parent", lm.cursor)
+	}
+	if lm.selectedUID != "01TEST-"+parentSID {
+		t.Fatalf("selectedUID = %q, want parent UID", lm.selectedUID)
+	}
+}
+
 func TestList_SelectionPreservedAcrossRefetchWithParentInsertion(t *testing.T) {
 	parentSID := "p001"
 	lm := listModel{

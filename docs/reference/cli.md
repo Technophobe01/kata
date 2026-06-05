@@ -203,6 +203,23 @@ Local commands auto-start the daemon when appropriate. `daemon start` runs in
 the foreground and is used for explicit service setups. `kata agent-instructions`
 is an alias for `kata quickstart`.
 
+`kata tui` opens the interactive issue browser. In the issue list, `v` toggles
+between nested and flat views: nested groups children under parents, while flat
+shows matching issues as peers in list order. Returning from flat to nested
+starts with parents collapsed. In nested view, `space` or right arrow expands
+the selected parent, left arrow collapses it, and `E` toggles every parent in
+the current list. `E` expands all when any parent is collapsed, then collapses
+all when every parent is already expanded.
+
+`PgUp` and `PgDn` page by the visible issue-list window. When a page lands on
+the first or final page, the cursor keeps its screen row; pressing the same page
+key again at that boundary jumps to the first or last issue.
+
+The TUI appends local daemon transport diagnostics to
+`<KATA_HOME>/runtime/<dbhash>/tui.log`, including retried stale-socket failures
+and request paths. Use that file when an interactive fetch reports a local
+daemon connection error.
+
 ## Backup and import
 
 ```sh

@@ -177,24 +177,74 @@ func TestEdge_IdentitySelection_FallsBackWhenIssueDisappears(t *testing.T) {
 	assertSelection(t, nm, 1, "01TEST-ccc3")
 }
 
-// TestEdge_PageUpPageDown_MovesCursorInChunks: pgup/pgdown shift the
-// cursor by pageStep rows so navigating long lists doesn't require
-// hundreds of j/k presses.
-func TestEdge_PageUpPageDown_MovesCursorInChunks(t *testing.T) {
+// TestEdge_PageUpPageDown_PagesVisibleWindow: pgup/pgdown move the
+// rendered window by roughly one page and keep the cursor on the same
+// screen row when possible. This feels like paging the viewport,
+// unlike the old cursor-only jump that re-centered the list around
+// the new row.
+func TestEdge_PageUpPageDown_PagesVisibleWindow(t *testing.T) {
 	m := initialModel(Options{})
 	m.list.loading = false
 	m.list.issues = makeTestIssues(50)
 	m.list.cursor = 5
+	mm, _ := updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = mm
 
-	// pgdown advances by pageStep (10).
 	nm, _ := updateModel(m, tea.KeyMsg{Type: tea.KeyPgDown})
-	assertSelection(t, nm, 15, "01TEST-r016")
+	assertSelection(t, nm, 27, "01TEST-r028")
+	assertViewContains(t, nm, "[23-46 of 50]")
 
-	// pgup walks back by pageStep.
+	nm, _ = updateModel(nm, tea.KeyMsg{Type: tea.KeyPgDown})
+	assertSelection(t, nm, 31, "01TEST-r032")
+	assertViewContains(t, nm, "[27-50 of 50]")
+
+	nm, _ = updateModel(nm, tea.KeyMsg{Type: tea.KeyPgDown})
+	assertSelection(t, nm, 49, "01TEST-r050")
+
 	nm, _ = updateModel(nm, tea.KeyMsg{Type: tea.KeyPgUp})
-	if nm.list.cursor != 5 {
-		t.Fatalf("after pgup, cursor = %d, want 5", nm.list.cursor)
+	if nm.list.cursor >= 49 {
+		t.Fatalf("after pgup from end, cursor = %d, want movement off the last row", nm.list.cursor)
 	}
+
+	nm, _ = updateModel(nm, tea.KeyMsg{Type: tea.KeyPgUp})
+	assertSelection(t, nm, 23, "01TEST-r024")
+	assertViewContains(t, nm, "[1-24 of 50]")
+
+	nm, _ = updateModel(nm, tea.KeyMsg{Type: tea.KeyPgUp})
+	assertSelection(t, nm, 0, "01TEST-r001")
+	assertViewContains(t, nm, "[1-24 of 50]")
+}
+
+func TestEdge_PageDownToFinalPagePreservesScreenRow(t *testing.T) {
+	m := initialModel(Options{})
+	m.list.loading = false
+	m.list.issues = makeTestIssues(88)
+	m.list.cursor = 0
+	mm, _ := updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 80})
+	m = mm
+
+	nm, _ := updateModel(m, tea.KeyMsg{Type: tea.KeyPgDown})
+	assertSelection(t, nm, 14, "01TEST-r015")
+	assertViewContains(t, nm, "[15-88 of 88]")
+
+	nm, _ = updateModel(nm, tea.KeyMsg{Type: tea.KeyPgDown})
+	assertSelection(t, nm, 87, "01TEST-r088")
+}
+
+func TestEdge_PageUpToFirstPagePreservesScreenRow(t *testing.T) {
+	m := initialModel(Options{})
+	m.list.loading = false
+	m.list.issues = makeTestIssues(88)
+	m.list.cursor = 87
+	mm, _ := updateModel(m, tea.WindowSizeMsg{Width: 120, Height: 80})
+	m = mm
+
+	nm, _ := updateModel(m, tea.KeyMsg{Type: tea.KeyPgUp})
+	assertSelection(t, nm, 73, "01TEST-r074")
+	assertViewContains(t, nm, "[1-74 of 88]")
+
+	nm, _ = updateModel(nm, tea.KeyMsg{Type: tea.KeyPgUp})
+	assertSelection(t, nm, 0, "01TEST-r001")
 }
 
 // TestEdge_PageDown_ClampsAtEnd: pgdown near the end clamps to the

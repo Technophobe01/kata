@@ -21,7 +21,9 @@ enter   open detail
 space   expand/collapse
 right   expand
 left    collapse
+E       expand/collapse all
 n       new issue (form)
+v       toggle flat/nested view
 o       toggle graph order
 x       close
 r       reopen
