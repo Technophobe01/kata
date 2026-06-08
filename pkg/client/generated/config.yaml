@@ -1,0 +1,14 @@
+package: generated
+skip-prune: true
+user-templates:
+  client: templates/client.tmpl
+  typeDef: templates/type_def.tmpl
+additional-imports:
+  - package: reflect
+output:
+  use-single-file: false
+  directory: ..
+generate:
+  client: true
+  client-with-response: true
+  models: true

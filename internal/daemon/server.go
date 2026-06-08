@@ -95,6 +95,7 @@ func NewServer(cfg ServerConfig) *Server {
 	mux := http.NewServeMux()
 	humaConfig := huma.DefaultConfig("kata", APISchemaVersion)
 	humaConfig.OpenAPIPath = "" // Plan 1: no /openapi.json served at runtime; see `kata openapi` + OpenAPIDocument
+	humaConfig.DocsPath = ""
 	// Drop DefaultConfig's SchemaLinkTransformer: it rebuilds response structs
 	// via reflection (adding a $schema field), which silently bypasses any
 	// MarshalJSON. Our APIError relies on MarshalJSON to emit the wire-spec
@@ -104,6 +105,8 @@ func NewServer(cfg ServerConfig) *Server {
 
 	s := &Server{cfg: cfg, api: humaAPI}
 	registerRoutes(humaAPI, mux, cfg)
+	registerOpenAPIYAML(mux)
+	applyJSONBlobSchemaOverrides(humaAPI.OpenAPI())
 
 	s.handler = withCSRFGuards(requireBearer(cfg.authPolicy(), cfg.DB)(withTrustedProxyActor(cfg)(mux)))
 	return s
@@ -118,6 +121,18 @@ func (s *Server) API() huma.API { return s.api }
 // Close releases server-owned resources. Currently a no-op since the DB is
 // owned by the caller.
 func (s *Server) Close() error { return nil }
+
+func registerOpenAPIYAML(mux *http.ServeMux) {
+	mux.HandleFunc(http.MethodGet+" /openapi.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		out, err := OpenAPIYAML()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/openapi+yaml")
+		_, _ = w.Write(out)
+	})
+}
 
 // Run listens on the configured endpoint until ctx is cancelled. The caller is
 // responsible for writing the runtime file once Run has started.
