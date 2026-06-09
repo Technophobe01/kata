@@ -47,8 +47,8 @@ func envHTTPTimeout(def time.Duration) time.Duration {
 // the .kata.local.toml walk so a workspace-local [server] override is
 // honored even when the user is invoking kata from outside the repo.
 //
-// If a remote is explicitly configured (via KATA_SERVER or
-// .kata.local.toml) but does not respond, the CLI surfaces this as a
+// If a remote is explicitly configured (via KATA_SERVER, .kata.local.toml,
+// or active_daemon) but does not respond, the CLI surfaces this as a
 // daemon-unavailable error so callers see a stable exit code and shape.
 func ensureDaemon(ctx context.Context) (string, error) {
 	workspaceStart := workspaceStartForRemote()
@@ -90,11 +90,11 @@ func workspaceStartForRemote() string {
 // with the rest of the CLI about which daemon is "the" daemon:
 //
 //  1. BaseURLKey on the context (test injection).
-//  2. Configured remote (KATA_SERVER env or .kata.local.toml
-//     [server].url). When the remote is set but unreachable, surface
-//     that as ErrRemoteUnavailable so health reports the explicitly-
-//     selected daemon's actual state rather than silently falling
-//     through to a local one.
+//  2. Configured remote (KATA_SERVER env, .kata.local.toml [server].url,
+//     or active_daemon). When the remote is set but unreachable,
+//     surface that as ErrRemoteUnavailable so health reports the
+//     explicitly-selected daemon's actual state rather than silently
+//     falling through to a local one.
 //  3. Local Discover (runtime files).
 //
 // Returns a kindDaemonUnavail cliError when no live daemon is found,
@@ -135,10 +135,12 @@ func discoverDaemon(ctx context.Context) (string, error) {
 // client directly; this wrapper exists only because every existing
 // CLI command site is already named for it.
 func httpClientFor(ctx context.Context, baseURL string) (*http.Client, error) {
+	workspaceStart := workspaceStartForRemote()
 	return client.NewHTTPClient(ctx, baseURL,
 		client.Opts{
-			Timeout:       envHTTPTimeout(defaultHTTPTimeout),
-			AllowInsecure: client.RemoteAllowInsecureForBaseURL(baseURL, workspaceStartForRemote()),
+			Timeout:        envHTTPTimeout(defaultHTTPTimeout),
+			AllowInsecure:  client.RemoteAllowInsecureForBaseURL(baseURL, workspaceStart),
+			WorkspaceStart: workspaceStart,
 		})
 }
 
@@ -147,9 +149,11 @@ func httpClientFor(ctx context.Context, baseURL string) (*http.Client, error) {
 // ResponseHeaderTimeout so a stalled handshake can't hang forever. Body
 // cancellation comes from the request context.
 func streamingClientFor(ctx context.Context, baseURL string) (*http.Client, error) {
+	workspaceStart := workspaceStartForRemote()
 	return client.NewHTTPClient(ctx, baseURL, client.Opts{
 		ResponseHeaderTimeout: client.SSEHandshakeTimeout,
-		AllowInsecure:         client.RemoteAllowInsecureForBaseURL(baseURL, workspaceStartForRemote()),
+		AllowInsecure:         client.RemoteAllowInsecureForBaseURL(baseURL, workspaceStart),
+		WorkspaceStart:        workspaceStart,
 	})
 }
 
