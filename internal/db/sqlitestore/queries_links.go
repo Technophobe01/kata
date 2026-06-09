@@ -14,7 +14,19 @@ import (
 // CreateLink inserts a links row. Distinct error types let the caller emit
 // the right wire status without parsing SQLite messages.
 func (d *Store) CreateLink(ctx context.Context, p db.CreateLinkParams) (db.Link, error) {
-	res, err := d.ExecContext(ctx,
+	return retryWrite1(ctx, d, func() (db.Link, error) {
+		return d.createLink(ctx, p)
+	})
+}
+
+func (d *Store) createLink(ctx context.Context, p db.CreateLinkParams) (db.Link, error) {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return db.Link{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx,
 		`INSERT INTO links(project_id, from_issue_id, to_issue_id, from_issue_uid, to_issue_uid, type, author)
 		 VALUES(?, ?, ?, (SELECT uid FROM issues WHERE id = ?), (SELECT uid FROM issues WHERE id = ?), ?, ?)`,
 		p.ProjectID, p.FromIssueID, p.ToIssueID, p.FromIssueID, p.ToIssueID, p.Type, p.Author)
@@ -26,7 +38,7 @@ func (d *Store) CreateLink(ctx context.Context, p db.CreateLinkParams) (db.Link,
 		// caller-facing semantic is "already linked" (200 no-op), not
 		// "different parent set" (409 conflict). Disambiguate by re-querying.
 		if errors.Is(classified, db.ErrParentAlreadySet) && p.Type == "parent" {
-			if _, lookupErr := d.LinkByEndpoints(ctx, p.FromIssueID, p.ToIssueID, "parent"); lookupErr == nil {
+			if _, lookupErr := linkByEndpoints(ctx, tx, p.FromIssueID, p.ToIssueID, "parent"); lookupErr == nil {
 				return db.Link{}, db.ErrLinkExists
 			}
 		}
@@ -36,7 +48,14 @@ func (d *Store) CreateLink(ctx context.Context, p db.CreateLinkParams) (db.Link,
 	if err != nil {
 		return db.Link{}, fmt.Errorf("last insert id: %w", err)
 	}
-	return d.LinkByID(ctx, id)
+	link, err := linkByID(ctx, tx, id)
+	if err != nil {
+		return db.Link{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return db.Link{}, err
+	}
+	return link, nil
 }
 
 // classifyLinkInsertError maps SQLite constraint failures to typed errors so
@@ -67,13 +86,21 @@ func classifyLinkInsertError(err error) error {
 
 // LinkByID fetches a link by rowid.
 func (d *Store) LinkByID(ctx context.Context, id int64) (db.Link, error) {
-	row := d.QueryRowContext(ctx, linkSelect+` WHERE id = ?`, id)
-	return scanLink(row)
+	return linkByID(ctx, d, id)
 }
 
 // LinkByEndpoints fetches the link for a (from, to, type) triple.
 func (d *Store) LinkByEndpoints(ctx context.Context, fromIssueID, toIssueID int64, linkType string) (db.Link, error) {
-	row := d.QueryRowContext(ctx,
+	return linkByEndpoints(ctx, d, fromIssueID, toIssueID, linkType)
+}
+
+func linkByID(ctx context.Context, q sqlReader, id int64) (db.Link, error) {
+	row := q.QueryRowContext(ctx, linkSelect+` WHERE id = ?`, id)
+	return scanLink(row)
+}
+
+func linkByEndpoints(ctx context.Context, q sqlReader, fromIssueID, toIssueID int64, linkType string) (db.Link, error) {
+	row := q.QueryRowContext(ctx,
 		linkSelect+` WHERE from_issue_id = ? AND to_issue_id = ? AND type = ?`,
 		fromIssueID, toIssueID, linkType)
 	return scanLink(row)
@@ -602,18 +629,20 @@ func (d *Store) LinksByIssue(ctx context.Context, issueID int64) ([]db.Link, err
 
 // DeleteLinkByID removes a links row. Returns ErrNotFound when no row exists.
 func (d *Store) DeleteLinkByID(ctx context.Context, linkID int64) error {
-	res, err := d.ExecContext(ctx, `DELETE FROM links WHERE id = ?`, linkID)
-	if err != nil {
-		return fmt.Errorf("delete link: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("delete link rows affected: %w", err)
-	}
-	if n == 0 {
-		return db.ErrNotFound
-	}
-	return nil
+	return d.RetryTransient(ctx, func() error {
+		res, err := d.ExecContext(ctx, `DELETE FROM links WHERE id = ?`, linkID)
+		if err != nil {
+			return fmt.Errorf("delete link: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("delete link rows affected: %w", err)
+		}
+		if n == 0 {
+			return db.ErrNotFound
+		}
+		return nil
+	})
 }
 
 const linkSelect = `SELECT id, project_id, from_issue_id, from_issue_uid, to_issue_id, to_issue_uid, type, author, created_at FROM links`
@@ -648,6 +677,12 @@ func scanLink(r rowScanner) (db.Link, error) {
 // at the call site); event attribution comes from ev. For parent/blocks the
 // two coincide; for related they may differ when canonicalization swapped.
 func (d *Store) CreateLinkAndEvent(ctx context.Context, p db.CreateLinkParams, ev db.LinkEventParams) (db.Link, db.Event, error) {
+	return retryWrite2(ctx, d, func() (db.Link, db.Event, error) {
+		return d.createLinkAndEvent(ctx, p, ev)
+	})
+}
+
+func (d *Store) createLinkAndEvent(ctx context.Context, p db.CreateLinkParams, ev db.LinkEventParams) (db.Link, db.Event, error) {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return db.Link{}, db.Event{}, fmt.Errorf("begin: %w", err)
@@ -754,6 +789,12 @@ func (d *Store) CreateLinkAndEvent(ctx context.Context, p db.CreateLinkParams, e
 // from_short_id/to_short_id/uid) comes from ev. Returns ErrNotFound if the
 // link is already gone — caller maps to 200 no-op envelope per spec §4.5.
 func (d *Store) DeleteLinkAndEvent(ctx context.Context, link db.Link, ev db.LinkEventParams) (db.Event, error) {
+	return retryWrite1(ctx, d, func() (db.Event, error) {
+		return d.deleteLinkAndEvent(ctx, link, ev)
+	})
+}
+
+func (d *Store) deleteLinkAndEvent(ctx context.Context, link db.Link, ev db.LinkEventParams) (db.Event, error) {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return db.Event{}, fmt.Errorf("begin: %w", err)

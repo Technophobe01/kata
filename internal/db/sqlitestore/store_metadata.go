@@ -18,6 +18,12 @@ import (
 // revision_new. No event is emitted and the revision is not bumped when the
 // patch produces no actual change (empty diff).
 func (d *Store) PatchIssueMetadata(ctx context.Context, in db.PatchIssueMetadataIn) (db.PatchIssueMetadataOut, error) {
+	return retryWrite1(ctx, d, func() (db.PatchIssueMetadataOut, error) {
+		return d.patchIssueMetadata(ctx, in)
+	})
+}
+
+func (d *Store) patchIssueMetadata(ctx context.Context, in db.PatchIssueMetadataIn) (db.PatchIssueMetadataOut, error) {
 	var out db.PatchIssueMetadataOut
 
 	// Validate all patch keys before opening a tx. A bad key/value never starts a tx.
@@ -73,11 +79,11 @@ func (d *Store) PatchIssueMetadata(ctx context.Context, in db.PatchIssueMetadata
 
 	if len(diff) == 0 {
 		// No-op: commit (no writes) and return Changed=false. Revision unchanged.
-		if err := tx.Commit(); err != nil {
+		issue, err := issueByIDTx(ctx, tx, in.IssueID)
+		if err != nil {
 			return out, err
 		}
-		issue, err := d.IssueByID(ctx, in.IssueID)
-		if err != nil {
+		if err := tx.Commit(); err != nil {
 			return out, err
 		}
 		out.Issue = issue
@@ -129,12 +135,11 @@ func (d *Store) PatchIssueMetadata(ctx context.Context, in db.PatchIssueMetadata
 		return out, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	issue, err := issueByIDTx(ctx, tx, in.IssueID)
+	if err != nil {
 		return out, err
 	}
-
-	issue, err := d.IssueByID(ctx, in.IssueID)
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		return out, err
 	}
 	out.Issue = issue
@@ -151,6 +156,12 @@ func (d *Store) PatchIssueMetadata(ctx context.Context, in db.PatchIssueMetadata
 // revision_new. No event is emitted and the revision is not bumped when the
 // patch produces no actual change (empty diff). Soft-deleted projects are rejected.
 func (d *Store) PatchProjectMetadata(ctx context.Context, in db.PatchProjectMetadataIn) (db.PatchProjectMetadataOut, error) {
+	return retryWrite1(ctx, d, func() (db.PatchProjectMetadataOut, error) {
+		return d.patchProjectMetadata(ctx, in)
+	})
+}
+
+func (d *Store) patchProjectMetadata(ctx context.Context, in db.PatchProjectMetadataIn) (db.PatchProjectMetadataOut, error) {
 	var out db.PatchProjectMetadataOut
 
 	// Validate all patch keys before opening a tx. A bad key/value never starts a tx.
@@ -205,11 +216,11 @@ func (d *Store) PatchProjectMetadata(ctx context.Context, in db.PatchProjectMeta
 
 	if len(diff) == 0 {
 		// No-op: commit (no writes) and return Changed=false. Revision unchanged.
-		if err := tx.Commit(); err != nil {
+		project, err := projectByIDTx(ctx, tx, in.ProjectID)
+		if err != nil {
 			return out, err
 		}
-		project, err := d.ProjectByID(ctx, in.ProjectID)
-		if err != nil {
+		if err := tx.Commit(); err != nil {
 			return out, err
 		}
 		out.Project = project
@@ -257,12 +268,11 @@ func (d *Store) PatchProjectMetadata(ctx context.Context, in db.PatchProjectMeta
 		return out, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	project, err := projectByIDTx(ctx, tx, in.ProjectID)
+	if err != nil {
 		return out, err
 	}
-
-	project, err := d.ProjectByID(ctx, in.ProjectID)
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		return out, err
 	}
 	out.Project = project

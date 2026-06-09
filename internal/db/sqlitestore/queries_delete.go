@@ -16,6 +16,12 @@ import (
 // Already-deleted issues are returned as a no-op envelope (nil event,
 // changed=false). Unknown issues return ErrNotFound.
 func (d *Store) SoftDeleteIssue(ctx context.Context, issueID int64, actor string) (db.Issue, *db.Event, bool, error) {
+	return retryWrite3(ctx, d, func() (db.Issue, *db.Event, bool, error) {
+		return d.softDeleteIssue(ctx, issueID, actor)
+	})
+}
+
+func (d *Store) softDeleteIssue(ctx context.Context, issueID int64, actor string) (db.Issue, *db.Event, bool, error) {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return db.Issue{}, nil, false, err
@@ -52,11 +58,11 @@ func (d *Store) SoftDeleteIssue(ctx context.Context, issueID int64, actor string
 	}
 	if n == 0 {
 		// Lost the race — another tx soft-deleted this issue. No event.
-		if err := tx.Commit(); err != nil {
+		updated, err := issueByIDTx(ctx, tx, issueID)
+		if err != nil {
 			return db.Issue{}, nil, false, err
 		}
-		updated, err := d.IssueByID(ctx, issueID)
-		if err != nil {
+		if err := tx.Commit(); err != nil {
 			return db.Issue{}, nil, false, err
 		}
 		return updated, nil, false, nil
@@ -78,11 +84,11 @@ func (d *Store) SoftDeleteIssue(ctx context.Context, issueID int64, actor string
 	if err != nil {
 		return db.Issue{}, nil, false, err
 	}
-	if err := tx.Commit(); err != nil {
+	updated, err := issueByIDTx(ctx, tx, issueID)
+	if err != nil {
 		return db.Issue{}, nil, false, err
 	}
-	updated, err := d.IssueByID(ctx, issueID)
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		return db.Issue{}, nil, false, err
 	}
 	return updated, &evt, true, nil
@@ -91,6 +97,12 @@ func (d *Store) SoftDeleteIssue(ctx context.Context, issueID int64, actor string
 // RestoreIssue clears deleted_at and emits issue.restored. Not-deleted issues
 // are returned as a no-op envelope. Unknown issues return ErrNotFound.
 func (d *Store) RestoreIssue(ctx context.Context, issueID int64, actor string) (db.Issue, *db.Event, bool, error) {
+	return retryWrite3(ctx, d, func() (db.Issue, *db.Event, bool, error) {
+		return d.restoreIssue(ctx, issueID, actor)
+	})
+}
+
+func (d *Store) restoreIssue(ctx context.Context, issueID int64, actor string) (db.Issue, *db.Event, bool, error) {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return db.Issue{}, nil, false, err
@@ -124,11 +136,11 @@ func (d *Store) RestoreIssue(ctx context.Context, issueID int64, actor string) (
 	}
 	if n == 0 {
 		// Lost the race — another tx restored this issue. No event.
-		if err := tx.Commit(); err != nil {
+		updated, err := issueByIDTx(ctx, tx, issueID)
+		if err != nil {
 			return db.Issue{}, nil, false, err
 		}
-		updated, err := d.IssueByID(ctx, issueID)
-		if err != nil {
+		if err := tx.Commit(); err != nil {
 			return db.Issue{}, nil, false, err
 		}
 		return updated, nil, false, nil
@@ -151,11 +163,11 @@ func (d *Store) RestoreIssue(ctx context.Context, issueID int64, actor string) (
 	if err != nil {
 		return db.Issue{}, nil, false, err
 	}
-	if err := tx.Commit(); err != nil {
+	updated, err := issueByIDTx(ctx, tx, issueID)
+	if err != nil {
 		return db.Issue{}, nil, false, err
 	}
-	updated, err := d.IssueByID(ctx, issueID)
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		return db.Issue{}, nil, false, err
 	}
 	return updated, &evt, true, nil
@@ -180,6 +192,12 @@ type sqlReader interface {
 // Returns ErrNotFound if the issue does not exist (whether or not it had been
 // soft-deleted first).
 func (d *Store) PurgeIssue(ctx context.Context, issueID int64, actor string, reason *string) (db.PurgeLog, error) {
+	return retryWrite1(ctx, d, func() (db.PurgeLog, error) {
+		return d.purgeIssue(ctx, issueID, actor, reason)
+	})
+}
+
+func (d *Store) purgeIssue(ctx context.Context, issueID int64, actor string, reason *string) (db.PurgeLog, error) {
 	conn, err := d.Conn(ctx)
 	if err != nil {
 		return db.PurgeLog{}, fmt.Errorf("acquire conn: %w", err)

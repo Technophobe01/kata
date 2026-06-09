@@ -20,6 +20,12 @@ import (
 //
 // Idempotent no-ops do not emit their event.
 func (d *Store) EditIssueAtomic(ctx context.Context, p db.EditIssueAtomicParams) (db.EditIssueAtomicResult, error) {
+	return retryWrite1(ctx, d, func() (db.EditIssueAtomicResult, error) {
+		return d.editIssueAtomic(ctx, p)
+	})
+}
+
+func (d *Store) editIssueAtomic(ctx context.Context, p db.EditIssueAtomicParams) (db.EditIssueAtomicResult, error) {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return db.EditIssueAtomicResult{}, err
@@ -155,13 +161,12 @@ func (d *Store) EditIssueAtomic(ctx context.Context, p db.EditIssueAtomicParams)
 		anyChange = true
 	}
 
-	if err := tx.Commit(); err != nil {
-		return db.EditIssueAtomicResult{}, fmt.Errorf("commit: %w", err)
-	}
-
-	updated, err := d.IssueByID(ctx, p.IssueID)
+	updated, err := issueByIDTx(ctx, tx, p.IssueID)
 	if err != nil {
 		return db.EditIssueAtomicResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return db.EditIssueAtomicResult{}, fmt.Errorf("commit: %w", err)
 	}
 	return db.EditIssueAtomicResult{
 		Issue:     updated,

@@ -18,6 +18,22 @@ func (d *Store) CreateFederationEnrollment(
 	ctx context.Context,
 	p db.CreateFederationEnrollmentParams,
 ) (db.CreatedFederationEnrollment, error) {
+	if p.Token == "" {
+		token, err := generateFederationToken()
+		if err != nil {
+			return db.CreatedFederationEnrollment{}, err
+		}
+		p.Token = token
+	}
+	return retryWrite1(ctx, d, func() (db.CreatedFederationEnrollment, error) {
+		return d.createFederationEnrollment(ctx, p)
+	})
+}
+
+func (d *Store) createFederationEnrollment(
+	ctx context.Context,
+	p db.CreateFederationEnrollmentParams,
+) (db.CreatedFederationEnrollment, error) {
 	if !katauid.Valid(p.SpokeInstanceUID) {
 		return db.CreatedFederationEnrollment{}, fmt.Errorf("invalid spoke instance uid %q", p.SpokeInstanceUID)
 	}
@@ -29,24 +45,23 @@ func (d *Store) CreateFederationEnrollment(
 	if err := db.ValidateTokenActor(actor); err != nil {
 		return db.CreatedFederationEnrollment{}, fmt.Errorf("federation enrollment actor: %w", err)
 	}
-	token := p.Token
-	if token == "" {
-		token, err = generateFederationToken()
-		if err != nil {
-			return db.CreatedFederationEnrollment{}, err
-		}
-	}
 	var projectID any
 	if p.ProjectID != nil {
 		projectID = *p.ProjectID
 	}
-	res, err := d.ExecContext(ctx, `
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return db.CreatedFederationEnrollment{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO federation_enrollments(
 		  token_hash, spoke_instance_uid, project_id, capabilities, bound_actor,
 		  allow_adoption_snapshot_authors
 		)
 		VALUES(?, ?, ?, ?, ?, ?)`,
-		db.FederationTokenHash(token), p.SpokeInstanceUID, projectID, capabilities, actor,
+		db.FederationTokenHash(p.Token), p.SpokeInstanceUID, projectID, capabilities, actor,
 		p.AllowAdoptionSnapshotAuthors)
 	if err != nil {
 		return db.CreatedFederationEnrollment{}, fmt.Errorf("create federation enrollment: %w", err)
@@ -55,11 +70,14 @@ func (d *Store) CreateFederationEnrollment(
 	if err != nil {
 		return db.CreatedFederationEnrollment{}, fmt.Errorf("federation enrollment last id: %w", err)
 	}
-	enrollment, err := d.federationEnrollmentByID(ctx, id)
+	enrollment, err := federationEnrollmentByIDTx(ctx, tx, id)
 	if err != nil {
 		return db.CreatedFederationEnrollment{}, err
 	}
-	return db.CreatedFederationEnrollment{Enrollment: enrollment, Token: token}, nil
+	if err := tx.Commit(); err != nil {
+		return db.CreatedFederationEnrollment{}, err
+	}
+	return db.CreatedFederationEnrollment{Enrollment: enrollment, Token: p.Token}, nil
 }
 
 // ListFederationEnrollments returns every enrollment row ordered by id.
@@ -83,22 +101,24 @@ func (d *Store) ListFederationEnrollments(ctx context.Context) ([]db.FederationE
 // RevokeFederationEnrollment marks an enrollment inactive. Revocation is
 // one-way; repeated calls leave the original revoked_at intact.
 func (d *Store) RevokeFederationEnrollment(ctx context.Context, id int64) error {
-	res, err := d.ExecContext(ctx, `
-		UPDATE federation_enrollments
-		   SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-		       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		 WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("revoke federation enrollment: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("revoke federation enrollment rows affected: %w", err)
-	}
-	if n == 0 {
-		return db.ErrNotFound
-	}
-	return nil
+	return d.RetryTransient(ctx, func() error {
+		res, err := d.ExecContext(ctx, `
+			UPDATE federation_enrollments
+			   SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			 WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("revoke federation enrollment: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("revoke federation enrollment rows affected: %w", err)
+		}
+		if n == 0 {
+			return db.ErrNotFound
+		}
+		return nil
+	})
 }
 
 // AuthorizeFederationToken returns the active enrollment matching token,
@@ -141,8 +161,8 @@ func generateFederationToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
-func (d *Store) federationEnrollmentByID(ctx context.Context, id int64) (db.FederationEnrollment, error) {
-	return scanFederationEnrollment(d.QueryRowContext(ctx,
+func federationEnrollmentByIDTx(ctx context.Context, tx *sql.Tx, id int64) (db.FederationEnrollment, error) {
+	return scanFederationEnrollment(tx.QueryRowContext(ctx,
 		federationEnrollmentSelect+` WHERE id = ?`, id))
 }
 

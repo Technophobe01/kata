@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,6 +35,25 @@ func TestCreateIssue_AllocatesShortIDAndEmitsEvent(t *testing.T) {
 	assert.NotNil(t, evt.IssueID)
 	require.NotNil(t, evt.IssueUID)
 	assert.Equal(t, issue.UID, *evt.IssueUID)
+}
+
+func TestCreateIssue_RetriesTransientSQLiteBusy(t *testing.T) {
+	d, path := openTestDBWithPath(t)
+	ctx := context.Background()
+	p := createProject(ctx, t, d, "busy-create")
+	useFastSQLiteBusyTimeout(ctx, t, d)
+
+	lockConn := holdSQLiteWriteLock(ctx, t, path)
+	releaseSQLiteWriteLockAfter(ctx, t, lockConn, 50*time.Millisecond)
+
+	issue, evt, err := d.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: p.ID,
+		Title:     "retry after sqlite busy",
+		Author:    "tester",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "retry after sqlite busy", issue.Title)
+	assert.Equal(t, "issue.created", evt.Type)
 }
 
 func TestCreateIssue_ShortIDsAreUniquePerProject(t *testing.T) {
