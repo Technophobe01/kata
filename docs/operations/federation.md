@@ -379,6 +379,139 @@ issues keep their original displayed content authors.
 Adopted issues become ordinary federated spoke issues. You can keep editing
 them locally; acquire a hub lease only when you want exclusive coordination.
 
+## Leaving a federation
+
+`kata federation leave` is the inverse of `join`: it revokes the spoke's hub
+enrollment, then tears down the local spoke state so the project becomes an
+ordinary standalone local project again.
+
+```sh
+kata federation leave <project>
+```
+
+By default this **detaches**: the local `federation_bindings`,
+`federation_sync_status`, and quarantine rows are removed, the stored hub
+credential is deleted, and all of the project's issues and current state are
+kept. Leaving is revoke-first — the hub enrollment is revoked before any local
+teardown, so a hub failure leaves local state intact for a clean retry.
+
+Add `--delete` to also archive the now-standalone project (reversible with
+`kata projects restore`); `--delete --force` archives even when the project has
+open issues:
+
+```sh
+kata federation leave <project> --delete
+```
+
+If the project still has open issues and you do not pass `--force`, the leave
+is refused (`project_has_open_issues`) by a daemon preflight **before the hub
+enrollment is revoked**: the binding, the credential, and the hub enrollment
+all stay intact. The same preflight runs for plain detach leaves too, so any
+local refusal the daemon can predict surfaces before hub contact. Close the open issues (or re-run with
+`--force`) and run the leave again. The preflight is advisory — the
+authoritative check runs inside the archive transaction itself, which executes
+after the revoke — so an issue opened in that small window can still land the
+spoke "hub-revoked, locally intact"; re-running `leave --delete --local-only`
+(or `--force`) completes that teardown.
+
+Hub admin auth for the revoke is resolved, in order: `--hub-token`, the
+`--hub <name>` daemon-catalog entry, then the catalog entry whose URL matches
+the binding's hub URL. With no hub credential the revoke request is sent
+**unauthenticated** — the local daemon's global `KATA_AUTH_TOKEN` /
+`[auth].token` is never sent to the hub origin implicitly, so a token-protected
+hub requires `--hub-token`, a catalog entry, or `--local-only`. The hub URL
+itself always comes from the binding, and a catalog token is only ever sent to
+the origin its entry is configured for: a `--hub <name>` entry that is missing
+or whose URL does not match the binding's hub URL is rejected, so a catalog
+admin token cannot leak to a different hub. Use `--hub-token` when you
+deliberately need to present a token the catalog does not associate with that
+hub.
+
+For plain-HTTP overlay hubs joined with `--allow-insecure`, the transport
+opt-in is recorded on the binding itself (as well as in the credential), so
+the leave-time hub client can carry a bearer token to the plaintext hostname
+even after a partial leave lost `credentials.toml`. A same-origin catalog
+entry with `allow_insecure = true` also restores the opt-in, and
+`kata federation leave --allow-insecure` asserts it explicitly when no local
+record of it survives. Without one of those, a token-bearing request to a
+plaintext hostname is refused before any network I/O. Leave also warns when the hub holds a
+matching **global** enrollment (no project scope) for this spoke: it still
+authorizes the left project but is not auto-revoked, since it may serve the
+spoke's other projects.
+
+If no active enrollment matches this spoke's instance UID but project-scoped
+enrollment(s) still authorize the hub project, the leave **aborts** and names
+them instead of treating zero matches as success — the instance UID can change
+after a clone/import, or the enrollment may have been created for another
+instance (including another spoke of a shared hub project). Revoke the right
+one with `kata federation revoke <id>` on the hub, or rerun with
+`--local-only`.
+
+If the hub is unreachable, `--local-only` tears down the local spoke without
+contacting the hub. The enrollment token then **remains valid** until you run
+`kata federation revoke <enrollment-id>` on the hub yourself:
+
+```sh
+kata federation leave <project> --local-only
+```
+
+Leaving is idempotent: running it on a project that is already standalone
+reports success and finishes any cleanup a failed earlier leave left behind
+(such as a stale hub credential in `credentials.toml`), and `leave --delete`
+on a standalone project still archives it. An archive-leave retry on an
+already-archived project also resumes instead of erroring: it detaches a
+surviving binding, deletes a stale credential, and reports `archived=false`
+for that call. The leave command resolves archived projects for its argument
+and `--project` forms, so rerunning the same `kata federation leave
+<project>` completes the pending cleanup directly. A binding surviving on an
+archived project takes the normal bound path: the hub revoke runs (it is
+idempotent, so a retry whose enrollment was already revoked is a no-op, while
+a spoke archived via `kata projects remove` — which does not revoke — gets
+its enrollment revoked instead of silently stranded), then the local teardown
+finishes. `--local-only` remains the unreachable-hub escape.
+
+In the TUI federation view, press `x` on a spoke row to open a leave preview
+(the mutation boundary), toggle detach/archive and local-only, then confirm.
+
+Removing the spoke's already-pushed data from the hub project is a separate
+hub-admin action. A user-facing project purge is not yet available; use
+`--delete` (archive) for now.
+
+### Rejoining after a leave
+
+Leaving keeps the local project's identity: it still shares the hub project's
+UID. A later `join` for that hub project recognizes this and **rejoins** —
+rebinding the existing local project instead of creating a second replica:
+
+```sh
+kata federation join --project <spoke-project> --hub-url <url> \
+  --hub-project-id <id> --token <fresh-enrollment-token> --actor <actor> --push
+```
+
+Pull restarts from the hub's replay horizon (already-applied events
+deduplicate by event UID), and a push-enabled rejoin re-offers local-origin
+events from the beginning — the hub deduplicates what it already has and
+absorbs any edits made while the project was standalone. Rejoin with the same
+actor the enrollment is bound to; events authored as a different actor are
+rejected by the hub and quarantined.
+
+A join that names a *different* project while a local project still holds the
+hub project's UID is refused with `federation_rejoin_name_mismatch`, which
+names the holder — rerun the join with `--project <holder>` to rejoin it. An
+archived holder must be restored (`kata projects restore`) first.
+
+In the TUI, selecting a hub project whose identity is already held by a local
+unbound project presents the operation as **rejoin** of that project rather
+than a new local replica.
+
+### Adoption confirmation in the TUI
+
+Because adoption rewrites the local project's event history, the TUI enroll
+preview no longer executes an adoption on a bare Enter. Enter opens a
+confirmation screen that states the operation — federate local project X
+INTO hub project Y — and requires typing the local project's name. Creating
+a new replica and rejoining stay single-step confirmations.
+
 ## Sync model
 
 A spoke polls the hub for events after its pull cursor. It applies hub events
@@ -445,6 +578,7 @@ kata federation join --project <existing-project> --hub-url <url> \
   --hub-project-id <id> --token <token> --actor <actor> --push --adopt-existing
 kata federation enrollments list
 kata federation revoke <enrollment-id>
+kata federation leave <project> [--delete [--force]] [--local-only] [--hub <name>]
 kata federation status
 kata federation status --json
 kata federation lease acquire <issue-ref> [--ttl 30m]

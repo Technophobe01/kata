@@ -166,6 +166,9 @@ type ResolveResp struct {
 	Project struct {
 		ID   int64  `json:"id"`
 		Name string `json:"name"`
+		// UID seeds projectUIDByID at boot so the enroll flow's rejoin
+		// detection works before the async project-list fetch lands.
+		UID string `json:"uid"`
 	} `json:"project"`
 	WorkspaceRoot string `json:"workspace_root"`
 }
@@ -174,6 +177,9 @@ type ResolveResp struct {
 type ProjectSummary struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
+	// UID is the project's durable identity. Federated replicas share it with
+	// their hub project, which is how the enroll flow recognizes a rejoin.
+	UID string `json:"uid,omitempty"`
 }
 
 // InstanceInfo is the daemon instance identity returned by /api/v1/instance.
@@ -201,6 +207,19 @@ type ProjectFederationMetadata = api.ProjectFederationBody
 
 // FederationReplicaResult is the spoke join/adoption result response.
 type FederationReplicaResult = api.CreateFederationReplicaBody
+
+// LeaveFederationReplicaResult is the spoke leave (detach/archive) response.
+type LeaveFederationReplicaResult = api.LeaveFederationReplicaResultBody
+
+// LeaveFederationReplicaInput is the spoke leave request body.
+type LeaveFederationReplicaInput struct {
+	Disposition string `json:"disposition,omitempty"` // "detach" | "archive"
+	Force       bool   `json:"force,omitempty"`
+	Actor       string `json:"actor,omitempty"`
+	// Preflight validates (archive eligibility, spoke role) without mutating,
+	// so the archive's open-issue refusal can surface BEFORE the hub revoke.
+	Preflight bool `json:"preflight,omitempty"`
+}
 
 // CreateFederationReplicaInput is the spoke join/adoption request body.
 type CreateFederationReplicaInput struct {

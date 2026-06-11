@@ -329,6 +329,7 @@ kata federation join --project <existing-project> --hub-url <url> --hub-project-
   --token <token> --actor <actor> --push --adopt-existing
 kata federation enrollments list
 kata federation revoke <enrollment-id>
+kata federation leave <project> [--delete [--force]] [--local-only] [--hub <name>]
 kata federation status
 kata federation status --json
 kata federation lease acquire <issue-ref> [--ttl 30m]
@@ -338,9 +339,54 @@ kata federation lease release <issue-ref>
 `kata federation enrollments list` audits hub-side spoke grants without showing
 token hashes or plaintext tokens. `kata federation revoke <enrollment-id>` marks
 an enrollment inactive so the token no longer authorizes pull, push, or lease
-transport calls. Project-level `leave` and `disable` teardown commands are not
-currently exposed; operators should treat those as a separate reset/removal
-workflow because local pending pushes and replicated state need explicit policy.
+transport calls.
+
+`kata federation leave <project>` is the spoke-side inverse of `join`. It
+revokes the matching hub enrollment, then detaches the local spoke back to a
+standalone project — removing the binding, sync-status, quarantine, and claim
+rows and deleting the daemon-local hub credential in one daemon-route operation
+(`POST /api/v1/federation/replicas/{id}/actions/leave`). Leaving is revoke-first,
+so a hub failure leaves local state intact for a clean retry; it is idempotent
+(a project with no binding reports "already standalone", and the daemon route
+still runs so a stale hub credential left by a partial leave is deleted on the
+retry). `--delete` also archives the
+now-standalone project (reversible via `kata projects restore`), with archive
+eligibility checked before any detach so an open-issue refusal cannot leave the
+project half-torn-down; `--force` overrides that refusal. An advisory daemon
+preflight (`preflight=true` on the leave route) runs before the hub revoke for
+every hub-contacting leave — detach refusals (spoke-role drift, vanished
+project, actor validation) and the archive's open-issue check alike — so a
+predictable local refusal cannot strand a hub-revoked, locally bound spoke. Retrying an
+archive-leave whose archive already committed resumes rather than refusing:
+the already-archived step is skipped (that call reports `archived=false`) and
+any surviving detach and credential cleanup still run. The join-time
+`--allow-insecure` transport opt-in is persisted on the binding (schema 15)
+and surfaced in status as the union with the credential's copy (only when
+that credential names the binding's hub URL and project); the leave hub
+client further unions a same-origin catalog entry's `allow_insecure` and the
+explicit `leave --allow-insecure` flag, so a credential loss cannot strand a
+plain-HTTP overlay hub's enrollment behind the plaintext-bearer refusal. `--local-only` tears
+down locally when the hub is unreachable, leaving the enrollment token to be
+revoked manually. A binding-aware guard stops an in-flight sync pass from
+re-creating `federation_sync_status` rows after a leave, and quarantine
+recording no-ops the same way so a poisoned push response landing after the
+leave cannot recreate active quarantine state for a standalone or archived
+project. A user-facing project purge for the `--delete` path is deferred.
+
+Leave keeps the project's shared identity (its UID stays the hub project's
+UID), which makes the round-trip contract hold: **enroll → leave → enroll
+works**. A `join` that targets a hub project whose UID is held by an unbound
+local project of the same name rebinds it (rejoin): pull restarts just below
+the replay horizon and event-UID dedup absorbs the overlap, while a
+push-enabled rejoin restarts the push cursor at 0 so the hub deduplicates
+re-offered events and absorbs edits made while standalone. The same path
+recovers a partially-failed join (project created, binding never written). A
+join naming a different project refuses with
+`federation_rejoin_name_mismatch`, naming the holder; an archived holder must
+be restored first. In the TUI, adoption (history-rewriting) is additionally
+gated behind a typed-confirmation screen stating the local-INTO-hub
+relationship, and the enrollment recovery screen prints the actual join error
+(the token-expiry hint is reserved for 401/403).
 
 `kata federation status` reports one entry for each local federation binding:
 

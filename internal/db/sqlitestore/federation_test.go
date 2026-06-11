@@ -20,7 +20,7 @@ import (
 func TestFederationSchemaVersionAndTable(t *testing.T) {
 	d := openTestDB(t)
 
-	assert.Equal(t, 14, db.CurrentSchemaVersion())
+	assert.Equal(t, 15, db.CurrentSchemaVersion())
 	assertSchemaVersion(t, d, db.CurrentSchemaVersion())
 	assertSchemaObject(t, d, "federation_bindings")
 	assertSchemaObject(t, d, "idx_federation_bindings_role_enabled")
@@ -31,6 +31,7 @@ func TestFederationSchemaVersionAndTable(t *testing.T) {
 	assertSchemaObject(t, d, "idx_events_origin_project_id")
 	assertFederationBindingColumn(t, d, "push_enabled")
 	assertFederationBindingColumn(t, d, "push_cursor_event_id")
+	assertFederationBindingColumn(t, d, "allow_insecure")
 	for _, column := range []string{
 		"last_pull_started_at", "last_pull_success_at",
 		"last_push_started_at", "last_push_success_at",
@@ -130,6 +131,7 @@ func TestFederationBindingUpsertRoundTrip(t *testing.T) {
 
 func TestFederationSyncStatusRecordsOperationalState(t *testing.T) {
 	d, ctx, p := setupTestProject(t)
+	upsertTestSpokeFederationBinding(ctx, t, d, p, true)
 	pullStarted := time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
 	pullSuccess := pullStarted.Add(2 * time.Second)
 	pushStarted := pullSuccess.Add(3 * time.Second)
@@ -159,6 +161,7 @@ func TestFederationSyncStatusRecordsOperationalState(t *testing.T) {
 
 func TestFederationSyncStatusSuccessDoesNotClearPriorError(t *testing.T) {
 	d, ctx, p := setupTestProject(t)
+	upsertTestSpokeFederationBinding(ctx, t, d, p, true)
 	errorAt := time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
 	successAt := errorAt.Add(time.Minute)
 
@@ -175,6 +178,7 @@ func TestFederationSyncStatusSuccessDoesNotClearPriorError(t *testing.T) {
 
 func TestFederationSyncStatusClearErrorExplicitly(t *testing.T) {
 	d, ctx, p := setupTestProject(t)
+	upsertTestSpokeFederationBinding(ctx, t, d, p, true)
 	errorAt := time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
 
 	require.NoError(t, d.RecordFederationSyncError(ctx, p.ID, errors.New("hub offline"), errorAt))
@@ -188,6 +192,8 @@ func TestFederationSyncStatusClearErrorExplicitly(t *testing.T) {
 
 func TestFederationQuarantineRecordAndActiveRoundTrip(t *testing.T) {
 	d, ctx, p := setupTestProject(t)
+	// Quarantine recording is binding-guarded (leave race); seed the binding.
+	upsertTestSpokeFederationBinding(ctx, t, d, p, true)
 	createdAt := time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
 	params := db.RecordFederationQuarantineParams{
 		ProjectID:    p.ID,
@@ -219,6 +225,8 @@ func TestFederationQuarantineRecordAndActiveRoundTrip(t *testing.T) {
 
 func TestFederationQuarantineRecordIsIdempotentPerProjectDirection(t *testing.T) {
 	d, ctx, p := setupTestProject(t)
+	// Quarantine recording is binding-guarded (leave race); seed the binding.
+	upsertTestSpokeFederationBinding(ctx, t, d, p, true)
 	first, err := d.RecordFederationQuarantine(ctx, db.RecordFederationQuarantineParams{
 		ProjectID:    p.ID,
 		Direction:    db.FederationQuarantineDirectionPush,
@@ -3167,4 +3175,163 @@ func TestCountActiveFederationEnrollments(t *testing.T) {
 	got, err = d.CountActiveFederationEnrollments(ctx, p.ID)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), got, "active project + active global counted; revoked excluded")
+}
+
+// newTestSpokeProject creates a project with a spoke federation binding and a
+// sync status row, returning the projectID and projectUID.
+func newTestSpokeProject(t *testing.T, d *sqlitestore.Store) (int64, string) {
+	t.Helper()
+	ctx := context.Background()
+	p := createProject(ctx, t, d, "spoke-project")
+	_, err := d.UpsertFederationBinding(ctx, db.FederationBinding{
+		ProjectID:            p.ID,
+		Role:                 db.FederationRoleSpoke,
+		HubURL:               "http://hub.example:7373",
+		HubProjectID:         42,
+		HubProjectUID:        newTestUID(t),
+		ReplayHorizonEventID: 1,
+		Enabled:              true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, d.RecordFederationSyncPullStarted(ctx, p.ID, time.Now().UTC()))
+	return p.ID, p.UID
+}
+
+// newTestStandaloneProject creates a plain project with no federation binding.
+func newTestStandaloneProject(t *testing.T, d *sqlitestore.Store) int64 {
+	t.Helper()
+	ctx := context.Background()
+	p := createProject(ctx, t, d, "standalone-project")
+	return p.ID
+}
+
+// newTestHubProject creates a project with a hub federation binding.
+func newTestHubProject(t *testing.T, d *sqlitestore.Store) int64 {
+	t.Helper()
+	ctx := context.Background()
+	p := createProject(ctx, t, d, "hub-project")
+	_, err := d.UpsertFederationBinding(ctx, db.FederationBinding{
+		ProjectID:     p.ID,
+		Role:          db.FederationRoleHub,
+		HubProjectUID: p.UID,
+		Enabled:       true,
+	})
+	require.NoError(t, err)
+	return p.ID
+}
+
+func TestLeaveFederationReplicaDetachesSpoke(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	projectID, projectUID := newTestSpokeProject(t, d)
+
+	res, err := d.LeaveFederationReplica(ctx, projectID)
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if res.ProjectUID != projectUID || res.Role != db.FederationRoleSpoke {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if _, err := d.FederationBindingByProject(ctx, projectID); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("binding should be gone, got %v", err)
+	}
+	if _, err := d.ProjectByID(ctx, projectID); err != nil {
+		t.Fatalf("project should survive detach: %v", err)
+	}
+}
+
+func TestLeaveFederationReplicaIdempotentWhenStandalone(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	projectID := newTestStandaloneProject(t, d)
+	res, err := d.LeaveFederationReplica(ctx, projectID)
+	if err != nil {
+		t.Fatalf("leave on standalone should be nil error, got %v", err)
+	}
+	if res.ProjectID != projectID || res.Role != "" {
+		t.Fatalf("standalone leave should report empty role, got %+v", res)
+	}
+}
+
+func TestLeaveFederationReplicaRejectsHub(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	projectID := newTestHubProject(t, d)
+	if _, err := d.LeaveFederationReplica(ctx, projectID); !errors.Is(err, db.ErrFederationNotSpoke) {
+		t.Fatalf("want ErrFederationNotSpoke, got %v", err)
+	}
+}
+
+// TestLeaveFederationReplicaMissingProjectIsNotFound guards the daemon route's
+// 404 mapping: a missing project must surface db.ErrNotFound, not a wrapped
+// sql.ErrNoRows (which would slip past errors.Is and yield a 500).
+func TestLeaveFederationReplicaMissingProjectIsNotFound(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	if _, err := d.LeaveFederationReplica(ctx, 999999); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("want db.ErrNotFound for missing project, got %v", err)
+	}
+}
+
+// TestQuarantineRecordingNoOpsWithoutBinding: an in-flight push sync that
+// loaded the binding before a leave can receive the hub's poison response
+// after the leave committed. Recording must no-op like the sync-status
+// writers so the race cannot recreate active quarantine state for a
+// standalone (or archived) project and block a later rejoin.
+func TestQuarantineRecordingNoOpsWithoutBinding(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	p := createProject(ctx, t, d, "spoke-project")
+	_, err := d.UpsertFederationBinding(ctx, db.FederationBinding{
+		ProjectID:            p.ID,
+		Role:                 db.FederationRoleSpoke,
+		HubURL:               "http://127.0.0.1:7373",
+		HubProjectID:         42,
+		HubProjectUID:        p.UID,
+		ReplayHorizonEventID: 1,
+		Enabled:              true,
+	})
+	require.NoError(t, err)
+
+	// Leave deletes the binding and quarantine rows; the poisoned push
+	// response lands afterwards.
+	_, err = d.LeaveFederationReplica(ctx, p.ID)
+	require.NoError(t, err)
+
+	got, err := d.RecordFederationQuarantine(ctx, db.RecordFederationQuarantineParams{
+		ProjectID:    p.ID,
+		Direction:    db.FederationQuarantineDirectionPush,
+		FirstEventID: 7,
+		LastEventID:  9,
+		EventUIDs:    []string{"evt-7"},
+		Error:        "hub rejected batch",
+		CreatedAt:    time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err, "post-leave quarantine recording must no-op, not error")
+	assert.Zero(t, got.ID, "no quarantine row should be created without a binding")
+
+	active, err := d.ActiveFederationQuarantinesByProject(ctx, p.ID)
+	require.NoError(t, err)
+	assert.Empty(t, active, "leave racing a poisoned push must not recreate quarantine state")
+}
+
+func TestSyncStatusWritersNoOpWithoutBinding(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	projectID := newTestStandaloneProject(t, d)
+
+	if err := d.RecordFederationSyncPullSuccess(ctx, projectID, time.Now().UTC()); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if err := d.RecordFederationSyncError(ctx, projectID, errors.New("x"), time.Now().UTC()); err != nil {
+		t.Fatalf("record err: %v", err)
+	}
+	var n int
+	if err := d.QueryRowContext(ctx,
+		`SELECT count(*) FROM federation_sync_status WHERE project_id = ?`, projectID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected no sync_status row without a binding, got %d", n)
+	}
 }

@@ -85,11 +85,12 @@ func (d *Store) RecordFederationSyncError(ctx context.Context, projectID int64, 
 	return d.RetryTransient(ctx, func() error {
 		_, err := d.ExecContext(ctx, `
 			INSERT INTO federation_sync_status(project_id, last_error_at, last_error)
-			VALUES(?, ?, ?)
+			SELECT ?, ?, ?
+			WHERE EXISTS (SELECT 1 FROM federation_bindings WHERE project_id = ?)
 			ON CONFLICT(project_id) DO UPDATE SET
 				last_error_at = excluded.last_error_at,
 				last_error = excluded.last_error`,
-			projectID, at.UTC().Format(sqliteTimeFormat), msg)
+			projectID, at.UTC().Format(sqliteTimeFormat), msg, projectID)
 		if err != nil {
 			return fmt.Errorf("record federation sync error: %w", err)
 		}
@@ -103,10 +104,11 @@ func (d *Store) ClearFederationSyncError(ctx context.Context, projectID int64) e
 	return d.RetryTransient(ctx, func() error {
 		_, err := d.ExecContext(ctx, `
 			INSERT INTO federation_sync_status(project_id, last_error_at, last_error)
-			VALUES(?, NULL, NULL)
+			SELECT ?, NULL, NULL
+			WHERE EXISTS (SELECT 1 FROM federation_bindings WHERE project_id = ?)
 			ON CONFLICT(project_id) DO UPDATE SET
 				last_error_at = NULL,
-				last_error = NULL`, projectID)
+				last_error = NULL`, projectID, projectID)
 		if err != nil {
 			return fmt.Errorf("clear federation sync error: %w", err)
 		}
@@ -116,7 +118,11 @@ func (d *Store) ClearFederationSyncError(ctx context.Context, projectID int64) e
 
 // RecordFederationQuarantine creates or returns the active quarantine for one
 // project/direction. A second failure while a quarantine is active preserves
-// the original poisoned batch so status and skip stay stable.
+// the original poisoned batch so status and skip stay stable. Like the
+// sync-status writers, it no-ops (zero quarantine, nil error) when the
+// project has no federation binding: an in-flight sync pass that loaded the
+// binding before a leave must not recreate quarantine state for a standalone
+// or archived project.
 func (d *Store) RecordFederationQuarantine(
 	ctx context.Context,
 	p db.RecordFederationQuarantineParams,
@@ -147,14 +153,24 @@ func (d *Store) recordFederationQuarantine(
 		INSERT INTO federation_quarantine(
 			project_id, direction, first_event_id, last_event_id, event_uids, error, created_at
 		)
-		VALUES(?, ?, ?, ?, ?, ?, ?)
+		SELECT ?, ?, ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM federation_bindings WHERE project_id = ?)
 		ON CONFLICT(project_id, direction) WHERE skipped_at IS NULL DO NOTHING`,
 		p.ProjectID, string(p.Direction), p.FirstEventID, p.LastEventID, string(eventUIDs),
-		p.Error, p.CreatedAt.UTC().Format(sqliteTimeFormat))
+		p.Error, p.CreatedAt.UTC().Format(sqliteTimeFormat), p.ProjectID)
 	if err != nil {
 		return db.FederationQuarantine{}, fmt.Errorf("record federation quarantine: %w", err)
 	}
 	quarantine, err := activeFederationQuarantine(ctx, tx, p.ProjectID, p.Direction)
+	if errors.Is(err, db.ErrNotFound) {
+		// The guarded insert no-opped: no binding row, so leave already tore
+		// this project down (or it was never federated). Surface the no-op,
+		// not an error — the in-flight pass has nothing left to quarantine.
+		if commitErr := tx.Commit(); commitErr != nil {
+			return db.FederationQuarantine{}, commitErr
+		}
+		return db.FederationQuarantine{}, nil
+	}
 	if err != nil {
 		return db.FederationQuarantine{}, err
 	}
@@ -292,10 +308,11 @@ func (d *Store) upsertFederationSyncTime(ctx context.Context, projectID int64, c
 	return d.RetryTransient(ctx, func() error {
 		_, err := d.ExecContext(ctx, fmt.Sprintf(`
 			INSERT INTO federation_sync_status(project_id, %s)
-			VALUES(?, ?)
+			SELECT ?, ?
+			WHERE EXISTS (SELECT 1 FROM federation_bindings WHERE project_id = ?)
 			ON CONFLICT(project_id) DO UPDATE SET
 				%s = excluded.%s`, column, column, column),
-			projectID, at.UTC().Format(sqliteTimeFormat))
+			projectID, at.UTC().Format(sqliteTimeFormat), projectID)
 		if err != nil {
 			return fmt.Errorf("record federation sync %s: %w", column, err)
 		}
@@ -329,13 +346,17 @@ func (d *Store) upsertFederationBinding(ctx context.Context, b db.FederationBind
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	allowInsecure := 0
+	if b.AllowInsecure {
+		allowInsecure = 1
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO federation_bindings(
 			project_id, role, hub_url, hub_project_id, hub_project_uid,
 			replay_horizon_event_id, pull_cursor_event_id, push_enabled,
-			push_cursor_event_id, bound_actor, enabled
+			push_cursor_event_id, bound_actor, allow_insecure, enabled
 		)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_id) DO UPDATE SET
 			role = excluded.role,
 			hub_url = excluded.hub_url,
@@ -346,11 +367,12 @@ func (d *Store) upsertFederationBinding(ctx context.Context, b db.FederationBind
 			push_enabled = excluded.push_enabled,
 			push_cursor_event_id = excluded.push_cursor_event_id,
 			bound_actor = excluded.bound_actor,
+			allow_insecure = excluded.allow_insecure,
 			enabled = excluded.enabled,
 			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
 		b.ProjectID, string(b.Role), b.HubURL, b.HubProjectID, b.HubProjectUID,
 		b.ReplayHorizonEventID, b.PullCursorEventID, pushEnabled, b.PushCursorEventID,
-		actor, enabled)
+		actor, allowInsecure, enabled)
 	if err != nil {
 		return db.FederationBinding{}, fmt.Errorf("upsert federation binding: %w", err)
 	}
@@ -362,6 +384,61 @@ func (d *Store) upsertFederationBinding(ctx context.Context, b db.FederationBind
 		return db.FederationBinding{}, err
 	}
 	return binding, nil
+}
+
+// LeaveFederationReplica detaches a spoke project: it deletes the binding,
+// sync-status, and quarantine rows and clears claim projection state in one
+// transaction, returning the project UID for credential cleanup. It is
+// idempotent: a project with no binding returns a zero-role result and no
+// error. A hub binding returns db.ErrFederationNotSpoke.
+func (d *Store) LeaveFederationReplica(ctx context.Context, projectID int64) (db.LeaveFederationResult, error) {
+	return retryWrite1(ctx, d, func() (db.LeaveFederationResult, error) {
+		return d.leaveFederationReplica(ctx, projectID)
+	})
+}
+
+func (d *Store) leaveFederationReplica(ctx context.Context, projectID int64) (db.LeaveFederationResult, error) {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return db.LeaveFederationResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	uid, err := projectUIDTx(ctx, tx, projectID)
+	if err != nil {
+		return db.LeaveFederationResult{}, err
+	}
+
+	binding, err := federationBindingByProject(ctx, tx, projectID)
+	switch {
+	case errors.Is(err, db.ErrNotFound):
+		if err := tx.Commit(); err != nil {
+			return db.LeaveFederationResult{}, err
+		}
+		return db.LeaveFederationResult{ProjectID: projectID, ProjectUID: uid}, nil
+	case err != nil:
+		return db.LeaveFederationResult{}, err
+	}
+	if binding.Role != db.FederationRoleSpoke {
+		return db.LeaveFederationResult{}, db.ErrFederationNotSpoke
+	}
+
+	for _, stmt := range []string{
+		`DELETE FROM federation_quarantine WHERE project_id = ?`,
+		`DELETE FROM federation_sync_status WHERE project_id = ?`,
+		`DELETE FROM federation_bindings WHERE project_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, projectID); err != nil {
+			return db.LeaveFederationResult{}, fmt.Errorf("leave federation replica: %w", err)
+		}
+	}
+	if err := clearProjectClaimStateTx(ctx, tx, projectID); err != nil {
+		return db.LeaveFederationResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return db.LeaveFederationResult{}, err
+	}
+	return db.LeaveFederationResult{ProjectID: projectID, ProjectUID: uid, Role: db.FederationRoleSpoke}, nil
 }
 
 func (d *Store) boundFederationActorTx(ctx context.Context, tx *sql.Tx, projectID int64) (string, bool, error) {
@@ -881,7 +958,7 @@ func ensureFederatedMoveAllowedTx(ctx context.Context, q sqlReader, projectIDs .
 
 const federationBindingSelect = `SELECT project_id, role, hub_url, hub_project_id, hub_project_uid,
        replay_horizon_event_id, pull_cursor_event_id, push_enabled, push_cursor_event_id,
-       bound_actor, enabled, created_at, updated_at, last_sync_at
+       bound_actor, allow_insecure, enabled, created_at, updated_at, last_sync_at
   FROM federation_bindings`
 
 func federationBindingByProject(ctx context.Context, q sqlReader, projectID int64) (db.FederationBinding, error) {
@@ -891,18 +968,20 @@ func federationBindingByProject(ctx context.Context, q sqlReader, projectID int6
 
 func scanFederationBinding(r rowScanner) (db.FederationBinding, error) {
 	var (
-		b           db.FederationBinding
-		role        string
-		enabled     int
-		pushEnabled int
-		lastSyncAt  sql.NullTime
+		b             db.FederationBinding
+		role          string
+		enabled       int
+		pushEnabled   int
+		allowInsecure int
+		lastSyncAt    sql.NullTime
 	)
 	err := r.Scan(&b.ProjectID, &role, &b.HubURL, &b.HubProjectID, &b.HubProjectUID,
 		&b.ReplayHorizonEventID, &b.PullCursorEventID, &pushEnabled,
-		&b.PushCursorEventID, &b.Actor, &enabled, &b.CreatedAt, &b.UpdatedAt, &lastSyncAt)
+		&b.PushCursorEventID, &b.Actor, &allowInsecure, &enabled, &b.CreatedAt, &b.UpdatedAt, &lastSyncAt)
 	if err == nil {
 		b.Role = db.FederationRole(role)
 		b.PushEnabled = pushEnabled == 1
+		b.AllowInsecure = allowInsecure == 1
 		b.Enabled = enabled == 1
 		if lastSyncAt.Valid {
 			b.LastSyncAt = &lastSyncAt.Time
@@ -1220,8 +1299,14 @@ func federationFoldEvents(ctx context.Context, tx *sql.Tx, projectID int64) ([]d
 
 func projectUIDTx(ctx context.Context, tx *sql.Tx, projectID int64) (string, error) {
 	var uid string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT uid FROM projects WHERE id = ?`, projectID).Scan(&uid); err != nil {
+	err := tx.QueryRowContext(ctx,
+		`SELECT uid FROM projects WHERE id = ?`, projectID).Scan(&uid)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Surface the domain not-found sentinel so callers (e.g. the daemon
+		// leave route) can map a missing project to 404 via errors.Is.
+		return "", db.ErrNotFound
+	}
+	if err != nil {
 		return "", fmt.Errorf("lookup project uid: %w", err)
 	}
 	return uid, nil
@@ -1822,15 +1907,19 @@ func (d *Store) adoptProjectIntoFederation(
 	if pullCursor < 0 {
 		pullCursor = 0
 	}
+	allowInsecure := 0
+	if p.AllowInsecure {
+		allowInsecure = 1
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO federation_bindings(
 			project_id, role, hub_url, hub_project_id, hub_project_uid,
 			replay_horizon_event_id, pull_cursor_event_id, push_enabled,
-			push_cursor_event_id, bound_actor, enabled
+			push_cursor_event_id, bound_actor, allow_insecure, enabled
 		)
-		VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1)`,
+		VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1)`,
 		project.ID, string(db.FederationRoleSpoke), p.HubURL, p.HubProjectID, p.HubProjectUID,
-		p.ReplayHorizonEventID, pullCursor, pushFloor, actor); err != nil {
+		p.ReplayHorizonEventID, pullCursor, pushFloor, actor, allowInsecure); err != nil {
 		return db.AdoptProjectIntoFederationResult{}, fmt.Errorf("insert adoption federation binding: %w", err)
 	}
 

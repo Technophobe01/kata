@@ -158,6 +158,16 @@ func TestFederationSyncStatusRoundTrip(t *testing.T) {
 	srcDB := openExportTestDB(t)
 	p, err := srcDB.CreateProject(ctx, "sync-status")
 	require.NoError(t, err)
+	// federation_sync_status writers no-op without a live binding (the leave
+	// sync-race guard), so seed one before recording sync status.
+	_, err = srcDB.UpsertFederationBinding(ctx, db.FederationBinding{
+		ProjectID:            p.ID,
+		Role:                 db.FederationRoleHub,
+		HubProjectUID:        p.UID,
+		ReplayHorizonEventID: 1,
+		Enabled:              true,
+	})
+	require.NoError(t, err)
 	require.NoError(t, srcDB.RecordFederationSyncPullStarted(ctx, p.ID, mustParseTime(t, "2026-05-23T01:00:00.000Z")))
 	require.NoError(t, srcDB.RecordFederationSyncPullSuccess(ctx, p.ID, mustParseTime(t, "2026-05-23T01:00:01.000Z")))
 	require.NoError(t, srcDB.RecordFederationSyncPushStarted(ctx, p.ID, mustParseTime(t, "2026-05-23T01:00:02.000Z")))
@@ -405,6 +415,7 @@ func TestRoundtrip_FederationBindingCarriesPushState(t *testing.T) {
 		PushEnabled:          true,
 		PushCursorEventID:    5,
 		Actor:                "wesm",
+		AllowInsecure:        true,
 		Enabled:              true,
 	}
 	_, err = srcDB.UpsertFederationBinding(ctx, binding)
@@ -428,6 +439,7 @@ func TestRoundtrip_FederationBindingCarriesPushState(t *testing.T) {
 	assert.Equal(t, true, bindingPayload["push_enabled"])
 	assert.Equal(t, float64(5), bindingPayload["push_cursor_event_id"])
 	assert.Equal(t, "wesm", bindingPayload["bound_actor"])
+	assert.Equal(t, true, bindingPayload["allow_insecure"])
 	assert.NotContains(t, bindingPayload, "materialize_after_event_id")
 
 	dstDB := openImportTargetDB(t)
@@ -437,6 +449,7 @@ func TestRoundtrip_FederationBindingCarriesPushState(t *testing.T) {
 	assert.True(t, got.PushEnabled)
 	assert.Equal(t, int64(5), got.PushCursorEventID)
 	assert.Equal(t, "wesm", got.Actor)
+	assert.True(t, got.AllowInsecure, "allow_insecure must survive the JSONL round trip")
 }
 
 func TestRoundtrip_FederationEnrollmentRows(t *testing.T) {

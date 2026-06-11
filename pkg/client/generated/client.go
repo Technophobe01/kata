@@ -142,8 +142,11 @@ type ClientInterface interface {
 	CreateFederationReplica(ctx context.Context, options *CreateFederationReplicaRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CreateFederationReplicaResponse, error)
 	CreateFederationReplicaWithResponse(ctx context.Context, options *CreateFederationReplicaRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CreateFederationReplicaResp, error)
 
-	GetFederationStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetFederationStatusResponse, error)
-	GetFederationStatusWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetFederationStatusResp, error)
+	LeaveFederationReplica(ctx context.Context, options *LeaveFederationReplicaRequestOptions, reqEditors ...runtime.RequestEditorFn) (*LeaveFederationReplicaResponse, error)
+	LeaveFederationReplicaWithResponse(ctx context.Context, options *LeaveFederationReplicaRequestOptions, reqEditors ...runtime.RequestEditorFn) (*LeaveFederationReplicaResp, error)
+
+	GetFederationStatus(ctx context.Context, options *GetFederationStatusRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetFederationStatusResponse, error)
+	GetFederationStatusWithResponse(ctx context.Context, options *GetFederationStatusRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetFederationStatusResp, error)
 
 	Health(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*HealthResponse, error)
 	HealthWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*HealthResp, error)
@@ -839,11 +842,80 @@ func (c *Client) CreateFederationReplica(ctx context.Context, options *CreateFed
 	return responseParser(ctx, resp)
 }
 
-func (c *Client) GetFederationStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetFederationStatusResponse, error) {
+func (c *Client) LeaveFederationReplica(ctx context.Context, options *LeaveFederationReplicaRequestOptions, reqEditors ...runtime.RequestEditorFn) (*LeaveFederationReplicaResponse, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
-		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/federation/status",
-		Method:     "GET",
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/federation/replicas/{project_id}/actions/leave",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*LeaveFederationReplicaResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(LeaveFederationReplicaErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "LeaveFederationReplicaErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(LeaveFederationReplicaResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "LeaveFederationReplicaResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/federation/replicas/{project_id}/actions/leave")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+func (c *Client) GetFederationStatus(ctx context.Context, options *GetFederationStatusRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetFederationStatusResponse, error) {
+	var err error
+
+	queryEncoding := map[string]runtime.QueryEncoding{
+		"include": {Style: "form", Explode: &[]bool{false}[0]},
+	}
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:    c.apiClient.GetBaseURL() + "/api/v1/federation/status",
+		Method:        "GET",
+		Options:       options,
+		QueryEncoding: queryEncoding,
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)

@@ -24,6 +24,11 @@ const (
 	federationModeSelectHub
 	federationModeSelectHubProject
 	federationModeBrowseHubs
+	federationModeLeavePreview
+	// federationModeAdoptConfirm is the typed-confirmation gate between the
+	// enroll preview and execution for adoption operations, which rewrite the
+	// local project's event history.
+	federationModeAdoptConfirm
 )
 
 type federationOperation string
@@ -32,6 +37,9 @@ const (
 	federationOperationAdoptSameName    federationOperation = "adopt-same-name"
 	federationOperationAdoptSelectedHub federationOperation = "adopt-selected-hub"
 	federationOperationCreateReplica    federationOperation = "create-replica"
+	// federationOperationRejoin rebinds a local project that previously left
+	// this hub project's federation (it still shares the hub project's UID).
+	federationOperationRejoin federationOperation = "rejoin"
 )
 
 type federationDraft struct {
@@ -60,6 +68,38 @@ type federationEnrollResult struct {
 	Metadata   ProjectFederationMetadata
 	Replica    FederationReplicaResult
 	Recovery   federationRecovery
+}
+
+// federationLeaveDraft captures one spoke row's leave intent. It is the
+// mutation boundary: populated when `x` is pressed on a spoke row and
+// rendered in federationModeLeavePreview before any hub revoke or local
+// teardown runs. Disposition is "detach" (default) or "archive". LocalOnly
+// skips the hub revoke (leaving the enrollment token valid). BlockedReason is
+// set when the selected row cannot be left (e.g. not a spoke).
+type federationLeaveDraft struct {
+	ProjectID     int64
+	ProjectName   string
+	HubURL        string
+	HubProjectID  int64
+	InstanceUID   string
+	AllowInsecure bool
+	Disposition   string
+	Actor         string
+	LocalOnly     bool
+	BlockedReason string
+}
+
+// federationLeaveResult is the outcome surfaced on the result screen after a
+// successful leave.
+type federationLeaveResult struct {
+	Draft         federationLeaveDraft
+	RevokedCount  int
+	SkippedRevoke bool
+	// GlobalEnrollmentIDs are active hub enrollments with global (nil) project
+	// scope for this spoke: they still authorize the left project but are not
+	// auto-revoked, since they may serve other projects.
+	GlobalEnrollmentIDs []int64
+	Body                LeaveFederationReplicaResult
 }
 
 type federationRecovery struct {
@@ -197,6 +237,7 @@ func (m Model) handleFederationEnrollResult(msg federationEnrollResultMsg) (Mode
 		return m, nil
 	}
 	m.federationResult = msg.result
+	m.federationResultIsLeave = false
 	m.federationMode = federationModeResult
 	m.federationLoading = true
 	m.federationErr = nil
@@ -219,6 +260,10 @@ func (m Model) routeFederationViewKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m.routeFederationBrowseHubsKey(msg)
 	case federationModePreview:
 		return m.routeFederationPreviewKey(msg)
+	case federationModeAdoptConfirm:
+		return m.routeFederationAdoptConfirmKey(msg)
+	case federationModeLeavePreview:
+		return m.routeFederationLeavePreviewKey(msg)
 	case federationModeRecovery:
 		return m.routeFederationRecoveryKey(msg)
 	case federationModeResult:
@@ -239,6 +284,11 @@ func (m Model) routeFederationViewKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, m.fetchFederationStatus()
 	case "b":
 		return m.startFederationHubBrowse()
+	case "x":
+		if m.federationCursor < 0 || m.federationCursor >= len(rows) {
+			return m, nil
+		}
+		return m.startFederationLeave(rows[m.federationCursor])
 	case "enter":
 		if m.federationCursor < 0 || m.federationCursor >= len(rows) {
 			return m, nil
@@ -259,6 +309,13 @@ func (m Model) routeFederationDetailKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.federationErr = nil
 		m.federationGen++
 		return m, m.fetchFederationStatus()
+	case "x":
+		rows := federationSpokeStatuses(m.federationStatuses)
+		cursor := clampFederationCursor(m.federationCursor, rows)
+		if cursor < 0 || cursor >= len(rows) {
+			return m, nil
+		}
+		return m.startFederationLeave(rows[cursor])
 	}
 	return m, nil
 }
@@ -370,10 +427,60 @@ func (m Model) routeFederationPreviewKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if m.federationDraft.BlockedReason != "" || m.federationEnrollRunning {
 			return m, nil
 		}
+		if m.federationDraft.AdoptExisting {
+			// Adoption rewrites the local project's event history; require the
+			// operator to type the project name before executing.
+			m.federationAdoptConfirmInput = ""
+			m.federationEnrollErr = nil
+			m.federationMode = federationModeAdoptConfirm
+			return m, nil
+		}
 		m.federationEnrollAttempt++
 		m.federationEnrollRunning = true
 		m.federationEnrollErr = nil
 		return m, m.executeFederationEnrollment(m.federationEnrollAttempt)
+	}
+	return m, nil
+}
+
+// routeFederationAdoptConfirmKey is a single-field typed confirmation: the
+// operator must type the local project's name exactly before an adoption
+// executes. Esc returns to the preview.
+func (m Model) routeFederationAdoptConfirmKey(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.federationAdoptConfirmInput = ""
+		m.federationEnrollErr = nil
+		m.federationMode = federationModePreview
+		return m, nil
+	case tea.KeyEnter:
+		if m.federationEnrollRunning {
+			return m, nil
+		}
+		if m.federationAdoptConfirmInput != m.federationDraft.SpokeProjectName {
+			m.federationEnrollErr = fmt.Errorf("type %q to confirm adoption", m.federationDraft.SpokeProjectName)
+			return m, nil
+		}
+		m.federationAdoptConfirmInput = ""
+		m.federationEnrollAttempt++
+		m.federationEnrollRunning = true
+		m.federationEnrollErr = nil
+		return m, m.executeFederationEnrollment(m.federationEnrollAttempt)
+	case tea.KeyBackspace:
+		if r := []rune(m.federationAdoptConfirmInput); len(r) > 0 {
+			m.federationAdoptConfirmInput = string(r[:len(r)-1])
+		}
+		return m, nil
+	case tea.KeySpace:
+		// bubbletea v1.3.10 delivers KeySpace with Runes{' '} (a back-compat
+		// detail) and Windows sends KeyRunes, so msg.Runes works today —
+		// append the literal so a runeless KeySpace from another backend or a
+		// future library version cannot silently drop the character.
+		m.federationAdoptConfirmInput += " "
+		return m, nil
+	case tea.KeyRunes:
+		m.federationAdoptConfirmInput += string(msg.Runes)
+		return m, nil
 	}
 	return m, nil
 }
@@ -397,6 +504,268 @@ func (m Model) routeFederationResultKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, nil
+}
+
+// startFederationLeave builds the leave draft from a selected row and enters
+// the preview. Leave is spoke-only: a non-spoke row is a no-op (the guard).
+// The preview is the mutation boundary — nothing is torn down here.
+func (m Model) startFederationLeave(row FederationProjectStatus) (Model, tea.Cmd) {
+	if row.Role != "spoke" {
+		return m, nil
+	}
+	m.federationEnrollErr = nil
+	m.federationLeaveRunning = false
+	m.federationLeaveDraft = federationLeaveDraft{
+		ProjectID:    row.ProjectID,
+		ProjectName:  row.ProjectName,
+		HubURL:       row.HubURL,
+		HubProjectID: row.HubProjectID,
+		InstanceUID:  strings.TrimSpace(m.federationInstance.InstanceUID),
+		// The binding's transport opt-in, so a plain-HTTP overlay hub joined
+		// with allow_insecure can also be left from the TUI.
+		AllowInsecure: row.AllowInsecure,
+		Disposition:   "detach",
+		Actor:         m.list.actor,
+	}
+	m.federationMode = federationModeLeavePreview
+	return m, nil
+}
+
+func (m Model) routeFederationLeavePreviewKey(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "backspace":
+		m.federationMode = federationModeList
+		m.federationEnrollErr = nil
+		return m, nil
+	case "d":
+		if m.federationLeaveDraft.Disposition == "archive" {
+			m.federationLeaveDraft.Disposition = "detach"
+		} else {
+			m.federationLeaveDraft.Disposition = "archive"
+		}
+		return m, nil
+	case "l":
+		m.federationLeaveDraft.LocalOnly = !m.federationLeaveDraft.LocalOnly
+		return m, nil
+	case "enter":
+		if m.federationLeaveDraft.BlockedReason != "" || m.federationLeaveRunning {
+			return m, nil
+		}
+		m.federationLeaveAttempt++
+		m.federationLeaveRunning = true
+		m.federationEnrollErr = nil
+		return m, m.executeFederationLeave(m.federationLeaveAttempt)
+	}
+	return m, nil
+}
+
+func (m Model) handleFederationLeaveResult(msg federationLeaveResultMsg) (Model, tea.Cmd) {
+	if m.staleConnMsg(msg.connGen) || msg.attempt != m.federationLeaveAttempt {
+		return m, nil
+	}
+	m.federationLeaveRunning = false
+	if msg.err != nil {
+		m.federationEnrollErr = msg.err
+		m.federationMode = federationModeLeavePreview
+		return m, nil
+	}
+	m.federationLeaveResult = msg.result
+	m.federationResultIsLeave = true
+	m.federationMode = federationModeResult
+	m.federationLoading = true
+	m.federationErr = nil
+	m.federationGen++
+	return m, m.fetchFederationStatus()
+}
+
+func (m Model) executeFederationLeave(attempt uint64) tea.Cmd {
+	connGen := m.connGen
+	draft := m.federationLeaveDraft
+	spoke := m.api
+	hubTarget := m.federationLeaveHubTarget(draft.HubURL, draft.AllowInsecure)
+	return func() tea.Msg {
+		result, err := runFederationLeave(context.Background(), draft, hubTarget, spoke)
+		return federationLeaveResultMsg{
+			connGen: connGen,
+			attempt: attempt,
+			result:  result,
+			err:     err,
+		}
+	}
+}
+
+// federationLeaveHubTarget resolves the hub admin daemonTarget for a leave by
+// matching the binding's hub URL against the catalog (so its token/token_env
+// is used), falling back to an implicit target that picks up global auth.
+// This mirrors the CLI's hub-admin auth precedence: the catalog entry whose URL
+// matches the binding's hub_url supplies only the admin token, else the global
+// KATA_AUTH_TOKEN fallback. The target URL is ALWAYS the binding's hub URL —
+// the catalog entry never redirects the admin token to a different origin — and
+// the URL comparison normalizes trailing slashes so a catalog/binding slash
+// mismatch still matches (#273).
+func (m Model) federationLeaveHubTarget(hubURL string, allowInsecure bool) daemonTarget {
+	want := strings.TrimRight(hubURL, "/")
+	for _, target := range m.daemonTargets {
+		if target.Local {
+			continue
+		}
+		if strings.TrimRight(target.URL, "/") == want {
+			// Token/token_env come from the catalog entry, but pin the URL to
+			// the binding's hub URL so the admin token is sent only to the
+			// bound origin. allow_insecure is the UNION of the binding's
+			// join-time opt-in and the same-origin catalog entry's: the
+			// catalog can restore an opt-in lost with the credential during a
+			// partial-leave recovery, but can never remove the binding's.
+			matched := target
+			matched.URL = want
+			matched.AllowInsecure = allowInsecure || target.AllowInsecure
+			return matched
+		}
+	}
+	// No catalog match: an unauthenticated, non-implicit target. Implicit
+	// targets pick up the global KATA_AUTH_TOKEN/[auth].token in
+	// resolvedDaemonTarget, which must never be sent to the hub origin.
+	return daemonTarget{URL: want, AllowInsecure: allowInsecure}
+}
+
+// runFederationLeave mirrors runFederationEnrollment: revoke-first on the hub
+// (unless LocalOnly), then call the spoke's local teardown route. The hub
+// revoke aborts the leave on failure so local state is never half torn down,
+// matching the CLI ordering.
+func runFederationLeave(
+	parent context.Context,
+	draft federationLeaveDraft,
+	hubTarget daemonTarget,
+	spoke federationSpokeAPI,
+) (federationLeaveResult, error) {
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+	defer cancel()
+	result := federationLeaveResult{Draft: draft}
+	if spoke == nil {
+		return result, errors.New("spoke: leave failed: daemon client unavailable")
+	}
+	disposition := draft.Disposition
+	if disposition == "" {
+		disposition = "detach"
+	}
+	if !draft.LocalOnly {
+		// Daemon preflight BEFORE the irreversible hub revoke, for every
+		// leave that will contact the hub: the route can refuse a detach too
+		// (role drift, vanished project, actor validation), and the archive
+		// disposition adds the open-issue refusal. A refusal discovered only
+		// after the revoke would strand the spoke locally bound with the hub
+		// side gone.
+		if _, err := spoke.LeaveFederationReplica(ctx, draft.ProjectID, LeaveFederationReplicaInput{
+			Disposition: disposition,
+			Actor:       draft.Actor,
+			Preflight:   true,
+		}); err != nil {
+			return result, fmt.Errorf("spoke: leave preflight failed: %w", err)
+		}
+	}
+	if draft.LocalOnly {
+		result.SkippedRevoke = true
+	} else {
+		revoked, globals, err := revokeFederationLeaveEnrollments(ctx, draft, hubTarget)
+		if err != nil {
+			return result, err
+		}
+		result.RevokedCount = revoked
+		result.GlobalEnrollmentIDs = globals
+	}
+	body, err := spoke.LeaveFederationReplica(ctx, draft.ProjectID, LeaveFederationReplicaInput{
+		Disposition: disposition,
+		Actor:       draft.Actor,
+	})
+	if err != nil {
+		return result, fmt.Errorf("spoke: leave failed: %w", err)
+	}
+	result.Body = body
+	return result, nil
+}
+
+// revokeFederationLeaveEnrollments lists the hub's enrollments and revokes
+// every active project-scoped one bound to this spoke instance + hub project.
+// Zero matches is success (already revoked). Matching GLOBAL enrollments
+// (project_id NULL) are returned, not revoked — they may authorize other
+// projects on the hub — so the result screen can warn that they still
+// authorize this project. A hub transport/auth failure aborts the leave
+// before local teardown, with guidance to retry with local-only.
+func revokeFederationLeaveEnrollments(
+	ctx context.Context,
+	draft federationLeaveDraft,
+	hubTarget daemonTarget,
+) (int, []int64, error) {
+	if strings.TrimSpace(draft.InstanceUID) == "" {
+		return 0, nil, errors.New("spoke instance UID is not loaded; refresh federation status before leaving")
+	}
+	hub, _, err := newFederationHubAdminClient(ctx, hubTarget)
+	if err != nil {
+		return 0, nil, federationLeaveHubError(err)
+	}
+	enrollments, err := hub.ListFederationEnrollments(ctx)
+	if err != nil {
+		return 0, nil, federationLeaveHubError(err)
+	}
+	ids, globals, foreign := matchFederationLeaveEnrollments(enrollments, draft.InstanceUID, draft.HubProjectID)
+	if len(ids) == 0 && len(foreign) > 0 {
+		return 0, nil, fmt.Errorf(
+			"no active enrollment matches this spoke's instance UID, but enrollment(s) %s still authorize the hub project — the instance UID can change after a clone/import, or the enrollment may belong to another spoke instance; revoke the right one with `kata federation revoke <id>` on the hub, or retry with local-only to tear down locally without revoking",
+			formatEnrollmentIDs(foreign))
+	}
+	for _, id := range ids {
+		if err := hub.RevokeFederationEnrollment(ctx, id); err != nil {
+			return 0, nil, federationLeaveHubError(err)
+		}
+	}
+	return len(ids), globals, nil
+}
+
+// matchFederationLeaveEnrollments returns the IDs of active (not-revoked)
+// enrollments whose spoke instance UID and hub project ID match this spoke's
+// binding, the IDs of active GLOBAL enrollments (nil project scope) for the
+// same spoke — those still authorize this project but are not auto-revoked
+// because they may serve the spoke's other projects on the hub — and the IDs
+// of active project-scoped enrollments for OTHER spoke instances. The caller
+// must not treat zero matches as success while foreign ones exist: the
+// instance UID can drift from the enrollment's (clone/import refresh or an
+// explicit --spoke-instance enroll), and silently proceeding would strand a
+// live token. Mirrors the CLI's revokeSpokeEnrollmentsOnHub selection.
+func matchFederationLeaveEnrollments(
+	enrollments []FederationEnrollment,
+	instanceUID string,
+	hubProjectID int64,
+) (ids, globals, foreign []int64) {
+	for _, enrollment := range enrollments {
+		if enrollment.RevokedAt != nil {
+			continue
+		}
+		if enrollment.ProjectID == nil {
+			if enrollment.SpokeInstanceUID == instanceUID {
+				globals = append(globals, enrollment.ID)
+			}
+			continue
+		}
+		if *enrollment.ProjectID != hubProjectID {
+			continue
+		}
+		if enrollment.SpokeInstanceUID == instanceUID {
+			ids = append(ids, enrollment.ID)
+			continue
+		}
+		foreign = append(foreign, enrollment.ID)
+	}
+	return ids, globals, foreign
+}
+
+// federationLeaveHubError wraps a hub-side failure with guidance to retry with
+// local-only, since local teardown is intentionally skipped when the hub
+// revoke cannot complete (mirrors the CLI guidance).
+func federationLeaveHubError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("hub revoke failed: %w; retry with local-only to tear down locally, then revoke on the hub later", err)
 }
 
 func (m Model) cursorMoveFederation(msg tea.KeyMsg, rows []FederationProjectStatus) (Model, bool) {
@@ -453,12 +822,18 @@ func (m Model) startFederationEnrollment() (Model, tea.Cmd) {
 	m.federationHubProjects = nil
 	m.federationHubProjectsLoading = false
 	m.federationEnrollErr = nil
-	if projectID, projectName, ok := m.defaultFederationProject(); ok {
-		m.federationDraft.SpokeProjectID = projectID
-		m.federationDraft.SpokeProjectName = projectName
-		m.federationDraft.AdoptExisting = true
-		m.federationMode = federationModeSelectHub
-		return m, nil
+	// Never skip the local-project step: the choice between adopting a local
+	// project and creating a new replica must stay explicit and visible. An
+	// active project only pre-positions the cursor (the adopt flow costs one
+	// Enter), instead of silently pre-arming adoption — which is how a
+	// misclick could federate the wrong project.
+	if projectID, _, ok := m.defaultFederationProject(); ok {
+		for i, row := range federationLocalProjectRows(m) {
+			if !row.createReplica && row.project.ID == projectID {
+				m.federationLocalProjectCursor = i
+				break
+			}
+		}
 	}
 	m.federationMode = federationModeSelectLocalProject
 	return m, nil
@@ -557,9 +932,17 @@ type federationLocalProjectRow struct {
 
 func federationLocalProjectRows(m Model) []federationLocalProjectRow {
 	rows := []federationLocalProjectRow{{createReplica: true}}
-	projects := make([]ProjectSummary, 0, len(m.projectsByID))
+	projects := make([]ProjectSummary, 0, len(m.projectsByID)+1)
 	for id, name := range m.projectsByID {
 		projects = append(projects, ProjectSummary{ID: id, Name: name})
+	}
+	// The boot project-list fetch is asynchronous and can fail, so the
+	// scoped/selected project must stay adoptable from scope state alone —
+	// an empty cache must not reduce the flow to "create replica" only.
+	if id, name, ok := m.defaultFederationProject(); ok {
+		if _, cached := m.projectsByID[id]; !cached {
+			projects = append(projects, ProjectSummary{ID: id, Name: name})
+		}
 	}
 	sort.SliceStable(projects, func(i, j int) bool {
 		li, lj := strings.ToLower(projects[i].Name), strings.ToLower(projects[j].Name)
@@ -785,7 +1168,10 @@ func resolveFederationHubProject(
 }
 
 func federationReplicaProjectName(draft federationDraft, hubProjectName string) string {
-	if draft.AdoptExisting && strings.TrimSpace(draft.SpokeProjectName) != "" {
+	if strings.TrimSpace(draft.SpokeProjectName) != "" &&
+		(draft.AdoptExisting || draft.Operation == federationOperationRejoin) {
+		// Adoption and rejoin both target an existing local project, which may
+		// be named differently from the hub project.
 		return draft.SpokeProjectName
 	}
 	return hubProjectName
@@ -844,7 +1230,24 @@ func (m Model) previewFederationEnrollment() (Model, tea.Cmd) {
 		m.federationSelectedProjectSet = true
 		m.federationSelectedProjectID = 0
 		m.federationSelectedProjectName = project.Name
-		if localProjectNameExists(m, draft.SpokeProjectName) {
+		if holderID, holderName, ok := localProjectByUID(m, project.UID); ok {
+			// The hub project's identity already exists locally, so this is a
+			// rejoin of that project (it previously left this federation), not
+			// a new replica — the daemon would refuse the new-replica request.
+			if status, bound := localProjectFederationBinding(m, holderID, holderName); bound {
+				role := status.Role
+				if role == "" {
+					role = "unknown"
+				}
+				draft.BlockedReason = fmt.Sprintf(
+					"local project %q already has federation binding as %s", holderName, role)
+			} else {
+				draft.Operation = federationOperationRejoin
+				draft.SpokeProjectName = holderName
+				m.federationSelectedProjectID = holderID
+				m.federationSelectedProjectName = holderName
+			}
+		} else if localProjectNameExists(m, draft.SpokeProjectName) {
 			draft.BlockedReason = fmt.Sprintf("local project %q already exists", draft.SpokeProjectName)
 		}
 	} else {
@@ -874,6 +1277,29 @@ func (m Model) previewFederationEnrollment() (Model, tea.Cmd) {
 				projectName,
 				role,
 			)
+		}
+		if draft.BlockedReason == "" && draft.HubProjectID != 0 {
+			// The selected local project may already share the target hub
+			// project's identity — the post-leave state. Adoption would rewrite
+			// its event history a second time; rejoin just rebinds it. Mirrors
+			// the create-replica branch's detection for the adopt-first flow.
+			// Either UID being unknown disables that comparison, so block
+			// rather than default to history-rewriting adoption.
+			hubUID := federationHubProjectUIDByID(m, draft.HubProjectID)
+			localUID := m.projectUIDByID[draft.SpokeProjectID]
+			switch {
+			case hubUID != "" && localUID == hubUID:
+				draft.Operation = federationOperationRejoin
+				draft.AdoptExisting = false
+			case localUID == "":
+				draft.BlockedReason = fmt.Sprintf(
+					"local project %q identity is still loading; press esc and retry",
+					draft.SpokeProjectName)
+			case hubUID == "":
+				draft.BlockedReason = fmt.Sprintf(
+					"hub project %q identity is unknown; refresh the hub project list and retry",
+					draft.HubProjectName)
+			}
 		}
 	}
 	draft.AllowInsecure = draft.HubTarget.AllowInsecure
@@ -931,6 +1357,32 @@ func localProjectNameExists(m Model, name string) bool {
 		}
 	}
 	return false
+}
+
+// federationHubProjectUIDByID returns the UID of a listed hub project, or ""
+// when the project (or its UID) is unknown.
+func federationHubProjectUIDByID(m Model, hubProjectID int64) string {
+	for _, p := range m.federationHubProjects {
+		if p.ID == hubProjectID {
+			return p.UID
+		}
+	}
+	return ""
+}
+
+// localProjectByUID finds the local project holding a hub project's UID. A
+// match means the local project shares identity with the hub project — the
+// post-leave rejoin state.
+func localProjectByUID(m Model, uid string) (int64, string, bool) {
+	if strings.TrimSpace(uid) == "" {
+		return 0, "", false
+	}
+	for id, projectUID := range m.projectUIDByID {
+		if projectUID == uid {
+			return id, m.projectsByID[id], true
+		}
+	}
+	return 0, "", false
 }
 
 func localProjectFederationBinding(

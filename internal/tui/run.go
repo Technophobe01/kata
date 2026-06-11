@@ -138,10 +138,12 @@ func buildRunModel(opts Options, c *Client, bi bootInit, conns ...daemonConnecti
 	}
 	if len(bi.projects) > 0 {
 		m.projectsByID = make(map[int64]string, len(bi.projects))
+		m.projectUIDByID = make(map[int64]string, len(bi.projects))
 		m.projectIdentByID = make(map[int64]string, len(bi.projects))
 		m.projectStats = make(map[int64]ProjectStatsSummary, len(bi.projects))
 		for _, r := range bi.projects {
 			m.projectsByID[r.ID] = r.Name
+			m.projectUIDByID[r.ID] = r.UID
 			m.projectIdentByID[r.ID] = r.Name
 			if r.Stats != nil {
 				m.projectStats[r.ID] = *r.Stats
@@ -255,6 +257,17 @@ func bootResolveScope(ctx context.Context, c *Client, cwd string) (bootInit, err
 				homeProjectID:   rr.Project.ID,
 				homeProjectName: rr.Project.Name,
 			},
+			// Seed the cache maps with the resolved project so its UID is
+			// known from the first frame — the enroll flow's rejoin detection
+			// must not wait on the async project-list fetch. The full fetch
+			// replaces these maps when it lands.
+			projects: []ProjectSummaryWithStats{{
+				ProjectSummary: ProjectSummary{
+					ID:   rr.Project.ID,
+					Name: rr.Project.Name,
+					UID:  rr.Project.UID,
+				},
+			}},
 			view: viewList,
 		}, nil
 	}

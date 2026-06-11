@@ -508,6 +508,7 @@ type AdoptProjectIntoFederationParams struct {
 	HubProjectUID        string
 	ReplayHorizonEventID int64
 	Actor                string
+	AllowInsecure        bool
 }
 
 // AdoptProjectIntoFederationResult describes the adopted project, binding, and
@@ -516,6 +517,14 @@ type AdoptProjectIntoFederationResult struct {
 	Project               Project
 	Binding               FederationBinding
 	AdoptionSnapshotCount int64
+}
+
+// LeaveFederationResult reports what LeaveFederationReplica removed. ProjectUID
+// lets the daemon route run credential cleanup after the DB transaction.
+type LeaveFederationResult struct {
+	ProjectID  int64
+	ProjectUID string
+	Role       FederationRole
 }
 
 // FederationIngestEvent carries one spoke event plus the spoke-local event row
