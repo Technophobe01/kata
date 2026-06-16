@@ -142,11 +142,121 @@ func TestClaimGateLinkCreateDeniesOtherPeerClaimHolder(t *testing.T) {
 	assertAPIError(t, resp.StatusCode, raw, http.StatusConflict, "claim_denied")
 }
 
+// TestClaimGateLinkCreateEvaluatesTargetAgainstItsOwnProject pins that the
+// peer claim gate is evaluated against the PEER's project, not the URL
+// project. The subject lives in a non-federated project (no binding), so the
+// old per-URL-project gate would have silently passed; the foreign target
+// lives in a federated project whose claim is held by another actor, which
+// must deny the link.
+// TestClaimGateCreateIdempotentRetryReusesDespiteChangedPeerClaim pins that a
+// retry of an already-successful create (same Idempotency-Key + body) returns
+// the stored reuse envelope even when a linked target's claim changed after
+// the first request. The idempotency lookup must win over the federated claim
+// gate: a safe retry of an issue that already exists must not 409 claim_denied.
+func TestClaimGateCreateIdempotentRetryReusesDespiteChangedPeerClaim(t *testing.T) {
+	env := testenv.New(t)
+	project, _, peer := setupClaimGateProject(t, env, true)
+	body := map[string]any{
+		"actor": "agent",
+		"title": "links to a federated peer",
+		"links": []map[string]any{{"type": "related", "to_ref": peer.ShortID}},
+	}
+	headers := map[string]string{"Idempotency-Key": "create-reuse-1"}
+
+	// First create: peer is unclaimed, so the claim gate passes and the
+	// idempotency record is stored.
+	first, raw := envDoRaw(t, env, http.MethodPost, issuesURL(project.ID), body, headers)
+	require.Equal(t, http.StatusOK, first.StatusCode, string(raw))
+
+	// A different actor now holds the peer's claim — a fresh claim gate for
+	// "agent" would be denied.
+	acquireClaimGateIssue(t, env, project, peer, "other")
+
+	// Retry with the same key + body: must reuse, not re-run the claim gate.
+	second, raw2 := envDoRaw(t, env, http.MethodPost, issuesURL(project.ID), body, headers)
+	require.Equal(t, http.StatusOK, second.StatusCode, string(raw2))
+	var out struct {
+		Reused  bool `json:"reused"`
+		Changed bool `json:"changed"`
+	}
+	require.NoError(t, json.Unmarshal(raw2, &out))
+	require.True(t, out.Reused, "idempotent retry must return the reuse envelope")
+	require.False(t, out.Changed, "idempotent retry must not report a change")
+}
+
+// TestCreateIdempotentRetryReusesDespiteArchivedLinkTarget pins that a retry
+// of an already-successful create (same Idempotency-Key + body) returns the
+// stored reuse envelope even when a linked target's project was archived after
+// the first request. The archived-target gate must run only on a fresh create
+// (after the idempotency lookup), not during link resolution.
+func TestCreateIdempotentRetryReusesDespiteArchivedLinkTarget(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	subj, err := env.DB.CreateProject(ctx, "subj")
+	require.NoError(t, err)
+	peerProj, err := env.DB.CreateProject(ctx, "peerproj")
+	require.NoError(t, err)
+	peer, _, err := env.DB.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: peerProj.ID, Title: "peer", Author: "tester",
+	})
+	require.NoError(t, err)
+
+	body := map[string]any{
+		"actor": "agent",
+		"title": "links to a cross-project peer",
+		"links": []map[string]any{{"type": "related", "to_ref": "peerproj#" + peer.ShortID}},
+	}
+	headers := map[string]string{"Idempotency-Key": "create-archived-reuse-1"}
+
+	// First create: peer's project is active, so the addable gate passes.
+	first, raw := envDoRaw(t, env, http.MethodPost, issuesURL(subj.ID), body, headers)
+	require.Equal(t, http.StatusOK, first.StatusCode, string(raw))
+
+	// Archive the peer's project after the successful create.
+	_, _, err = env.DB.RemoveProject(ctx, db.RemoveProjectParams{
+		ProjectID: peerProj.ID, Actor: "tester", Force: true,
+	})
+	require.NoError(t, err)
+
+	// Retry with the same key + body: must reuse, not fail link_target_archived.
+	second, raw2 := envDoRaw(t, env, http.MethodPost, issuesURL(subj.ID), body, headers)
+	require.Equal(t, http.StatusOK, second.StatusCode, string(raw2))
+	var out struct {
+		Reused  bool `json:"reused"`
+		Changed bool `json:"changed"`
+	}
+	require.NoError(t, json.Unmarshal(raw2, &out))
+	require.True(t, out.Reused, "idempotent retry must return the reuse envelope")
+	require.False(t, out.Changed, "idempotent retry must not report a change")
+}
+
+func TestClaimGateLinkCreateEvaluatesTargetAgainstItsOwnProject(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	src, err := env.DB.CreateProject(ctx, "src")
+	require.NoError(t, err)
+	subject, _, err := env.DB.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: src.ID, Title: "subject", Author: "tester",
+	})
+	require.NoError(t, err)
+
+	tgt, peer, _ := setupClaimGateProject(t, env, true)
+	acquireClaimGateIssue(t, env, tgt, peer, "other")
+
+	resp, raw := envDoRaw(t, env, http.MethodPost,
+		issuePathRef(src.ID, subject.ShortID, "links"), map[string]string{
+			"actor":  "agent",
+			"type":   "related",
+			"to_ref": peer.UID,
+		}, nil)
+
+	assertAPIError(t, resp.StatusCode, raw, http.StatusConflict, "claim_denied")
+}
+
 func TestClaimGateDuplicateLinkCreateDoesNotRequirePeerClaim(t *testing.T) {
 	env := testenv.New(t)
 	project, issue, peer := setupClaimGateProject(t, env, true)
 	_, err := env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: issue.ID,
 		ToIssueID:   peer.ID,
 		Type:        "related",
@@ -175,7 +285,6 @@ func TestClaimGateLinkDeleteAllowsUnclaimedPeer(t *testing.T) {
 	env := testenv.New(t)
 	project, issue, peer := setupClaimGateProject(t, env, true)
 	link, err := env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: issue.ID,
 		ToIssueID:   peer.ID,
 		Type:        "related",
@@ -194,7 +303,6 @@ func TestClaimGateLinkDeleteDeniesOtherPeerClaimHolder(t *testing.T) {
 	env := testenv.New(t)
 	project, issue, peer := setupClaimGateProject(t, env, true)
 	link, err := env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: issue.ID,
 		ToIssueID:   peer.ID,
 		Type:        "related",
@@ -214,7 +322,6 @@ func TestClaimGateLinkDeleteSkipsSoftDeletedPeerClaim(t *testing.T) {
 	env := testenv.New(t)
 	project, issue, peer := setupClaimGateProject(t, env, true)
 	link, err := env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: issue.ID,
 		ToIssueID:   peer.ID,
 		Type:        "related",
@@ -241,7 +348,6 @@ func TestClaimGateParentReplaceAllowsUnclaimedOldParent(t *testing.T) {
 	})
 	require.NoError(t, err)
 	_, err = env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: child.ID,
 		ToIssueID:   oldParent.ID,
 		Type:        "parent",
@@ -271,7 +377,6 @@ func TestClaimGateParentReplaceDeniesOtherOldParentClaimHolder(t *testing.T) {
 	})
 	require.NoError(t, err)
 	_, err = env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: child.ID,
 		ToIssueID:   oldParent.ID,
 		Type:        "parent",
@@ -302,7 +407,6 @@ func TestClaimGateParentReplaceSkipsSoftDeletedOldParentClaim(t *testing.T) {
 	})
 	require.NoError(t, err)
 	_, err = env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: child.ID,
 		ToIssueID:   oldParent.ID,
 		Type:        "parent",
@@ -355,7 +459,6 @@ func TestClaimGateEditLinksDeltaRemoveSkipsSoftDeletedPeerClaim(t *testing.T) {
 	env := testenv.New(t)
 	project, child, parent := setupClaimGateProject(t, env, true)
 	_, err := env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: child.ID,
 		ToIssueID:   parent.ID,
 		Type:        "parent",
@@ -384,7 +487,6 @@ func TestClaimGateEditLinksDeltaParentReplaceAllowsUnclaimedOldParent(t *testing
 	})
 	require.NoError(t, err)
 	_, err = env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: child.ID,
 		ToIssueID:   oldParent.ID,
 		Type:        "parent",
@@ -412,7 +514,6 @@ func TestClaimGateEditLinksDeltaParentReplaceDeniesOtherOldParentClaimHolder(t *
 	})
 	require.NoError(t, err)
 	_, err = env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: child.ID,
 		ToIssueID:   oldParent.ID,
 		Type:        "parent",
@@ -823,7 +924,6 @@ func claimGateLinkDeleteRequest(t *testing.T, federated bool) (*testenv.Env, cla
 	env := testenv.New(t)
 	project, issue, peer := setupClaimGateProject(t, env, false)
 	link, err := env.DB.CreateLink(context.Background(), db.CreateLinkParams{
-		ProjectID:   project.ID,
 		FromIssueID: issue.ID,
 		ToIssueID:   peer.ID,
 		Type:        "related",

@@ -412,19 +412,45 @@ func fmtTime(t time.Time) string {
 	return t.Format("2006-01-02 15:04")
 }
 
-// eventJumpTarget reads the issue short_id that a jumpable event refers
-// to. link.added / link.removed carry to_short_id; we also accept
-// issue_short_id for events whose subject IS the jump target.
+// eventJumpTarget reads the ref a jumpable event refers to, resolved under
+// the current detail project. link.added / link.removed carry the peer
+// (to_uid / to_short_id); we also accept issue_short_id for events whose
+// subject IS the jump target.
 func eventJumpTarget(events []EventLogEntry, idx int) (string, bool) {
 	if idx < 0 || idx >= len(events) {
 		return "", false
 	}
-	return readEventTargetShortID(events[idx])
+	return readEventTargetRef(events[idx])
 }
 
-// readEventTargetShortID pulls a short_id out of e.Payload. The keys
-// checked are "to_short_id" and "issue_short_id" in order so a link-
-// event payload's peer wins over the subject issue's own ref.
+// readEventTargetRef pulls a jump ref out of e.Payload. A link peer's UID
+// ("to_uid") is preferred over its short_id: an event row carries no peer
+// project, so a bare short_id is resolved under the CURRENT detail project —
+// which would open a same-suffix issue (or 404) when the peer is actually in
+// another project. The peer UID is globally unique and the daemon's resolver
+// scopes it to the URL project, so a same-project peer resolves while a
+// foreign peer returns issue_not_found: the jump fails closed instead of
+// landing on the wrong issue. Keys are checked most-specific first:
+// to_uid, to_short_id (legacy/pre-UID link events, which predate
+// cross-project links), then issue_short_id (subject events, same project).
+func readEventTargetRef(e EventLogEntry) (string, bool) {
+	if e.Payload == nil {
+		return "", false
+	}
+	for _, k := range []string{"to_uid", "to_short_id", "issue_short_id"} {
+		if v, ok := e.Payload[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s, true
+			}
+		}
+	}
+	return "", false
+}
+
+// readEventTargetShortID pulls the peer's display short_id out of e.Payload
+// for rendering link-event descriptions. Unlike readEventTargetRef (the jump
+// path), this never returns a UID — the row text always shows the friendly
+// short_id. Keys: to_short_id (link peer) then issue_short_id (subject).
 func readEventTargetShortID(e EventLogEntry) (string, bool) {
 	if e.Payload == nil {
 		return "", false
@@ -452,23 +478,40 @@ func numberFromAny(v any) (int64, bool) {
 	return 0, false
 }
 
-// linkJumpTarget returns the short_id to navigate to from the link at
-// idx. Outgoing links jump to To.ShortID; incoming links (where
-// To.ShortID == current) jump to From.ShortID instead so Enter on an
+// linkJumpTarget returns the peer to navigate to from the link at idx.
+// Outgoing links jump to the To peer; incoming links (where the To side is
+// the current issue) jump to the From peer instead, so Enter on an
 // "X blocks me" entry takes the user to X rather than re-opening the
-// current issue. self-loop links (rare) fall through to To.ShortID and
-// re-open the current issue, which is harmless.
-func linkJumpTarget(links []LinkEntry, idx int, current string) (string, bool) {
+// current issue. The chosen peer's project rides along so a cross-project
+// link resolves under the peer's own project.
+//
+// "Is this the current issue?" is decided by UID when both ends carry one:
+// short_ids are unique only within a project, so a foreign peer can share
+// the current issue's bare short_id, and short_id equality alone would
+// misroute an incoming cross-project link. Self-loop links resolve to the
+// current issue and are rejected (no jump).
+func linkJumpTarget(links []LinkEntry, idx int, currentShortID, currentUID string) (jumpTargetRef, bool) {
 	if idx < 0 || idx >= len(links) {
-		return "", false
+		return jumpTargetRef{}, false
 	}
 	l := links[idx]
-	target := l.To.ShortID
-	if target == current && l.From.ShortID != "" {
-		target = l.From.ShortID
+	peer := l.To
+	if peerIsCurrent(l.To, currentShortID, currentUID) && l.From.ShortID != "" {
+		peer = l.From
 	}
-	if target == "" {
-		return "", false
+	if peer.ShortID == "" || peerIsCurrent(peer, currentShortID, currentUID) {
+		return jumpTargetRef{}, false
 	}
-	return target, true
+	return jumpTargetRef{projectName: peer.Project, ref: peer.ShortID}, true
+}
+
+// peerIsCurrent reports whether a link peer is the issue currently open in
+// the detail view. UID equality is authoritative when both the peer and
+// the current issue carry a UID; otherwise it falls back to short_id
+// equality (the only signal available for fixtures or pre-UID rows).
+func peerIsCurrent(p LinkPeer, currentShortID, currentUID string) bool {
+	if currentUID != "" && p.UID != "" {
+		return p.UID == currentUID
+	}
+	return currentShortID != "" && p.ShortID == currentShortID
 }

@@ -70,7 +70,11 @@ irreversibly removed except for tombstones needed to preserve external refs.
 
 ## Relationships
 
-Relationships are normalized links between issues in the same project.
+Relationships are normalized links between issues in the same daemon database;
+links may span projects. Relationship flags accept `short_id` (same project),
+`project#short_id`, or a full ULID — foreign refs are forwarded to the daemon,
+which resolves them in the named project. Adding a link whose target is in an
+archived project is rejected; unarchive the project to add links to it.
 
 | Relationship | Cardinality | Meaning |
 | --- | --- | --- |

@@ -87,6 +87,15 @@ kata edit <issue-ref> \
   [--comment TEXT]
 ```
 
+Link flags (`--parent`, `--blocks`, `--blocked-by`, `--related`, and their
+`--remove-*` counterparts) accept `short_id` (same project),
+`project#short_id`, or a full ULID. Cross-project peers render as
+`project#short_id` in `kata show` output and in `kata edit`'s one-line change
+summary; same-project peers stay bare. `kata create`'s summary echoes link
+refs as you supplied them (a ULID input echoes the ULID). Adds targeting
+archived projects are rejected with a hint to unarchive the project first.
+`--remove-*` flags work against archived or soft-deleted peers.
+
 Move between projects:
 
 ```sh
@@ -99,6 +108,10 @@ The issue's target `short_id` is assigned by the daemon during the move, so it
 may differ from the source `short_id` if the target project already has a
 collision. `--dry-run` is a client-side preview: it resolves the source issue
 and target project without mutating anything.
+
+Links survive a move — `parent`, `blocks`/`blocked-by`, and `related` edges
+are never removed or rewritten. See the link-flag reference above for
+cross-project ref syntax and rendering rules.
 
 Comment:
 

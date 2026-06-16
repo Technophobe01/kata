@@ -541,12 +541,14 @@ func (d *Store) createIssue(ctx context.Context, p db.CreateIssueParams) (int64,
 	}
 
 	// Initial links — resolve to_number → (to_issue_id, to_issue_uid,
-	// to_issue_short_id) within the same project, excluding soft-deleted
-	// targets. The schema's same-project trigger enforces the cross-project
-	// check, but we'd rather surface a typed not-found than a generic
-	// constraint failure. The peer UID and short_id are captured here and
-	// folded into the issue.created event payload: UID is canonical, short_id
-	// is the rendered display value (spec §11).
+	// to_issue_short_id), excluding soft-deleted targets. Targets may live
+	// in any project (links span projects since storage v16); the daemon
+	// resolves refs and gates archived peer projects before calling in, so
+	// this is the in-tx existence re-check. We surface a typed not-found
+	// rather than letting a constraint failure propagate. The peer UID and
+	// short_id are captured here and folded into the issue.created event
+	// payload: UID is canonical, short_id is the rendered display value
+	// (spec §11).
 	resolvedTargets := make([]createdLinkTarget, 0, len(links))
 	for _, l := range links {
 		var (
@@ -554,13 +556,10 @@ func (d *Store) createIssue(ctx context.Context, p db.CreateIssueParams) (int64,
 			toIssueUID     string
 			toIssueShortID string
 		)
-		// Initial-link targets are addressed by their issue ID for now; the
-		// CLI/daemon will be migrated to short_ids in Tasks 11/14. Until
-		// then this lookup intentionally treats ToNumber as a numeric ID.
 		err := tx.QueryRowContext(ctx,
 			`SELECT id, uid, short_id FROM issues
-			 WHERE project_id = ? AND id = ? AND deleted_at IS NULL`,
-			p.ProjectID, l.ToNumber).Scan(&toIssueID, &toIssueUID, &toIssueShortID)
+			 WHERE id = ? AND deleted_at IS NULL`,
+			l.ToNumber).Scan(&toIssueID, &toIssueUID, &toIssueShortID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, db.Event{}, db.ErrInitialLinkTargetNotFound
 		}
@@ -579,9 +578,9 @@ func (d *Store) createIssue(ctx context.Context, p db.CreateIssueParams) (int64,
 			fromID, toID = toID, fromID
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO links(project_id, from_issue_id, to_issue_id, from_issue_uid, to_issue_uid, type, author)
-			 VALUES(?, ?, ?, (SELECT uid FROM issues WHERE id = ?), (SELECT uid FROM issues WHERE id = ?), ?, ?)`,
-			p.ProjectID, fromID, toID, fromID, toID, l.Type, p.Author); err != nil {
+			`INSERT INTO links(from_issue_id, to_issue_id, from_issue_uid, to_issue_uid, type, author)
+			 VALUES(?, ?, (SELECT uid FROM issues WHERE id = ?), (SELECT uid FROM issues WHERE id = ?), ?, ?)`,
+			fromID, toID, fromID, toID, l.Type, p.Author); err != nil {
 			return 0, db.Event{}, classifyLinkInsertError(err)
 		}
 	}
@@ -808,16 +807,18 @@ func (d *Store) IssueByUID(ctx context.Context, issueUID string, include db.Incl
 	return scanIssue(row)
 }
 
-// ShortIDsByUIDs returns the current short_id for each requested issue
-// UID inside projectID. UIDs that don't resolve (purged, never existed,
-// or live in a different project) are omitted from the result. Used by
+// IssueQualifiersByUIDs resolves each requested issue UID to its current
+// project (id + name) and short_id, across ALL projects — UIDs are
+// globally unique, so no project scope is applied. UIDs that don't
+// resolve (purged or never existed) are omitted from the result. Used by
 // the audit projection to map a close-time parent UID to the parent's
-// CURRENT short_id, which is stable across project-merge collision
-// reshuffles even though the short_id itself is not.
-func (d *Store) ShortIDsByUIDs(
-	ctx context.Context, projectID int64, uids []string,
-) (map[string]string, error) {
-	out := map[string]string{}
+// CURRENT short_id (stable across project-merge collision reshuffles) and
+// to its owning project so a foreign parent renders qualified
+// ("project#short_id") rather than as an ambiguous bare suffix.
+func (d *Store) IssueQualifiersByUIDs(
+	ctx context.Context, uids []string,
+) (map[string]db.IssueQualifier, error) {
+	out := map[string]db.IssueQualifier{}
 	if len(uids) == 0 {
 		return out, nil
 	}
@@ -829,29 +830,30 @@ func (d *Store) ShortIDsByUIDs(
 		}
 		slice := uids[i:end]
 		placeholders := make([]string, len(slice))
-		args := make([]any, 0, len(slice)+1)
-		args = append(args, projectID)
+		args := make([]any, 0, len(slice))
 		for j, u := range slice {
 			placeholders[j] = "?"
 			args = append(args, u)
 		}
-		q := `SELECT uid, short_id FROM issues
-		      WHERE project_id = ? AND uid IN (` + strings.Join(placeholders, ",") + `)`
+		q := `SELECT i.uid, i.project_id, p.name, i.short_id
+		      FROM issues i JOIN projects p ON p.id = i.project_id
+		      WHERE i.uid IN (` + strings.Join(placeholders, ",") + `)`
 		rows, err := d.QueryContext(ctx, q, args...)
 		if err != nil {
-			return nil, fmt.Errorf("short ids by uids: %w", err)
+			return nil, fmt.Errorf("issue qualifiers by uids: %w", err)
 		}
 		for rows.Next() {
-			var uid, sid string
-			if err := rows.Scan(&uid, &sid); err != nil {
+			var uid string
+			var qual db.IssueQualifier
+			if err := rows.Scan(&uid, &qual.ProjectID, &qual.ProjectName, &qual.ShortID); err != nil {
 				_ = rows.Close()
-				return nil, fmt.Errorf("scan short id by uid: %w", err)
+				return nil, fmt.Errorf("scan issue qualifier by uid: %w", err)
 			}
-			out[uid] = sid
+			out[uid] = qual
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("iterate short ids by uids: %w", err)
+			return nil, fmt.Errorf("iterate issue qualifiers by uids: %w", err)
 		}
 		_ = rows.Close()
 	}
@@ -1172,7 +1174,7 @@ func (d *Store) closeIssueWithEvents(
 		}
 		return issue, nil, false, nil
 	}
-	if hasOpen, err := txHasOpenChildren(ctx, tx, issue.ProjectID, issueID); err != nil {
+	if hasOpen, err := txHasOpenChildren(ctx, tx, issueID); err != nil {
 		return db.Issue{}, nil, false, err
 	} else if hasOpen {
 		return db.Issue{}, nil, false, db.ErrOpenChildren
@@ -1769,15 +1771,21 @@ func (d *Store) claimOwner(ctx context.Context, issueID int64, actor string, for
 }
 
 // ReadyIssues returns open, non-deleted issues with no open `blocks` predecessor,
-// ordered by updated_at DESC. limit==0 means no limit.
+// ordered by updated_at DESC. limit==0 means no limit. Blockers may live in
+// another project (links span projects, storage v16), but a blocker whose
+// project is archived (projects.deleted_at IS NOT NULL) does not gate
+// readiness — mirroring the child/close queries' archived-project exclusion,
+// so an active issue is not stranded behind hidden archived work.
 func (d *Store) ReadyIssues(ctx context.Context, projectID int64, limit int, filter db.ReadyIssuesFilter) ([]db.Issue, error) {
 	q := issueSelect + `
 		WHERE i.project_id = ? AND i.status = 'open' AND i.deleted_at IS NULL
 		  AND NOT EXISTS (
 		    SELECT 1 FROM links l
 		    JOIN issues blocker ON blocker.id = l.from_issue_id
+		    JOIN projects bp ON bp.id = blocker.project_id
 		    WHERE l.type = 'blocks' AND l.to_issue_id = i.id
 		      AND blocker.status = 'open' AND blocker.deleted_at IS NULL
+		      AND bp.deleted_at IS NULL
 		  )`
 	args := []any{projectID}
 
@@ -1823,9 +1831,10 @@ func (d *Store) ReadyIssues(ctx context.Context, projectID int64, limit int, fil
 
 // ReadyIssuesGlobal returns ready issues across every non-archived project,
 // each paired with its project name. "Ready" matches ReadyIssues: open,
-// not soft-deleted, and not blocked by an open `blocks` predecessor.
-// Issues from archived projects (projects.deleted_at IS NOT NULL) are
-// excluded. Ordering matches ReadyIssues so behavior is consistent.
+// not soft-deleted, and not blocked by an open `blocks` predecessor in an
+// active project. Issues from archived projects (projects.deleted_at IS NOT
+// NULL) are excluded, and an open blocker in an archived project does not
+// gate readiness. Ordering matches ReadyIssues so behavior is consistent.
 func (d *Store) ReadyIssuesGlobal(ctx context.Context, limit int) ([]db.ReadyGlobalIssue, error) {
 	// issueSelect ends with "FROM issues i JOIN projects p ON p.id = i.project_id"
 	// We need to add p.name before FROM, so we build the SELECT from scratch.
@@ -1835,8 +1844,10 @@ func (d *Store) ReadyIssuesGlobal(ctx context.Context, limit int) ([]db.ReadyGlo
 		  AND NOT EXISTS (
 		    SELECT 1 FROM links l
 		    JOIN issues blocker ON blocker.id = l.from_issue_id
+		    JOIN projects bp ON bp.id = blocker.project_id
 		    WHERE l.type = 'blocks' AND l.to_issue_id = i.id
 		      AND blocker.status = 'open' AND blocker.deleted_at IS NULL
+		      AND bp.deleted_at IS NULL
 		  )
 		ORDER BY i.updated_at DESC, i.id DESC`
 	if limit > 0 {
@@ -2028,8 +2039,8 @@ const eventSelectByID = `SELECT e.id, e.uid, e.origin_instance_uid, e.project_id
        e.type, e.actor, e.payload, e.hlc_physical_ms, e.hlc_counter, e.content_hash, e.created_at
   FROM events e
   JOIN projects p ON p.id = e.project_id
-  LEFT JOIN issues i ON i.project_id = e.project_id AND (i.id = e.issue_id OR (e.issue_id IS NULL AND e.issue_uid IS NOT NULL AND i.uid = e.issue_uid))
-  LEFT JOIN issues ri ON ri.project_id = e.project_id AND (ri.id = e.related_issue_id OR (e.related_issue_id IS NULL AND e.related_issue_uid IS NOT NULL AND ri.uid = e.related_issue_uid))
+  LEFT JOIN issues i ON i.id = e.issue_id OR (e.issue_id IS NULL AND e.issue_uid IS NOT NULL AND i.uid = e.issue_uid)
+  LEFT JOIN issues ri ON ri.id = e.related_issue_id OR (e.related_issue_id IS NULL AND e.related_issue_uid IS NOT NULL AND ri.uid = e.related_issue_uid)
  WHERE e.id = ?`
 
 func stringPtrValue(s *string) any {

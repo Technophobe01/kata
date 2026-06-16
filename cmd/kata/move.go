@@ -19,7 +19,13 @@ func newMoveCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "move <issue-ref> <project>",
 		Short: "move an issue to another project",
-		Args:  cobra.ExactArgs(2),
+		Long: `Move an issue to another project.
+
+The issue keeps its UID, comments, history, and all of its links
+(parent, blocks/blocked-by, related) — relationships are never severed
+by a move and may span projects afterward. A fresh short_id is
+assigned in the target project.`,
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runMove(cmd, args[0], args[1], dryRun)
 		},

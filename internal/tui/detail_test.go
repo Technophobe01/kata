@@ -1292,6 +1292,125 @@ func TestDetailChildren_EnterJumpsToChild(t *testing.T) {
 	assertJumpDetailCmd(t, cmd, "44dd")
 }
 
+// jumpMsgFromCmd runs cmd and asserts it produced a jumpDetailMsg, which it
+// returns for field-level inspection (project routing).
+func jumpMsgFromCmd(t *testing.T, cmd tea.Cmd) jumpDetailMsg {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("expected jump cmd, got nil")
+	}
+	msg := cmd()
+	jm, ok := msg.(jumpDetailMsg)
+	if !ok {
+		t.Fatalf("expected jumpDetailMsg, got %T", msg)
+	}
+	return jm
+}
+
+// TestDetail_EnterOnChild_CarriesChildProjectID: a child in another project
+// (its own numeric project_id, hydrated cross-project on the show response)
+// must carry that project_id on the jump so the fetch resolves under the
+// child's project rather than the parent's.
+func TestDetail_EnterOnChild_CarriesChildProjectID(t *testing.T) {
+	dm := detailFixture()
+	dm.children = []Issue{
+		{UID: "01TEST-43cc", ShortID: "43cc", ProjectID: 7},
+		{UID: "01TEST-44dd", ShortID: "44dd", ProjectID: 9},
+	}
+	dm.detailFocus = focusChildren
+	dm.childCursor = 1
+	km := newKeymap()
+
+	_, cmd := dm.Update(tea.KeyMsg{Type: tea.KeyEnter}, km, &fakeDetailAPI{})
+	jm := jumpMsgFromCmd(t, cmd)
+	if jm.ref != "44dd" || jm.projectID != 9 {
+		t.Fatalf("jumpDetailMsg = %+v, want ref=44dd projectID=9", jm)
+	}
+}
+
+// TestHandleJumpDetail_ResolvesForeignProjectByName: a jump carrying a peer's
+// project NAME resolves the fetch project_id through projectsByID, so the
+// post-jump detail is scoped to the foreign project.
+func TestHandleJumpDetail_ResolvesForeignProjectByName(t *testing.T) {
+	m := newTestModel()
+	m.view = viewDetail
+	m.projectsByID = map[int64]string{7: "alpha", 9: "beta"}
+	m.detail = detailModel{
+		issue:    &Issue{UID: "01TEST-42aa", ShortID: "42aa"},
+		scopePID: 7,
+		gen:      1,
+	}
+	m.nextGen = 1
+
+	m, _ = updateModel(m, jumpDetailMsg{ref: "7bb", projectName: "beta"})
+	if m.detail.scopePID != 9 {
+		t.Fatalf("post-jump scopePID = %d, want 9 (beta)", m.detail.scopePID)
+	}
+}
+
+// TestHandleJumpDetail_ChildProjectIDWins: an explicit project_id (children)
+// is used directly without a name lookup.
+func TestHandleJumpDetail_ChildProjectIDWins(t *testing.T) {
+	m := newTestModel()
+	m.view = viewDetail
+	m.detail = detailModel{
+		issue:    &Issue{UID: "01TEST-42aa", ShortID: "42aa"},
+		scopePID: 7,
+		gen:      1,
+	}
+	m.nextGen = 1
+
+	m, _ = updateModel(m, jumpDetailMsg{ref: "44dd", projectID: 9})
+	if m.detail.scopePID != 9 {
+		t.Fatalf("post-jump scopePID = %d, want 9 (child project_id)", m.detail.scopePID)
+	}
+}
+
+// TestHandleJumpDetail_SameProjectNameResolvesToCurrent: a jump whose peer
+// project name resolves to the current project keeps the current project,
+// so a plain in-project link jump is unaffected.
+func TestHandleJumpDetail_SameProjectNameResolvesToCurrent(t *testing.T) {
+	m := newTestModel()
+	m.view = viewDetail
+	m.projectsByID = map[int64]string{7: "alpha"}
+	m.detail = detailModel{
+		issue:    &Issue{UID: "01TEST-42aa", ShortID: "42aa"},
+		scopePID: 7,
+		gen:      1,
+	}
+	m.nextGen = 1
+
+	m, _ = updateModel(m, jumpDetailMsg{ref: "7bb", projectName: "alpha"})
+	if m.detail.scopePID != 7 {
+		t.Fatalf("post-jump scopePID = %d, want 7 (same project)", m.detail.scopePID)
+	}
+}
+
+// TestHandleJumpDetail_UnresolvableProjectNoOps: a named target project the
+// cache can't resolve must NOT fall back to the current project (that would
+// fetch a foreign bare short_id under the wrong project, opening a
+// same-suffix issue or 404ing). The jump no-ops: no navStack push, the
+// current detail is untouched.
+func TestHandleJumpDetail_UnresolvableProjectNoOps(t *testing.T) {
+	m := newTestModel()
+	m.view = viewDetail
+	m.projectsByID = map[int64]string{7: "alpha"}
+	current := &Issue{UID: "01TEST-42aa", ShortID: "42aa"}
+	m.detail = detailModel{issue: current, scopePID: 7, gen: 1}
+	m.nextGen = 1
+
+	m, cmd := updateModel(m, jumpDetailMsg{ref: "7bb", projectName: "ghost"})
+	if len(m.detail.navStack) != 0 {
+		t.Fatalf("navStack length = %d, want 0 (jump must no-op)", len(m.detail.navStack))
+	}
+	if m.detail.issue != current {
+		t.Fatalf("detail issue changed on an unresolvable jump; want untouched")
+	}
+	if cmd != nil {
+		t.Fatal("unresolvable jump must not dispatch fetches")
+	}
+}
+
 // runBatch unwraps a tea.Batch wrapper and runs every nested cmd in
 // sequence so jump-nav tests can observe the side effects of fetchIssue.
 // We deliberately ignore tea.Cmd return values from sub-cmds because the
@@ -1333,6 +1452,31 @@ func TestDetail_EnterOnEventWithIssueRef_JumpsAndStacks(t *testing.T) {
 	km := newKeymap()
 	_, cmd := dm.Update(tea.KeyMsg{Type: tea.KeyEnter}, km, api)
 	assertJumpDetailCmd(t, cmd, "l1l1")
+}
+
+// TestDetail_EnterOnLinkEvent_PrefersPeerUID: a link event carries the peer's
+// UID but no project. Jumping by the bare short_id would resolve under the
+// current project and could open a same-suffix issue in the wrong project.
+// The jump must use the peer's UID, which the daemon resolves under the
+// current project — landing on the right issue when same-project and failing
+// closed (issue_not_found) for a foreign peer rather than the wrong issue.
+func TestDetail_EnterOnLinkEvent_PrefersPeerUID(t *testing.T) {
+	api := &fakeDetailAPI{
+		getIssueResult: &Issue{UID: "01TESTPEERUID0000000000000", ShortID: "l1l1"},
+	}
+	dm := detailFixture()
+	dm.activeTab = tabEvents
+	dm.events = []EventLogEntry{
+		{Type: "issue.linked", Actor: "wesm",
+			Payload: map[string]any{
+				"type":        "blocks",
+				"to_short_id": "l1l1",
+				"to_uid":      "01TESTPEERUID0000000000000",
+			}},
+	}
+	dm.tabCursor = 0
+	_, cmd := dm.Update(tea.KeyMsg{Type: tea.KeyEnter}, newKeymap(), api)
+	assertJumpDetailCmd(t, cmd, "01TESTPEERUID0000000000000")
 }
 
 func TestDetail_EnterOnCurrentIssueEventDoesNotSelfJump(t *testing.T) {
@@ -1393,7 +1537,7 @@ func TestDetail_EnterOnIncomingLink_JumpsToFromShortID(t *testing.T) {
 }
 
 // TestLinkJumpTarget_OutgoingPicksTo: when To differs from the
-// current issue, the helper returns the To short_id. Pure unit test
+// current issue, the helper returns the To peer. Pure unit test
 // for the scoping logic.
 func TestLinkJumpTarget_OutgoingPicksTo(t *testing.T) {
 	links := []LinkEntry{{
@@ -1401,9 +1545,9 @@ func TestLinkJumpTarget_OutgoingPicksTo(t *testing.T) {
 		From: LinkPeer{UID: "01TEST-42aa", ShortID: "42aa"},
 		To:   LinkPeer{UID: "01TEST-7bb", ShortID: "7bb"},
 	}}
-	got, ok := linkJumpTarget(links, 0, "42aa")
-	if !ok || got != "7bb" {
-		t.Fatalf("linkJumpTarget = (%q, %v), want (7bb, true)", got, ok)
+	got, ok := linkJumpTarget(links, 0, "42aa", "01TEST-42aa")
+	if !ok || got.ref != "7bb" {
+		t.Fatalf("linkJumpTarget = (%+v, %v), want ref=7bb, true", got, ok)
 	}
 }
 
@@ -1415,9 +1559,43 @@ func TestLinkJumpTarget_IncomingPicksFrom(t *testing.T) {
 		From: LinkPeer{UID: "01TEST-99zz", ShortID: "99zz"},
 		To:   LinkPeer{UID: "01TEST-42aa", ShortID: "42aa"},
 	}}
-	got, ok := linkJumpTarget(links, 0, "42aa")
-	if !ok || got != "99zz" {
-		t.Fatalf("linkJumpTarget = (%q, %v), want (99zz, true)", got, ok)
+	got, ok := linkJumpTarget(links, 0, "42aa", "01TEST-42aa")
+	if !ok || got.ref != "99zz" {
+		t.Fatalf("linkJumpTarget = (%+v, %v), want ref=99zz, true", got, ok)
+	}
+}
+
+// TestLinkJumpTarget_CrossProjectCarriesPeerProject: an outgoing link to a
+// peer in another project carries that peer's project name so the jump
+// fetches under the peer's own project, not the current one.
+func TestLinkJumpTarget_CrossProjectCarriesPeerProject(t *testing.T) {
+	links := []LinkEntry{{
+		ID: 1, Type: "blocks",
+		From: LinkPeer{UID: "01TEST-42aa", ShortID: "42aa", Project: "alpha"},
+		To:   LinkPeer{UID: "01TEST-7bb", ShortID: "7bb", Project: "beta"},
+	}}
+	got, ok := linkJumpTarget(links, 0, "42aa", "01TEST-42aa")
+	if !ok || got.ref != "7bb" || got.projectName != "beta" {
+		t.Fatalf("linkJumpTarget = (%+v, %v), want ref=7bb project=beta", got, ok)
+	}
+}
+
+// TestLinkJumpTarget_IncomingMatchesByUID: a foreign From peer that happens
+// to share the current issue's bare short_id must not be mistaken for the
+// current issue. UID disambiguation keeps the jump targeting the foreign
+// peer rather than collapsing to a self-jump.
+func TestLinkJumpTarget_IncomingMatchesByUID(t *testing.T) {
+	// Current issue is alpha#42aa. The To side is a DIFFERENT issue in
+	// beta that also happens to carry short_id "42aa". A short_id-only
+	// check would treat To as "current" and wrongly pick From.
+	links := []LinkEntry{{
+		ID: 1, Type: "blocks",
+		From: LinkPeer{UID: "01TEST-99zz", ShortID: "99zz", Project: "alpha"},
+		To:   LinkPeer{UID: "01TEST-BETA42", ShortID: "42aa", Project: "beta"},
+	}}
+	got, ok := linkJumpTarget(links, 0, "42aa", "01TEST-42aa")
+	if !ok || got.ref != "42aa" || got.projectName != "beta" {
+		t.Fatalf("linkJumpTarget = (%+v, %v), want ref=42aa project=beta (To, by UID)", got, ok)
 	}
 }
 
