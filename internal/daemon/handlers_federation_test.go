@@ -1110,6 +1110,90 @@ func TestFederationQuarantineSkipRequiresConfirmAndAdvancesCursor(t *testing.T) 
 	assert.Equal(t, int64(9), binding.PushCursorEventID)
 }
 
+func TestFederationQuarantineRetryRequiresConfirmAndLeavesCursor(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	project, q := createPushQuarantineFixture(t, env)
+	path := fmt.Sprintf("/api/v1/projects/%d/federation/quarantine/%d/retry", project.ID, q.ID)
+
+	resp, raw := envDoRaw(t, env, http.MethodPost, path, map[string]any{
+		"actor":  "operator",
+		"reason": "hub upgraded",
+	}, nil)
+	require.Equal(t, http.StatusPreconditionFailed, resp.StatusCode, string(raw))
+	assert.Contains(t, string(raw), "confirm_required")
+
+	resp, raw = envDoRaw(t, env, http.MethodPost, path, map[string]any{
+		"actor":  "operator",
+		"reason": "hub upgraded",
+	}, map[string]string{"X-Kata-Confirm": fmt.Sprintf("SKIP FEDERATION BATCH %d", q.ID)})
+	require.Equal(t, http.StatusPreconditionFailed, resp.StatusCode, string(raw))
+	assert.Contains(t, string(raw), "confirm_mismatch")
+
+	var out api.FederationQuarantineSummary
+	resp, raw = envDoRaw(t, env, http.MethodPost, path, map[string]any{
+		"actor":  "operator",
+		"reason": "hub upgraded",
+	}, map[string]string{"X-Kata-Confirm": fmt.Sprintf("RETRY FEDERATION BATCH %d", q.ID)})
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	require.NoError(t, json.Unmarshal(raw, &out))
+	assert.Equal(t, q.ID, out.ID)
+	binding, err := env.DB.FederationBindingByProject(ctx, project.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), binding.PushCursorEventID)
+	_, err = env.DB.ActiveFederationQuarantine(ctx, project.ID, db.FederationQuarantineDirectionPush)
+	assert.ErrorIs(t, err, db.ErrNotFound)
+	var skipReason string
+	require.NoError(t, env.DB.QueryRow(`
+		SELECT skip_reason
+		  FROM federation_quarantine
+		 WHERE id = ?`,
+		q.ID).Scan(&skipReason))
+	assert.Equal(t, "retry: hub upgraded", skipReason)
+}
+
+func TestFederationQuarantineRetryRejectsPullQuarantine(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	project, err := env.DB.CreateProject(ctx, "spoke")
+	require.NoError(t, err)
+	_, err = env.DB.UpsertFederationBinding(ctx, db.FederationBinding{
+		ProjectID:            project.ID,
+		Role:                 db.FederationRoleSpoke,
+		HubURL:               "http://127.0.0.1:7373",
+		HubProjectID:         42,
+		HubProjectUID:        project.UID,
+		ReplayHorizonEventID: 9,
+		PullCursorEventID:    12,
+		PushEnabled:          true,
+		Actor:                "tester",
+		PushCursorEventID:    0,
+		Enabled:              true,
+	})
+	require.NoError(t, err)
+	q, err := env.DB.RecordFederationQuarantine(ctx, db.RecordFederationQuarantineParams{
+		ProjectID:    project.ID,
+		Direction:    db.FederationQuarantineDirectionPull,
+		FirstEventID: 7,
+		LastEventID:  9,
+		EventUIDs:    []string{"evt-7"},
+		Error:        "hub replay failed",
+		CreatedAt:    time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	path := fmt.Sprintf("/api/v1/projects/%d/federation/quarantine/%d/retry", project.ID, q.ID)
+
+	resp, raw := envDoRaw(t, env, http.MethodPost, path, map[string]any{
+		"actor":  "operator",
+		"reason": "try pull",
+	}, map[string]string{"X-Kata-Confirm": fmt.Sprintf("RETRY FEDERATION BATCH %d", q.ID)})
+
+	assertAPIError(t, resp.StatusCode, raw, http.StatusConflict, "federation_quarantine_retry_unsupported")
+	active, err := env.DB.ActiveFederationQuarantine(ctx, project.ID, db.FederationQuarantineDirectionPull)
+	require.NoError(t, err)
+	assert.Nil(t, active.SkippedAt)
+}
+
 func TestFederationQuarantineSkipIdentityModeBootstrapTokenCannotWrite(t *testing.T) {
 	env := testenv.New(t, testenv.WithAuthToken("bootstrap-token"), testenv.WithRequireTokenIdentity())
 	ctx := context.Background()
@@ -1758,6 +1842,9 @@ func TestFederationIngestRejectsFutureSchemaVersion(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "future schema response: %s", raw)
 	assert.Contains(t, string(raw), "schema_version")
+	var errBody api.ErrorEnvelope
+	require.NoError(t, json.Unmarshal(raw, &errBody))
+	assert.Equal(t, "unsupported_federation_schema", errBody.Error.Code)
 	assert.Equal(t, beforeEvents, countEvents(t, env.DB))
 }
 
@@ -1782,6 +1869,39 @@ func TestFederationIngestRejectsMissingSchemaVersion(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "missing schema response: %s", raw)
 	assert.Contains(t, string(raw), "schema_version")
+	var errBody api.ErrorEnvelope
+	require.NoError(t, json.Unmarshal(raw, &errBody))
+	assert.Equal(t, "validation", errBody.Error.Code)
+	assert.Equal(t, beforeEvents, countEvents(t, env.DB))
+}
+
+func TestFederationIngestRejectsZeroSchemaVersion(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	project := createFederatedHubProject(t, env, "hub")
+	created, err := env.DB.CreateFederationEnrollment(ctx, db.CreateFederationEnrollmentParams{
+		Token:            "zero-schema",
+		SpokeInstanceUID: federationTestSpokeUID,
+		ProjectID:        &project.ID,
+		Capabilities:     "push",
+		Actor:            "tester",
+	})
+	require.NoError(t, err)
+	ev := federationRemoteIssueCreatedEvent(t, project, federationTestSpokeUID)
+	body := map[string]any{
+		"schema_version": 0,
+		"events":         []any{federationIngestEnvelope(t, int64(17), ev)},
+	}
+	beforeEvents := countEvents(t, env.DB)
+
+	resp, raw := envDoRaw(t, env, http.MethodPost,
+		projectPath(project.ID)+"/federation/events:ingest", body, bearer(created.Token))
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "zero schema response: %s", raw)
+	assert.Contains(t, string(raw), "schema_version")
+	var errBody api.ErrorEnvelope
+	require.NoError(t, json.Unmarshal(raw, &errBody))
+	assert.Equal(t, "invalid_federation_schema", errBody.Error.Code)
 	assert.Equal(t, beforeEvents, countEvents(t, env.DB))
 }
 
