@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -170,6 +172,378 @@ token_env = "KATA_SHARED_TOKEN"
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.Equal(t, srv.URL, url)
+}
+
+func TestEnsureNamedRunning_RemoteCatalogTargetWinsOverEnv(t *testing.T) {
+	selected := pingingServer(t)
+	env := pingingServer(t)
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_SERVER", env.URL)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[daemon]]
+name = "shared"
+url = "`+selected.URL+`"
+`), 0o600))
+
+	url, err := EnsureNamedRunning(context.Background(), "shared")
+
+	require.NoError(t, err)
+	assert.Equal(t, selected.URL, url)
+}
+
+func TestNewHTTPClient_NamedRemoteUsesCatalogToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/ping":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":      true,
+				"service": "kata",
+				"version": "test",
+			})
+		case "/protected":
+			gotAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[daemon]]
+name = "shared"
+url = "`+srv.URL+`"
+token = "catalog-token"
+`), 0o600))
+
+	c, err := NewHTTPClient(context.Background(), srv.URL, Opts{
+		Timeout:    time.Second,
+		DaemonName: "shared",
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/protected", nil)
+	require.NoError(t, err)
+	resp, err := c.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Equal(t, "Bearer catalog-token", gotAuth)
+}
+
+func TestNewHTTPClient_NamedRemoteAuthTokenEnvOverridesUnsetCatalogTokenEnv(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_AUTH_TOKEN", "env-token")
+	t.Setenv("KATA_SHARED_TOKEN", "")
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/ping":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":      true,
+				"service": "kata",
+				"version": "test",
+			})
+		case "/protected":
+			gotAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[daemon]]
+name = "shared"
+url = "`+srv.URL+`"
+token_env = "KATA_SHARED_TOKEN"
+`), 0o600))
+
+	c, err := NewHTTPClient(context.Background(), srv.URL, Opts{
+		Timeout:    time.Second,
+		DaemonName: "shared",
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/protected", nil)
+	require.NoError(t, err)
+	resp, err := c.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Equal(t, "Bearer env-token", gotAuth)
+}
+
+func TestNewHTTPClient_NamedRemoteAuthTokenEnvSuppliesTokenlessCatalog(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_AUTH_TOKEN", "env-token")
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/ping":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":      true,
+				"service": "kata",
+				"version": "test",
+			})
+		case "/protected":
+			gotAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[daemon]]
+name = "shared"
+url = "`+srv.URL+`"
+`), 0o600))
+
+	c, err := NewHTTPClient(context.Background(), srv.URL, Opts{
+		Timeout:    time.Second,
+		DaemonName: "shared",
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/protected", nil)
+	require.NoError(t, err)
+	resp, err := c.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Equal(t, "Bearer env-token", gotAuth)
+}
+
+func TestNewHTTPClient_NamedRemoteAuthTokenEnvWinsInIdentityAutostartMode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_AUTH_TOKEN", "client-token")
+	t.Setenv("KATA_AUTOSTART", "1")
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/ping":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":      true,
+				"service": "kata",
+				"version": "test",
+			})
+		case "/protected":
+			gotAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[auth]
+token = "bootstrap-token"
+require_token_identity = true
+
+[[daemon]]
+name = "shared"
+url = "`+srv.URL+`"
+`), 0o600))
+
+	c, err := NewHTTPClient(context.Background(), srv.URL, Opts{
+		Timeout:    time.Second,
+		DaemonName: "shared",
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/protected", nil)
+	require.NoError(t, err)
+	resp, err := c.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Equal(t, "Bearer client-token", gotAuth)
+}
+
+func TestNewHTTPClient_NamedRemoteAuthTokenEnvHonorsTrustPrivateNetwork(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_AUTH_TOKEN", "env-token")
+	t.Setenv("KATA_TRUST_PRIVATE_NETWORK", "1")
+	baseURL := "http://100.64.0.5:7373"
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[daemon]]
+name = "shared"
+url = "`+baseURL+`"
+`), 0o600))
+
+	c, err := NewHTTPClient(context.Background(), baseURL, Opts{
+		Timeout:    time.Second,
+		DaemonName: "shared",
+	})
+
+	require.NoError(t, err)
+	assert.NotNil(t, c)
+}
+
+func TestNewHTTPClient_NamedRemoteCatalogTokenHonorsTrustPrivateNetwork(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_TRUST_PRIVATE_NETWORK", "1")
+	baseURL := "http://100.64.0.5:7373"
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[daemon]]
+name = "shared"
+url = "`+baseURL+`"
+token = "catalog-token"
+`), 0o600))
+
+	c, err := NewHTTPClient(context.Background(), baseURL, Opts{
+		Timeout:    time.Second,
+		DaemonName: "shared",
+	})
+
+	require.NoError(t, err)
+	assert.NotNil(t, c)
+}
+
+func TestNewHTTPClient_ActiveRemoteTokenEnvHonorsTrustPrivateNetwork(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_SERVER", "")
+	t.Setenv("KATA_SHARED_TOKEN", "catalog-env-token")
+	baseURL := "http://100.64.0.5:7373"
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+active_daemon = "shared"
+
+[auth]
+trust_private_network = true
+
+[[daemon]]
+name = "shared"
+url = "`+baseURL+`"
+token_env = "KATA_SHARED_TOKEN"
+`), 0o600))
+
+	c, err := NewHTTPClient(context.Background(), baseURL, Opts{Timeout: time.Second})
+
+	require.NoError(t, err)
+	assert.NotNil(t, c)
+}
+
+func TestNewHTTPClient_NamedLocalUsesCatalogToken(t *testing.T) {
+	home := setupKataEnv(t)
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/ping":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":      true,
+				"service": "kata",
+				"version": currentVersionForEnsure(),
+				"pid":     os.Getpid(),
+			})
+		case "/protected":
+			gotAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	require.NoError(t, writeRuntimeRecord(t, home, strings.TrimPrefix(srv.URL, "http://")))
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[daemon]]
+name = "local-auth"
+local = true
+token = "local-token"
+`), 0o600))
+
+	c, err := NewHTTPClient(context.Background(), srv.URL, Opts{
+		Timeout:    time.Second,
+		DaemonName: "local-auth",
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/protected", nil)
+	require.NoError(t, err)
+	resp, err := c.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Equal(t, "Bearer local-token", gotAuth)
+}
+
+func TestNewHTTPClient_NamedLocalUsesProvidedBaseURLWithoutStarting(t *testing.T) {
+	home := setupKataEnv(t)
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[daemon]]
+name = "local-auth"
+local = true
+token = "local-token"
+`), 0o600))
+
+	c, err := NewHTTPClient(context.Background(), srv.URL, Opts{
+		Timeout:    time.Second,
+		DaemonName: "local-auth",
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := c.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Equal(t, "Bearer local-token", gotAuth)
+}
+
+func TestNewHTTPClient_NamedLocalBypassesActiveDaemonAuth(t *testing.T) {
+	home := setupKataEnv(t)
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("KATA_REMOTE_TOKEN", "")
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+active_daemon = "remote"
+
+[auth]
+token = "global-token"
+
+[[daemon]]
+name = "local"
+local = true
+
+[[daemon]]
+name = "remote"
+url = "`+srv.URL+`"
+token_env = "KATA_REMOTE_TOKEN"
+`), 0o600))
+
+	c, err := NewHTTPClient(context.Background(), srv.URL, Opts{
+		Timeout:    time.Second,
+		DaemonName: "local",
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := c.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Equal(t, "Bearer global-token", gotAuth)
 }
 
 func TestResolveRemote_FileUnreachableErrors(t *testing.T) {

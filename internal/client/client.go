@@ -133,6 +133,7 @@ type Opts struct {
 	ResponseHeaderTimeout time.Duration
 	AllowInsecure         bool
 	WorkspaceStart        string
+	DaemonName            string
 }
 
 // TargetAuth is explicit per-target bearer configuration. It is used by
@@ -140,8 +141,9 @@ type Opts struct {
 // process and therefore cannot rely on the package-global auth resolution
 // path.
 type TargetAuth struct {
-	Token         string
-	AllowInsecure bool
+	Token               string
+	AllowInsecure       bool
+	TrustPrivateNetwork bool
 }
 
 // NewHTTPClient returns an *http.Client whose transport matches baseURL —
@@ -157,6 +159,38 @@ type TargetAuth struct {
 // from the first-party CLI/TUI without callers having to plumb the header
 // through every request site.
 func NewHTTPClient(ctx context.Context, baseURL string, opts Opts) (*http.Client, error) {
+	if opts.DaemonName != "" {
+		target, err := namedDaemonTargetForBaseURL(opts.DaemonName, baseURL)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimRight(baseURL, "/") != target.BaseURL {
+			return nil, fmt.Errorf("daemon %q resolved to %s, not %s",
+				target.Name, target.BaseURL, strings.TrimRight(baseURL, "/"))
+		}
+		if !target.Local {
+			auth := resolveAuthConfig()
+			if token := authTokenEnvOverride(); token != "" {
+				return NewHTTPClientForTarget(ctx, baseURL,
+					TargetAuth{
+						Token:               token,
+						AllowInsecure:       target.AllowInsecure,
+						TrustPrivateNetwork: auth.TrustPrivateNetwork,
+					}, opts)
+			}
+			return NewHTTPClientForTarget(ctx, baseURL,
+				TargetAuth{
+					Token:               target.Token,
+					AllowInsecure:       target.AllowInsecure,
+					TrustPrivateNetwork: auth.TrustPrivateNetwork,
+				}, opts)
+		}
+		if target.Token != "" {
+			return NewHTTPClientWithBearer(ctx, baseURL, target.Token, opts)
+		}
+		auth := resolveAuthConfig()
+		return newHTTPClientWithAuth(ctx, baseURL, auth, opts)
+	}
 	if auth, ok, err := activeRemoteTargetAuthForBaseURL(baseURL, opts.WorkspaceStart); err != nil {
 		return nil, err
 	} else if ok {
@@ -186,7 +220,8 @@ func NewHTTPClientForTarget(ctx context.Context, baseURL string, auth TargetAuth
 	if err != nil {
 		return nil, err
 	}
-	rt, err := explicitBearerTransport(c.Transport, auth.Token, baseURL, auth.AllowInsecure)
+	rt, err := explicitBearerTransport(c.Transport, auth.Token, baseURL,
+		auth.TrustPrivateNetwork, auth.AllowInsecure)
 	if err != nil {
 		return nil, err
 	}

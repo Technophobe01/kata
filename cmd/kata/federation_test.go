@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -410,6 +411,105 @@ func TestFederationEnrollCLIUsesKATAServerAsSpokeForAdoption(t *testing.T) {
 	assert.True(t, enrollments[0].AllowAdoptionSnapshotAuthors)
 }
 
+func TestFederationEnrollCLIUsesNamedSpokeCatalogAuthForAdoption(t *testing.T) {
+	resetFlags(t)
+	spoke := testenv.New(t, testenv.WithAuthToken("spoke-token"))
+	hub := testenv.New(t, testenv.WithAuthToken("hub-token"))
+	ctx := context.Background()
+	_, err := spoke.DB.CreateProject(ctx, "fedlab")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(hub.Home, "config.toml"), []byte(`
+[[daemon]]
+name = "spoke"
+url = "`+spoke.URL+`"
+token = "spoke-token"
+`), 0o600))
+
+	cmd := newRootCmd()
+	var buf strings.Builder
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--daemon", "spoke",
+		"--project", "fedlab",
+		"federation", "enroll",
+		"--spoke-instance", spoke.DB.InstanceUID(),
+		"--hub-url", hub.URL,
+		"--actor", "wesm",
+	})
+
+	require.NoError(t, cmd.Execute())
+	out := buf.String()
+	assert.Contains(t, out, "--hub-url "+hub.URL)
+	assert.Contains(t, out, "--adopt-existing")
+
+	enrollments, err := hub.DB.ListFederationEnrollments(ctx)
+	require.NoError(t, err)
+	require.Len(t, enrollments, 1)
+	assert.True(t, enrollments[0].AllowAdoptionSnapshotAuthors)
+}
+
+func TestFederationEnrollCLIExplicitDaemonResolutionFailureErrors(t *testing.T) {
+	resetFlags(t)
+	hub := testenv.New(t, testenv.WithAuthToken("hub-token"))
+	ctx := context.Background()
+	t.Setenv("KATA_AUTH_TOKEN", "hub-token")
+
+	cmd := newRootCmd()
+	var buf strings.Builder
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--daemon", "missing-spoke",
+		"--project", "fedlab",
+		"federation", "enroll",
+		"--spoke-instance", "01HZNQ7VFPK1XGD8R5MABCD4EF",
+		"--hub-url", hub.URL,
+		"--actor", "operator",
+	})
+
+	err := cmd.Execute()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing-spoke")
+	enrollments, listErr := hub.DB.ListFederationEnrollments(ctx)
+	require.NoError(t, listErr)
+	assert.Empty(t, enrollments)
+}
+
+func TestFederationEnrollCLIKATAServerSpokeAuthFailureErrors(t *testing.T) {
+	resetFlags(t)
+	spoke := testenv.New(t, testenv.WithAuthToken("spoke-token"))
+	hub := testenv.New(t, testenv.WithAuthToken("hub-token"))
+	t.Setenv("KATA_SERVER", spoke.URL)
+	t.Setenv("KATA_AUTH_TOKEN", "hub-token")
+	ctx := context.Background()
+	_, err := spoke.DB.CreateProject(ctx, "fedlab")
+	require.NoError(t, err)
+
+	cmd := newRootCmd()
+	var buf strings.Builder
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--project", "fedlab",
+		"federation", "enroll",
+		"--spoke-instance", spoke.DB.InstanceUID(),
+		"--hub-url", hub.URL,
+		"--actor", "operator",
+	})
+
+	err = cmd.Execute()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Authorization bearer required")
+	_, projectErr := hub.DB.ProjectByName(ctx, "fedlab")
+	assert.ErrorIs(t, projectErr, db.ErrNotFound)
+	enrollments, listErr := hub.DB.ListFederationEnrollments(ctx)
+	require.NoError(t, listErr)
+	assert.Empty(t, enrollments)
+}
+
 func TestFederationEnrollCLISameNameAutoAdoptionRequiresMatchingSpokeInstance(t *testing.T) {
 	resetFlags(t)
 	hub := testenv.New(t, testenv.WithAuthToken("hub-token"))
@@ -663,6 +763,89 @@ func TestFederationSpokeProjectExistsDoesNotAttachHubTokenToSpokeProbe(t *testin
 	require.True(t, exists)
 	require.NotEmpty(t, seenAuth)
 	assert.Equal(t, []string{""}, seenAuth)
+}
+
+func TestFederationSpokeHTTPClientDoesNotUseKATAServerGlobalAuth(t *testing.T) {
+	resetFlags(t)
+	t.Setenv("KATA_AUTH_TOKEN", "hub-token")
+	var gotAuth string
+	spoke := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/ping":
+			_, _ = w.Write([]byte(`{"ok":true,"service":"kata","version":"test"}`))
+		case "/probe":
+			gotAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(spoke.Close)
+	t.Setenv("KATA_SERVER", spoke.URL)
+
+	hc, err := federationSpokeHTTPClient(context.Background(), spoke.URL)
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, spoke.URL+"/probe", nil)
+	require.NoError(t, err)
+	resp, err := hc.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Empty(t, gotAuth)
+}
+
+func TestFederationSpokeHTTPClientDoesNotUseNamedDaemonGlobalAuthFallback(t *testing.T) {
+	resetFlags(t)
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_AUTH_TOKEN", "env-token")
+	flags.Daemon = "spoke"
+	var gotAuth string
+	spoke := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(spoke.Close)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[[daemon]]
+name = "spoke"
+url = "`+spoke.URL+`"
+`), 0o600))
+
+	hc, err := federationSpokeHTTPClient(context.Background(), spoke.URL)
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, spoke.URL+"/probe", nil)
+	require.NoError(t, err)
+	resp, err := hc.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Empty(t, gotAuth)
+}
+
+func TestFederationSpokeHTTPClientNamedDaemonTokenEnvHonorsTrustPrivateNetwork(t *testing.T) {
+	resetFlags(t)
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_SPOKE_TOKEN", "spoke-token")
+	flags.Daemon = "spoke"
+	baseURL := "http://100.64.0.5:7373"
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+[auth]
+trust_private_network = true
+
+[[daemon]]
+name = "spoke"
+url = "`+baseURL+`"
+token_env = "KATA_SPOKE_TOKEN"
+`), 0o600))
+
+	hc, err := federationSpokeHTTPClient(context.Background(), baseURL)
+
+	require.NoError(t, err)
+	assert.NotNil(t, hc)
 }
 
 func TestFederationSpokeProjectExistsUsesReadonlyGETProbe(t *testing.T) {

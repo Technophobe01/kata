@@ -155,6 +155,11 @@ func federationEnrollCmd() *cobra.Command {
 				return err
 			}
 			ctx := cmd.Context()
+			if !adoptExistingFlag && pushCapable {
+				if err := federationSpokeProbePreflight(ctx, spokeInstance); err != nil {
+					return err
+				}
+			}
 			hubBaseURL := strings.TrimRight(hubURL, "/")
 			hubClient, err := federationEnrollHTTPClient(ctx, hubBaseURL, allowInsecure)
 			if err != nil {
@@ -174,7 +179,11 @@ func federationEnrollCmd() *cobra.Command {
 			}
 			adoptExisting := adoptExistingFlag
 			if !adoptExisting && pushCapable {
-				if spokeUID, ok := federationSpokeProjectUID(ctx, metadata.ProjectName, spokeInstance); ok {
+				spokeUID, ok, err := federationSpokeProjectUID(ctx, metadata.ProjectName, spokeInstance)
+				if err != nil {
+					return err
+				}
+				if ok {
 					// A same-name spoke project is normally adopted — unless it
 					// already shares the hub project's UID (it previously left
 					// this federation). Then the join is a plain rejoin and
@@ -248,7 +257,7 @@ func federationEnrollHTTPClientError(err error) error {
 }
 
 func federationSpokeProjectExists(ctx context.Context, projectName, spokeInstance string) bool {
-	_, ok := federationSpokeProjectUID(ctx, projectName, spokeInstance)
+	_, ok, _ := federationSpokeProjectUID(ctx, projectName, spokeInstance)
 	return ok
 }
 
@@ -256,24 +265,155 @@ func federationSpokeProjectExists(ctx context.Context, projectName, spokeInstanc
 // instance matches spokeInstance) has a project named projectName, returning
 // that project's UID. The UID is "" when the daemon's list payload predates
 // uid, in which case callers should fall back to the adoption default.
-func federationSpokeProjectUID(ctx context.Context, projectName, spokeInstance string) (string, bool) {
+func federationSpokeProjectUID(ctx context.Context, projectName, spokeInstance string) (string, bool, error) {
+	explicitDaemon := federationSpokeProbeExplicit(ctx)
 	spokeURL, err := ensureDaemon(ctx)
 	if err != nil {
-		return "", false
+		if explicitDaemon {
+			return "", false, err
+		}
+		return "", false, nil
 	}
-	spokeClient, err := clientpkg.NewHTTPClientForTarget(ctx, spokeURL, clientpkg.TargetAuth{}, clientpkg.Opts{
-		Timeout: envHTTPTimeout(defaultHTTPTimeout),
-	})
+	spokeClient, err := federationSpokeHTTPClient(ctx, spokeURL)
 	if err != nil {
-		return "", false
+		if explicitDaemon {
+			return "", false, err
+		}
+		return "", false, nil
 	}
 	if strings.TrimSpace(spokeInstance) != "" {
 		uid, err := federationSpokeInstanceUID(ctx, spokeClient, spokeURL)
 		if err != nil || uid != strings.TrimSpace(spokeInstance) {
-			return "", false
+			if err != nil && explicitDaemon {
+				return "", false, err
+			}
+			return "", false, nil
 		}
 	}
-	return federationSpokeProjectNameExists(ctx, spokeClient, spokeURL, projectName)
+	uid, ok, err := federationSpokeProjectNameExists(ctx, spokeClient, spokeURL, projectName)
+	if err != nil && explicitDaemon {
+		return "", false, err
+	}
+	if err != nil {
+		return "", false, nil
+	}
+	return uid, ok, nil
+}
+
+func federationSpokeProbeExplicit(ctx context.Context) bool {
+	if strings.TrimSpace(flags.Daemon) != "" {
+		return true
+	}
+	_, ok, err := clientpkg.ResolveRemote(ctx, workspaceStartForRemote())
+	return ok || err != nil
+}
+
+func federationSpokeProbePreflight(ctx context.Context, spokeInstance string) error {
+	if !federationSpokeProbeExplicit(ctx) {
+		return nil
+	}
+	spokeURL, err := ensureDaemon(ctx)
+	if err != nil {
+		return err
+	}
+	spokeClient, err := federationSpokeHTTPClient(ctx, spokeURL)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(spokeInstance) == "" {
+		return nil
+	}
+	_, err = federationSpokeInstanceUID(ctx, spokeClient, spokeURL)
+	return err
+}
+
+func federationSpokeHTTPClient(ctx context.Context, spokeURL string) (*http.Client, error) {
+	opts := clientpkg.Opts{Timeout: envHTTPTimeout(defaultHTTPTimeout)}
+	if strings.TrimSpace(flags.Daemon) == "" {
+		auth, err := federationImplicitSpokeTargetAuth(ctx, spokeURL)
+		if err != nil {
+			return nil, err
+		}
+		return clientpkg.NewHTTPClientForTarget(ctx, spokeURL, auth, opts)
+	}
+	cfg, err := config.ReadDaemonConfig()
+	if err != nil {
+		return nil, err
+	}
+	entry := catalogByName(cfg, flags.Daemon)
+	if entry == nil {
+		return clientpkg.NewHTTPClientForTarget(ctx, spokeURL, clientpkg.TargetAuth{}, opts)
+	}
+	if !entry.Local {
+		entryURL, err := clientpkg.NormalizeRemoteURL(entry.URL, entry.AllowInsecure)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimRight(entryURL, "/") != strings.TrimRight(spokeURL, "/") {
+			return clientpkg.NewHTTPClientForTarget(ctx, spokeURL, clientpkg.TargetAuth{}, opts)
+		}
+	}
+	token, err := selectedCatalogToken(entry)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(token) == "" {
+		return clientpkg.NewHTTPClientForTarget(ctx, spokeURL,
+			clientpkg.TargetAuth{AllowInsecure: entry.AllowInsecure}, opts)
+	}
+	auth, err := config.ReadAuthConfig()
+	if err != nil {
+		auth.TrustPrivateNetwork = config.EnvTruthy("KATA_TRUST_PRIVATE_NETWORK")
+	}
+	return clientpkg.NewHTTPClientForTarget(ctx, spokeURL,
+		clientpkg.TargetAuth{
+			Token:               token,
+			AllowInsecure:       entry.AllowInsecure,
+			TrustPrivateNetwork: auth.TrustPrivateNetwork,
+		}, opts)
+}
+
+func federationImplicitSpokeTargetAuth(ctx context.Context, spokeURL string) (clientpkg.TargetAuth, error) {
+	workspaceStart := workspaceStartForRemote()
+	if remoteURL, ok, err := clientpkg.ResolveRemote(ctx, workspaceStart); err != nil {
+		return clientpkg.TargetAuth{}, err
+	} else if !ok || strings.TrimRight(remoteURL, "/") != strings.TrimRight(spokeURL, "/") {
+		return clientpkg.TargetAuth{}, nil
+	}
+	if os.Getenv("KATA_SERVER") != "" {
+		return clientpkg.TargetAuth{}, nil
+	}
+	cfg, err := config.ReadDaemonConfig()
+	if err != nil {
+		return clientpkg.TargetAuth{}, err
+	}
+	if strings.TrimSpace(cfg.ActiveDaemon) == "" {
+		return clientpkg.TargetAuth{}, nil
+	}
+	entry := catalogByName(cfg, cfg.ActiveDaemon)
+	if entry == nil || entry.Local {
+		return clientpkg.TargetAuth{}, nil
+	}
+	entryURL, err := clientpkg.NormalizeRemoteURL(entry.URL, entry.AllowInsecure)
+	if err != nil {
+		return clientpkg.TargetAuth{}, err
+	}
+	if strings.TrimRight(entryURL, "/") != strings.TrimRight(spokeURL, "/") {
+		return clientpkg.TargetAuth{}, nil
+	}
+	token, err := selectedCatalogToken(entry)
+	if err != nil {
+		return clientpkg.TargetAuth{}, err
+	}
+	auth, err := config.ReadAuthConfig()
+	if err != nil {
+		auth.TrustPrivateNetwork = config.EnvTruthy("KATA_TRUST_PRIVATE_NETWORK")
+	}
+	return clientpkg.TargetAuth{
+		Token:               token,
+		AllowInsecure:       entry.AllowInsecure,
+		TrustPrivateNetwork: auth.TrustPrivateNetwork,
+	}, nil
 }
 
 func federationSpokeInstanceUID(ctx context.Context, client *http.Client, baseURL string) (string, error) {
@@ -293,14 +433,17 @@ func federationSpokeInstanceUID(ctx context.Context, client *http.Client, baseUR
 	return strings.TrimSpace(body.InstanceUID), nil
 }
 
-func federationSpokeProjectNameExists(ctx context.Context, client *http.Client, baseURL, projectName string) (string, bool) {
+func federationSpokeProjectNameExists(ctx context.Context, client *http.Client, baseURL, projectName string) (string, bool, error) {
 	projectName = strings.TrimSpace(projectName)
 	if projectName == "" {
-		return "", false
+		return "", false, nil
 	}
 	status, bs, err := httpDoJSON(ctx, client, http.MethodGet, baseURL+"/api/v1/projects", nil)
-	if err != nil || status >= 400 {
-		return "", false
+	if err != nil {
+		return "", false, err
+	}
+	if status >= 400 {
+		return "", false, apiErrFromBody(status, bs)
 	}
 	var body struct {
 		Projects []struct {
@@ -309,14 +452,14 @@ func federationSpokeProjectNameExists(ctx context.Context, client *http.Client, 
 		} `json:"projects"`
 	}
 	if err := json.Unmarshal(bs, &body); err != nil {
-		return "", false
+		return "", false, err
 	}
 	for _, project := range body.Projects {
 		if project.Name == projectName {
-			return project.UID, true
+			return project.UID, true, nil
 		}
 	}
-	return "", false
+	return "", false, nil
 }
 
 func federationEnrollmentsCmd() *cobra.Command {

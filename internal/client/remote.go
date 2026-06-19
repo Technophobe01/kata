@@ -39,12 +39,47 @@ type activeRemoteTarget struct {
 // of CLI-layer types so this package stays importable from the TUI.
 var ErrRemoteUnavailable = errors.New("kata server not responding")
 
+// ErrNamedDaemonNotFound marks a --daemon/catalog selection that does not
+// match any [[daemon]] entry in <KATA_HOME>/config.toml.
+var ErrNamedDaemonNotFound = errors.New("named daemon not found")
+
+type namedDaemonTarget struct {
+	Name          string
+	Local         bool
+	BaseURL       string
+	Token         string
+	AllowInsecure bool
+}
+
 // ResolveRemote is the exported view of resolveRemote so callers
 // outside client (e.g. cmd/kata health) can honor the same
 // KATA_SERVER / .kata.local.toml / active_daemon resolution rules without
 // auto-starting a local daemon.
 func ResolveRemote(ctx context.Context, workspaceStart string) (string, bool, error) {
 	return resolveRemote(ctx, workspaceStart)
+}
+
+// DiscoverNamed returns the base URL for a named daemon catalog entry without
+// starting a local daemon. Local entries inspect runtime files only; remote
+// entries are normalized and probed.
+func DiscoverNamed(ctx context.Context, name string) (string, bool, error) {
+	target, ok, err := discoverNamedDaemonTarget(ctx, name)
+	if err != nil || !ok {
+		return "", ok, err
+	}
+	return target.BaseURL, true, nil
+}
+
+// EnsureNamedRunning returns the base URL for a named daemon catalog entry,
+// auto-starting local entries and probing remote entries. It is an explicit
+// per-invocation selection and therefore ignores KATA_SERVER, .kata.local.toml,
+// and active_daemon.
+func EnsureNamedRunning(ctx context.Context, name string) (string, error) {
+	target, err := resolveNamedDaemonTarget(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	return target.BaseURL, nil
 }
 
 // NormalizeRemoteURL exposes kata's remote URL validation/canonicalization
@@ -132,6 +167,139 @@ func resolveActiveRemote(ctx context.Context) (string, bool, error) {
 	return target.BaseURL, true, nil
 }
 
+func discoverNamedDaemonTarget(ctx context.Context, name string) (namedDaemonTarget, bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return namedDaemonTarget{}, false, fmt.Errorf("%w: empty name", ErrNamedDaemonNotFound)
+	}
+	cfg, err := config.ReadDaemonConfig()
+	if err != nil {
+		return namedDaemonTarget{}, false, err
+	}
+	for _, d := range cfg.Daemons {
+		if d.Name != name {
+			continue
+		}
+		if d.Local {
+			ns, err := daemon.NewNamespace()
+			if err != nil {
+				return namedDaemonTarget{}, false, err
+			}
+			baseURL, ok := Discover(ctx, ns.DataDir)
+			if !ok {
+				return namedDaemonTarget{}, false, nil
+			}
+			target, err := namedDaemonTargetFromCatalog(d, baseURL, true)
+			if err != nil {
+				return namedDaemonTarget{}, false, err
+			}
+			return target, true, nil
+		}
+		target, err := namedDaemonTargetFromCatalog(d, "", false)
+		if err != nil {
+			return namedDaemonTarget{}, false, err
+		}
+		if !probeRemote(ctx, target.BaseURL) {
+			return namedDaemonTarget{}, false, fmt.Errorf("%w: %s (%s daemon %q)",
+				ErrRemoteUnavailable, target.BaseURL, daemonConfigSource(), d.Name)
+		}
+		return target, true, nil
+	}
+	return namedDaemonTarget{}, false, fmt.Errorf("%w: %q", ErrNamedDaemonNotFound, name)
+}
+
+func resolveNamedDaemonTarget(ctx context.Context, name string) (namedDaemonTarget, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return namedDaemonTarget{}, fmt.Errorf("%w: empty name", ErrNamedDaemonNotFound)
+	}
+	cfg, err := config.ReadDaemonConfig()
+	if err != nil {
+		return namedDaemonTarget{}, err
+	}
+	for _, d := range cfg.Daemons {
+		if d.Name != name {
+			continue
+		}
+		if d.Local {
+			baseURL, err := EnsureLocalRunning(ctx)
+			if err != nil {
+				return namedDaemonTarget{}, err
+			}
+			return namedDaemonTargetFromCatalog(d, baseURL, true)
+		}
+		target, err := namedDaemonTargetFromCatalog(d, "", false)
+		if err != nil {
+			return namedDaemonTarget{}, err
+		}
+		if !probeRemote(ctx, target.BaseURL) {
+			return namedDaemonTarget{}, fmt.Errorf("%w: %s (%s daemon %q)",
+				ErrRemoteUnavailable, target.BaseURL, daemonConfigSource(), d.Name)
+		}
+		return target, nil
+	}
+	return namedDaemonTarget{}, fmt.Errorf("%w: %q", ErrNamedDaemonNotFound, name)
+}
+
+func namedDaemonTargetForBaseURL(name, baseURL string) (namedDaemonTarget, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return namedDaemonTarget{}, fmt.Errorf("%w: empty name", ErrNamedDaemonNotFound)
+	}
+	cfg, err := config.ReadDaemonConfig()
+	if err != nil {
+		return namedDaemonTarget{}, err
+	}
+	for _, d := range cfg.Daemons {
+		if d.Name != name {
+			continue
+		}
+		if d.Local {
+			return namedDaemonTargetFromCatalog(d, strings.TrimRight(baseURL, "/"), true)
+		}
+		return namedDaemonTargetFromCatalog(d, "", false)
+	}
+	return namedDaemonTarget{}, fmt.Errorf("%w: %q", ErrNamedDaemonNotFound, name)
+}
+
+func namedDaemonTargetFromCatalog(
+	daemon config.CatalogDaemonConfig,
+	localBaseURL string,
+	local bool,
+) (namedDaemonTarget, error) {
+	baseURL := localBaseURL
+	if !local {
+		var err error
+		baseURL, err = normalizeRemoteURL(daemon.URL, daemon.AllowInsecure)
+		if err != nil {
+			return namedDaemonTarget{}, fmt.Errorf("%s daemon %q url %q: %w",
+				daemonConfigSource(), daemon.Name, daemon.URL, err)
+		}
+	}
+	target := activeRemoteTarget{
+		Name:          daemon.Name,
+		BaseURL:       baseURL,
+		Token:         daemon.Token,
+		TokenEnv:      daemon.TokenEnv,
+		AllowInsecure: daemon.AllowInsecure,
+	}
+	token := daemon.Token
+	if local || !globalAuthTokenOverrideSet() {
+		var err error
+		token, err = resolveActiveRemoteTargetToken(target)
+		if err != nil {
+			return namedDaemonTarget{}, err
+		}
+	}
+	return namedDaemonTarget{
+		Name:          daemon.Name,
+		Local:         local,
+		BaseURL:       baseURL,
+		Token:         token,
+		AllowInsecure: daemon.AllowInsecure,
+	}, nil
+}
+
 func activeRemoteFromConfig() (activeRemoteTarget, bool, error) {
 	cfg, err := config.ReadDaemonConfig()
 	if err != nil {
@@ -191,9 +359,11 @@ func activeRemoteTargetAuthForBaseURL(baseURL, workspaceStart string) (TargetAut
 	if err != nil {
 		return TargetAuth{}, false, err
 	}
+	auth := resolveAuthConfig()
 	return TargetAuth{
-		Token:         token,
-		AllowInsecure: target.AllowInsecure,
+		Token:               token,
+		AllowInsecure:       target.AllowInsecure,
+		TrustPrivateNetwork: auth.TrustPrivateNetwork,
 	}, true, nil
 }
 
