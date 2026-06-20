@@ -195,5 +195,7 @@ Other close reasons are `--wontfix`, `--duplicate-of <ref>`,
 `--superseded-by <ref>`, and `--audit-no-change`.
 
 Close issues as soon as each one is complete and verified. Do not save a batch
-of sibling closes for the end of a run: the daemon refuses more than three
-sibling closes by one actor under one parent within 60 seconds.
+of sibling closes for the end of a run. By default the daemon allows sibling
+close bursts when each close carries valid evidence and a substantive message.
+Successful CLI closes print a reminder that each close is a completion claim
+and that the message and evidence should be specific to the issue.

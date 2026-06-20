@@ -14,14 +14,14 @@ import (
 // suffix so the user knows to consult `kata show` for the rest.
 const openChildrenSampleLimit = 10
 
-// siblingThrottleWindow is the look-back period over which sibling closes by
-// the same actor under the same parent are counted. siblingThrottleLimit is
-// the threshold: at the Nth close (N == limit) the actor has already closed
-// (limit) prior siblings, and the next close is refused. Spec §3.9 fixes both
-// values at "3 closes in 60 seconds" for v1; neither is configurable.
+// defaultSiblingThrottleWindow is the default look-back period over which
+// sibling closes by the same actor under the same parent are counted when the
+// opt-in burst throttle is enabled. siblingThrottleLimit is the threshold: at
+// the Nth close (N == limit) the actor has already closed (limit) prior
+// siblings, and the next close is refused.
 const (
-	siblingThrottleWindow = 60 * time.Second
-	siblingThrottleLimit  = 3
+	defaultSiblingThrottleWindow = 60 * time.Second
+	siblingThrottleLimit         = 3
 )
 
 // repeatedMessageWindow is the look-back period for the repeated-message
@@ -147,15 +147,18 @@ func (r *guardRefRenderer) eventIssueRef(ctx context.Context, ev db.Event) (stri
 // the practical bound.
 func CheckSiblingCloseThrottle(
 	ctx context.Context, d db.Storage,
-	issue db.Issue, actor string, now time.Time,
+	issue db.Issue, actor string, now time.Time, window time.Duration,
 ) (parentRef string, cohort []string, refusal error) {
+	if window <= 0 {
+		window = defaultSiblingThrottleWindow
+	}
 	parentLink, err := d.ParentOf(ctx, issue.ID)
 	if err != nil {
 		// ErrNotFound = no parent set; any other error is treated as a soft
 		// failure rather than blocking the close.
 		return "", nil, nil
 	}
-	since := now.Add(-siblingThrottleWindow)
+	since := now.Add(-window)
 	siblings, err := d.RecentSiblingCloses(ctx, parentLink.ToIssueID, issue.ID, actor, since)
 	if err != nil {
 		return "", nil, nil
@@ -184,7 +187,7 @@ func CheckSiblingCloseThrottle(
 		"sibling-close throttle: you closed %d children of %s in the last %s:\n%s\n"+
 			"Slow down and review the scope of each remaining child before closing. "+
 			"Wait for the throttle window to clear, or ask a human reviewer to inspect and close",
-		len(siblings), parentRef, humanizeDuration(siblingThrottleWindow),
+		len(siblings), parentRef, humanizeDuration(window),
 		strings.Join(lines, "\n"))
 	return parentRef, refs, refusal
 }
@@ -259,10 +262,11 @@ func CheckRepeatedMessageGuard(
 	return priorRef, parentRef, refusal
 }
 
-// humanizeDuration renders d as "N sec" under a minute and "N min" otherwise.
+// humanizeDuration renders d as "N sec" through one minute and "N min"
+// otherwise.
 // Used by the throttle error to describe how long ago each sibling closed.
 func humanizeDuration(d time.Duration) string {
-	if d < time.Minute {
+	if d <= time.Minute {
 		return fmt.Sprintf("%d sec", int(d.Seconds()))
 	}
 	return fmt.Sprintf("%d min", int(d.Minutes()))
