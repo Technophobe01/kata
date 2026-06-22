@@ -13,6 +13,16 @@
   to preserve a real name in a user-facing operational command.
 - No Testing/Verification Sections in PRs: Do not include a testing plan, test plan, verification,
   or verified section in pull request descriptions.
+- No Unrequested GitHub Comments: Do not comment on GitHub issues or pull
+  requests unless the user explicitly instructs you to post a comment.
+- No Bash Content-Assertion Tests: Do not add bash tests that assert shell
+  script, workflow, or config behavior by grepping for implementation text.
+  These are usually tautological: they prove only that the file contains the
+  string the test searched for, not that the release, installer, or workflow
+  works. Prefer exercising the command/tool behavior directly, using the tool's
+  own validation command, or writing a real parser-backed test. If direct
+  behavior coverage is not practical, document the manual check instead of
+  adding a brittle shell content test.
 
 ## Project management
 

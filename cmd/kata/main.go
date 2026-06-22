@@ -112,6 +112,7 @@ func newRootCmd() *cobra.Command {
 		newProjectsCmd(),
 		newTokensCmd(),
 		newTUICmd(),
+		newUpdateCmd(),
 		newVersionCmd(),
 	}
 	cmd.AddCommand(subs...)
