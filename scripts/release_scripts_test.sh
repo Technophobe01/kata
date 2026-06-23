@@ -367,6 +367,21 @@ test_install_checksum_cannot_be_skipped() {
   assert_not_contains "$output" "Checksum verification skipped" "installer checksum enforcement"
 }
 
+test_powershell_installer() {
+  if ! command -v pwsh >/dev/null 2>&1; then
+    printf 'skipping PowerShell installer tests: pwsh not found\n'
+    return
+  fi
+
+  local output status
+  set +e
+  output="$(pwsh -NoProfile -File "$repo_root/scripts/install_ps1_test.ps1" 2>&1)"
+  status=$?
+  set -e
+
+  [[ $status -eq 0 ]] || fail "PowerShell installer tests should pass: $output"
+}
+
 test_release_rejects_missing_version
 test_release_rejects_v_prefixed_version
 test_release_rejects_non_semver_version
@@ -382,5 +397,6 @@ test_verify_release_tag_accepts_tag_on_origin_main
 test_verify_release_tag_rejects_workflow_sha_mismatch
 test_verify_release_tag_rejects_tag_moved_after_validation
 test_install_checksum_cannot_be_skipped
+test_powershell_installer
 
 printf 'release script tests passed\n'
