@@ -167,7 +167,7 @@ func TestUpdateInstall_HumanShowsDownloadDetailsBeforeConfirmation(t *testing.T)
 	}}}
 	stubUpdateClient(t, fake)
 
-	stdout, stderr, err := executeRootCaptureWithInput(t, context.Background(), "n\n", "update")
+	stdout, stderr, err := executeRootCaptureWithInput(context.Background(), t, "n\n", "update")
 
 	ce := requireCLIError(t, err, ExitConfirm)
 	assert.Equal(t, kindConfirm, ce.Kind)
@@ -250,7 +250,7 @@ func TestUpdateInstall_JSONRequiresConfirmation(t *testing.T) {
 	}}}
 	stubUpdateClient(t, fake)
 
-	stdout, stderr, err := executeRootCaptureWithInput(t, context.Background(), "n\n", "--json", "update")
+	stdout, stderr, err := executeRootCaptureWithInput(context.Background(), t, "n\n", "--json", "update")
 
 	ce := requireCLIError(t, err, ExitConfirm)
 	assert.Equal(t, kindConfirm, ce.Kind)
@@ -269,7 +269,7 @@ func TestUpdateInstall_JSONOutputAfterConfirmation(t *testing.T) {
 	}}}
 	stubUpdateClient(t, fake)
 
-	stdout, stderr, err := executeRootCaptureWithInput(t, context.Background(), "y\n", "--json", "update")
+	stdout, stderr, err := executeRootCaptureWithInput(context.Background(), t, "y\n", "--json", "update")
 
 	require.NoError(t, err)
 	assert.Contains(t, stderr, "Install kata update v0.4.0 -> v0.5.0?")
@@ -353,8 +353,7 @@ func TestUpdate_DefaultClientConfiguration(t *testing.T) {
 	assert.Empty(t, got.TrustedPublicKeys)
 }
 
-//nolint:revive // test helper keeps t first to match the surrounding helper style.
-func executeRootCaptureWithInput(t *testing.T, ctx context.Context, stdin string, args ...string) (stdout, stderr string, err error) {
+func executeRootCaptureWithInput(ctx context.Context, t *testing.T, stdin string, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	resetFlags(t)
 	cmd := newRootCmd()
