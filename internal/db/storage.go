@@ -75,6 +75,11 @@ type Storage interface {
 	SoftDeleteIssue(ctx context.Context, issueID int64, actor string) (Issue, *Event, bool, error)
 	RestoreIssue(ctx context.Context, issueID int64, actor string) (Issue, *Event, bool, error)
 	PurgeIssue(ctx context.Context, issueID int64, actor string, reason *string) (PurgeLog, error)
+	// PurgeProject permanently deletes an archived project and all its
+	// project-scoped rows, writing a project_purge_log tombstone. Refuses
+	// active (ErrProjectNotArchived) or federated (*ProjectFederatedError)
+	// projects; ErrNotFound if the project does not exist.
+	PurgeProject(ctx context.Context, p PurgeProjectParams) (ProjectPurgeLog, error)
 	ClaimOwner(ctx context.Context, issueID int64, actor string, force bool) (ClaimResult, error)
 	UpdateOwner(ctx context.Context, issueID int64, newOwner *string, actor string) (Issue, *Event, bool, error)
 	UpdatePriority(ctx context.Context, issueID int64, newPriority *int64, actor string) (Issue, *Event, bool, error)
@@ -246,6 +251,7 @@ type Storage interface {
 	ExportPendingClaimRequests(ctx context.Context, f ExportFilter) iter.Seq2[PendingClaimRequestExport, error]
 	ExportEvents(ctx context.Context, f ExportFilter) iter.Seq2[EventExport, error]
 	ExportPurgeLog(ctx context.Context, f ExportFilter) iter.Seq2[PurgeLogExport, error]
+	ExportProjectPurgeLog(ctx context.Context, f ExportFilter) iter.Seq2[ProjectPurgeLogExport, error]
 	ExportSequences(ctx context.Context) iter.Seq2[SequenceExport, error]
 
 	// federation: push + ingest

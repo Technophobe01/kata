@@ -76,7 +76,47 @@ kata projects restore old-lab
 ```
 
 `projects remove` hides the project from normal resolution but preserves events
-for audit.
+for audit. The project name stays reserved; `kata init` with the same name is
+rejected while the project is archived.
+
+Permanently delete an archived project:
+
+```sh
+kata projects purge old-lab --force --confirm "PURGE old-lab"
+```
+
+`projects purge` is irreversible. It deletes all project data and frees the
+name so `kata init --project old-lab` works again afterward.
+
+The project must be archived first (`kata projects remove`). Purging an active
+project fails with `project_not_archived`.
+
+Two flags are required to prevent accidental data loss:
+
+- `--force` must be present.
+- `--confirm` must be the exact string `PURGE <project>` (e.g.
+  `"PURGE old-lab"`). A wrong or missing value is rejected.
+
+An optional `--reason` records a free-text note in the audit tombstone:
+
+```sh
+kata projects purge old-lab --force --confirm "PURGE old-lab" \
+  --reason "decommissioned after team reorg"
+```
+
+Pass `--json` to receive the audit tombstone with row counts as JSON.
+
+**Federation**: a project with a federation binding cannot be purged.
+
+- If the project is a **spoke**, run `kata federation leave old-lab` first.
+- If the project is a **hub**, purge is not currently supported. Hub teardown
+  must be handled manually before the project can be purged.
+
+!!! warning
+    `projects purge` cannot be undone. Confirm you have the right project with
+    `kata projects show <project>` *before* you `kata projects remove` it
+    (`projects show` resolves active projects only). Once archived, the
+    `PURGE <project>` confirmation string is your last check before deletion.
 
 Detach one alias when a workspace identity was attached to the wrong project:
 

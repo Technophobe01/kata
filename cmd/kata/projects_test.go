@@ -211,6 +211,47 @@ func TestProjects_MergeReportsShortIDExtensions(t *testing.T) {
 	assert.Equal(t, srcUID, got.ShortIDExtensions[0]["uid"])
 }
 
+func TestProjects_PurgeArchivedFreesName(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	p, err := env.DB.CreateProject(ctx, "spoke-project")
+	require.NoError(t, err)
+	_, _, err = env.DB.RemoveProject(ctx, db.RemoveProjectParams{ProjectID: p.ID, Actor: "tester"})
+	require.NoError(t, err)
+
+	out := requireCmdOutput(t, env, "projects", "purge", "spoke-project",
+		"--force", "--confirm", "PURGE spoke-project")
+	assert.Contains(t, out, "purged")
+	assert.Contains(t, out, "name is now free")
+
+	_, err = env.DB.ProjectByID(ctx, p.ID)
+	require.ErrorIs(t, err, db.ErrNotFound)
+}
+
+func TestProjects_PurgeRequiresForce(t *testing.T) {
+	env := testenv.New(t)
+	// No project created: the --force gate must fire before any daemon lookup,
+	// so the error is the validation error, not a not-found.
+	_, err := runCmdOutput(t, env, "projects", "purge", "spoke-project")
+	ce := requireCLIError(t, err, ExitValidation)
+	assert.Contains(t, ce.Message, "--force")
+}
+
+func TestProjects_PurgeNoConfirmNonTTYFails(t *testing.T) {
+	env := testenv.New(t)
+	// Force non-TTY so resolveConfirm rejects with confirm_required instead of
+	// prompting; otherwise a TTY stdin would yield confirm_mismatch.
+	stubIsTTY(t, false)
+	ctx := context.Background()
+	p, err := env.DB.CreateProject(ctx, "spoke-project")
+	require.NoError(t, err)
+	_, _, err = env.DB.RemoveProject(ctx, db.RemoveProjectParams{ProjectID: p.ID, Actor: "tester"})
+	require.NoError(t, err)
+	_, err = runCmdOutput(t, env, "projects", "purge", "spoke-project", "--force")
+	ce := requireCLIError(t, err, ExitConfirm)
+	assert.Equal(t, "confirm_required", ce.Code)
+}
+
 // TestProjects_MergeHumanOutputReportsExtensions covers the non-JSON path: the
 // merged-project summary line drops the legacy `next #N` clause and gains a
 // per-extension `extended <project>#<short> from <pre> to <post>` line.

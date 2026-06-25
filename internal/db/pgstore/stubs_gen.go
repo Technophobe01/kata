@@ -362,6 +362,12 @@ func (s *Store) ExportProjectAliases(_ context.Context, _ db.ExportFilter) iter.
 	}
 }
 
+func (s *Store) ExportProjectPurgeLog(_ context.Context, _ db.ExportFilter) iter.Seq2[db.ProjectPurgeLogExport, error] {
+	return func(yield func(db.ProjectPurgeLogExport, error) bool) {
+		yield(db.ProjectPurgeLogExport{}, ErrNotImplementedPhase3)
+	}
+}
+
 func (s *Store) ExportProjects(_ context.Context, _ db.ExportFilter) iter.Seq2[db.ProjectExport, error] {
 	return func(yield func(db.ProjectExport, error) bool) {
 		yield(db.ProjectExport{}, ErrNotImplementedPhase3)
@@ -656,6 +662,10 @@ func (s *Store) ProjectByUID(_ context.Context, _ string) (db.Project, error) {
 
 func (s *Store) PurgeIssue(_ context.Context, _ int64, _ string, _ *string) (db.PurgeLog, error) {
 	return db.PurgeLog{}, ErrNotImplementedPhase3
+}
+
+func (s *Store) PurgeProject(_ context.Context, _ db.PurgeProjectParams) (db.ProjectPurgeLog, error) {
+	return db.ProjectPurgeLog{}, ErrNotImplementedPhase3
 }
 
 func (s *Store) PurgeResetCheck(_ context.Context, _ int64, _ int64) (int64, error) {
