@@ -93,6 +93,10 @@ type PurgeProjectResponse = ProjectPurgeResponseBody
 
 type PurgeProjectErrorResponse = ErrorEnvelope
 
+type RewriteAuthorIdentityResponse = RewriteAuthorIdentityResult
+
+type RewriteAuthorIdentityErrorResponse = ErrorEnvelope
+
 type DetachProjectAliasResponse = DetachProjectAliasResponseBody
 
 type DetachProjectAliasErrorResponse = ErrorEnvelope
@@ -470,6 +474,13 @@ type PurgeProjectResp struct {
 	Body         []byte
 	StatusCode   int
 	JSON200      *PurgeProjectResponse
+}
+
+type RewriteAuthorIdentityResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *RewriteAuthorIdentityResponse
 }
 
 type DetachProjectAliasResp struct {

@@ -596,7 +596,7 @@ func (d *Store) createIssue(ctx context.Context, p db.CreateIssueParams) (int64,
 		Status:                 "open",
 		Metadata:               json.RawMessage(`{}`),
 		Labels:                 labels,
-		Links:                  createdLinkPayloads(links, resolvedTargets),
+		Links:                  createdLinkPayloads(links, resolvedTargets, p.Author),
 		CreatedAt:              createdAt,
 		IdempotencyKey:         p.IdempotencyKey,
 		IdempotencyFingerprint: p.IdempotencyFingerprint,
@@ -638,6 +638,7 @@ type createdLinkOut struct {
 	ToShortID  string `json:"to_short_id,omitempty"`
 	ToIssueUID string `json:"to_issue_uid,omitempty"`
 	Incoming   bool   `json:"incoming,omitempty"`
+	Author     string `json:"author,omitempty"`
 }
 
 type issueSnapshotComment struct {
@@ -674,7 +675,7 @@ type issueCreatedPayload struct {
 	ExternalID             string                 `json:"external_id,omitempty"`
 }
 
-func createdLinkPayloads(links []db.InitialLink, targets []createdLinkTarget) []createdLinkOut {
+func createdLinkPayloads(links []db.InitialLink, targets []createdLinkTarget, author string) []createdLinkOut {
 	if len(links) == 0 {
 		return nil
 	}
@@ -689,6 +690,7 @@ func createdLinkPayloads(links []db.InitialLink, targets []createdLinkTarget) []
 			ToShortID:  t.ShortID,
 			ToIssueUID: t.UID,
 			Incoming:   l.Incoming,
+			Author:     author,
 		})
 	}
 	return out

@@ -122,6 +122,11 @@ kata comment edit <ref> <comment-uid> \
   [--body TEXT | --body-file PATH | --body-stdin]
 ```
 
+`kata comment edit` replaces the current comment body while preserving the
+comment UID, author, creation time, and thread position. Use it for
+pre-federation content redaction; it does not rewrite historical events that
+have already been shared.
+
 Close:
 
 ```sh
@@ -252,6 +257,7 @@ kata projects remove <project> [--force]
 kata projects restore <project>
 kata projects purge <project> --force --confirm "PURGE <project>" [--reason TEXT] [--json]
 kata projects detach <alias-identity>
+kata projects rewrite-author [<project>] --from <old-author> --to <new-author>
 ```
 
 `projects remove` archives a project (reversible with `restore`). The name
@@ -265,6 +271,13 @@ tombstone. Pass `--json` to receive the tombstone with row counts.
 
 A project that has a federation binding cannot be purged. Spokes must run
 `kata federation leave <project>` first. Hub purge is not currently supported.
+
+`projects rewrite-author` rewrites exact matches in the current issue author,
+issue owner, comment author, and link author fields. It is project-scoped,
+idempotent, and intended for current-state identity hygiene before exporting,
+sharing, or enrolling a project in federation; it is not a historical event
+redaction tool. If `<project>` is omitted, kata resolves the project from
+`--project` or the current workspace.
 
 ## Daemon and diagnostics
 
@@ -366,6 +379,13 @@ spoke project, then edit the printed join command's `--project` value.
 pre-adoption event history from the live event stream and queues fresh snapshots
 for federation. Run `kata --project <project> export --output <path>.jsonl`
 first if you need to retain that local event timeline.
+
+Before enrolling a project, `kata projects rewrite-author <project>
+--from <old-author> --to <new-author>` rewrites exact matches in the current
+issue author, issue owner, comment author, and link author fields. It is
+project-scoped, idempotent, and intended for current-state identity hygiene
+before federation snapshots are emitted; it is not a historical event redaction
+tool.
 
 Federation is an operator workflow. Most users never need these commands.
 Issue edits on push-enabled federated spokes remain local-first; use

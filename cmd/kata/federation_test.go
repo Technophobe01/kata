@@ -210,6 +210,7 @@ func TestFederationHelpIsVisible(t *testing.T) {
 	assert.Contains(t, out, "join")
 	assert.Contains(t, out, "leave")
 	assert.Contains(t, out, "revoke")
+	assert.NotContains(t, out, "rewrite-author")
 }
 
 func TestFederationStatusInvisibilityNonFederatedShowUnchanged(t *testing.T) {

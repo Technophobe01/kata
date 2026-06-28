@@ -3060,6 +3060,49 @@ components:
         - token
         - event
       type: object
+    RewriteAuthorIdentityRequestBody:
+      additionalProperties: false
+      properties:
+        actor:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+      required:
+        - from
+        - to
+      type: object
+    RewriteAuthorIdentityResult:
+      additionalProperties: true
+      properties:
+        changed:
+          type: boolean
+        comment_authors:
+          format: int64
+          type: integer
+        event:
+          $ref: "#/components/schemas/Event"
+        issue_authors:
+          format: int64
+          type: integer
+        issue_owners:
+          format: int64
+          type: integer
+        link_authors:
+          format: int64
+          type: integer
+        total:
+          format: int64
+          type: integer
+      required:
+        - changed
+        - issue_authors
+        - issue_owners
+        - comment_authors
+        - link_authors
+        - total
+      type: object
     RunIssueSyncOnceRequestBody:
       additionalProperties: false
       type: object
@@ -3264,7 +3307,7 @@ components:
       type: object
 info:
   title: kata
-  version: 0.2.0
+  version: 0.3.0
 openapi: 3.1.0
 paths:
   /api/v1/audit/closes:
@@ -3870,6 +3913,35 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ProjectPurgeResponseBody"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Error
+  /api/v1/projects/{project_id}/actions/rewrite-author:
+    post:
+      operationId: rewriteAuthorIdentity
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RewriteAuthorIdentityRequestBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RewriteAuthorIdentityResult"
           description: OK
         default:
           content:
