@@ -431,9 +431,10 @@ func registerFederationHandlers(humaAPI huma.API, cfg ServerConfig) {
 	})
 
 	huma.Register(humaAPI, huma.Operation{
-		OperationID: "ingestFederationProjectEvents",
-		Method:      "POST",
-		Path:        "/api/v1/projects/{project_id}/federation/events:ingest",
+		OperationID:  "ingestFederationProjectEvents",
+		Method:       "POST",
+		Path:         "/api/v1/projects/{project_id}/federation/events:ingest",
+		MaxBodyBytes: 64 << 20,
 	}, func(ctx context.Context, in *api.FederationIngestEventsRequest) (*api.FederationIngestEventsResponse, error) {
 		principal, err := authorizeFederationRequest(ctx, cfg.DB, in.Authorization, in.ProjectID, "push")
 		if err != nil {

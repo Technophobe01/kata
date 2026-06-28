@@ -179,7 +179,8 @@ func scanFederationEnrollment(r rowScanner) (db.FederationEnrollment, error) {
 		revokedAt sql.NullTime
 	)
 	err := r.Scan(&e.ID, &e.TokenHash, &e.SpokeInstanceUID, &projectID,
-		&e.Capabilities, &e.Actor, &allow, &e.CreatedAt, &e.UpdatedAt, &revokedAt)
+		&e.Capabilities, &e.Actor, &allow,
+		&e.CreatedAt, &e.UpdatedAt, &revokedAt)
 	if err == nil {
 		if projectID.Valid {
 			v := projectID.Int64

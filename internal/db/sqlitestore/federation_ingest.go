@@ -58,7 +58,7 @@ func (d *Store) ingestFederationEventsOnce(
 	if err != nil {
 		return db.FederationIngestResult{}, err
 	}
-	allowSnapshotAuthorPreservation, err := allowFederationIngestSnapshotAuthorPreservation(ctx, tx,
+	adoptionSnapshotAuthorState, err := computeFederationIngestAdoptionSnapshotAuthorState(ctx, tx,
 		p.ProjectID, p.FederationEnrollmentID, p.SpokeInstanceUID,
 		p.AllowSnapshotAuthorPreservation, p.Events)
 	if err != nil {
@@ -119,7 +119,7 @@ func (d *Store) ingestFederationEventsOnce(
 		if !errors.Is(err, db.ErrNotFound) {
 			return db.FederationIngestResult{}, err
 		}
-		if err := validateFederationBoundActorPayload(ev, boundActor, allowSnapshotAuthorPreservation); err != nil {
+		if err := validateFederationBoundActorPayload(ev, boundActor, adoptionSnapshotAuthorState.allowAuthorPreservation); err != nil {
 			return db.FederationIngestResult{}, err
 		}
 		if freshSnapshotSeen && ev.Type != "issue.snapshot" {
@@ -170,9 +170,11 @@ func (d *Store) ingestFederationEventsOnce(
 		if err := d.materializeFederatedProjectTx(ctx, tx, p.ProjectID); err != nil {
 			return db.FederationIngestResult{}, err
 		}
-		if err := consumeFederationAdoptionSnapshotAuthorMarker(ctx, tx,
-			p.ProjectID, p.FederationEnrollmentID, p.SpokeInstanceUID); err != nil {
-			return db.FederationIngestResult{}, err
+		if !adoptionSnapshotAuthorState.shouldDeferMarker {
+			if err := consumeFederationAdoptionSnapshotAuthorMarker(ctx, tx,
+				p.ProjectID, p.FederationEnrollmentID, p.SpokeInstanceUID); err != nil {
+				return db.FederationIngestResult{}, err
+			}
 		}
 	}
 	if err := federationFailpoint("before_federation_ingest_commit"); err != nil {
@@ -219,7 +221,12 @@ func validateFederationBoundActorPayload(
 	return nil
 }
 
-func allowFederationIngestSnapshotAuthorPreservation(
+type federationIngestAdoptionSnapshotAuthorState struct {
+	allowAuthorPreservation bool
+	shouldDeferMarker       bool
+}
+
+func computeFederationIngestAdoptionSnapshotAuthorState(
 	ctx context.Context,
 	tx *sql.Tx,
 	projectID int64,
@@ -227,39 +234,75 @@ func allowFederationIngestSnapshotAuthorPreservation(
 	spokeInstanceUID string,
 	allowExplicit bool,
 	events []db.FederationIngestEvent,
-) (bool, error) {
+) (federationIngestAdoptionSnapshotAuthorState, error) {
 	// Adoption emits an initial baseline: optional project metadata followed by
 	// issue.snapshot events that preserve historical issue/comment authors. That
 	// exception must be explicitly attached to the enrollment token and is
-	// consumed with the accepted ingest transaction.
+	// consumed with the accepted baseline batch. Spokes keep adoption metadata
+	// and following snapshots in one request; without an explicit snapshot in
+	// the batch, the hub treats metadata-only adoption as terminal.
+	state := federationIngestAdoptionSnapshotAuthorState{}
 	if !allowExplicit || enrollmentID <= 0 {
-		return false, nil
+		return state, nil
 	}
-	hasSnapshot := false
-	for _, in := range events {
-		switch in.Event.Type {
-		case "project.metadata_updated":
-			if hasSnapshot {
-				return false, nil
-			}
-		case "issue.snapshot":
-			hasSnapshot = true
-		default:
-			return false, nil
-		}
+	baselineShape := federationIngestAdoptionBaselineShape(events)
+	if !baselineShape.valid {
+		return state, nil
 	}
-	if !hasSnapshot {
-		return false, nil
+	marker, err := federationIngestAdoptionSnapshotAuthorMarker(ctx, tx,
+		projectID, enrollmentID, spokeInstanceUID)
+	if err != nil || !marker {
+		return state, err
 	}
 	prior, err := federationIngestHasPriorEvents(ctx, tx, projectID, spokeInstanceUID)
 	if err != nil {
-		return false, err
+		return state, err
 	}
 	if prior {
-		return false, nil
+		return state, nil
 	}
+
+	state.allowAuthorPreservation = true
+	return state, nil
+}
+
+type federationIngestBaselineShape struct {
+	valid            bool
+	hasSnapshot      bool
+	maxSourceEventID int64
+}
+
+func federationIngestAdoptionBaselineShape(events []db.FederationIngestEvent) federationIngestBaselineShape {
+	shape := federationIngestBaselineShape{valid: true}
+	for _, in := range events {
+		if in.SourceEventID > shape.maxSourceEventID {
+			shape.maxSourceEventID = in.SourceEventID
+		}
+		switch in.Event.Type {
+		case "project.metadata_updated":
+			if shape.hasSnapshot {
+				shape.valid = false
+				return shape
+			}
+		case "issue.snapshot":
+			shape.hasSnapshot = true
+		default:
+			shape.valid = false
+			return shape
+		}
+	}
+	return shape
+}
+
+func federationIngestAdoptionSnapshotAuthorMarker(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID int64,
+	enrollmentID int64,
+	spokeInstanceUID string,
+) (bool, error) {
 	var marker int
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT allow_adoption_snapshot_authors
 		  FROM federation_enrollments
 		 WHERE id = ?

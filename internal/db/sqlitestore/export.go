@@ -462,7 +462,8 @@ func (d *Store) ExportFederationEnrollments(ctx context.Context, f db.ExportFilt
 			var rec db.FederationEnrollmentExport
 			var allow int
 			if err := rows.Scan(&rec.ID, &rec.TokenHash, &rec.SpokeInstanceUID, &rec.ProjectID,
-				&rec.Capabilities, &rec.Actor, &allow, &rec.CreatedAt, &rec.UpdatedAt, &rec.RevokedAt); err != nil {
+				&rec.Capabilities, &rec.Actor, &allow,
+				&rec.CreatedAt, &rec.UpdatedAt, &rec.RevokedAt); err != nil {
 				return db.FederationEnrollmentExport{}, scanError("federation_enrollment", err)
 			}
 			rec.AllowAdoptionSnapshotAuthors = allow != 0

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1768,6 +1769,315 @@ func TestSyncFederationOncePushesAdoptedIssueSnapshotsAndLinks(t *testing.T) {
 	require.NoError(t, assertHubOriginEventCount(ctx, hub.DB, hubProject.ID, spoke.DB.InstanceUID(), 3))
 }
 
+func TestSyncFederationOncePushesSplitAdoptionSnapshotsWithHistoricalAuthors(t *testing.T) {
+	ctx := context.Background()
+	hub := testenv.New(t)
+	spoke := testenv.New(t)
+
+	hubProject := createFederatedHubForPush(t, hub)
+	created, err := hub.DB.CreateFederationEnrollment(ctx, db.CreateFederationEnrollmentParams{ //nolint:gosec // test-only bearer token
+		Token:                        "split-adopt-token",
+		SpokeInstanceUID:             spoke.DB.InstanceUID(),
+		ProjectID:                    &hubProject.ID,
+		Capabilities:                 "pull,push",
+		Actor:                        "agent",
+		AllowAdoptionSnapshotAuthors: true,
+	})
+	require.NoError(t, err)
+	hubBinding, err := hub.DB.FederationBindingByProject(ctx, hubProject.ID)
+	require.NoError(t, err)
+
+	localProject, err := spoke.DB.CreateProject(ctx, "spoke-project")
+	require.NoError(t, err)
+	largeBody := strings.Repeat("example adopted issue body\n", 1536)
+	issues := make([]db.Issue, 0, 40)
+	issueUIDs := make([]string, 0, 40)
+	for i := range 40 {
+		issue, _, err := spoke.DB.CreateIssue(ctx, db.CreateIssueParams{
+			ProjectID: localProject.ID,
+			Title:     "adopted issue " + strconv.Itoa(i),
+			Body:      largeBody,
+			Author:    "historical-author",
+		})
+		require.NoError(t, err)
+		issues = append(issues, issue)
+		issueUIDs = append(issueUIDs, issue.UID)
+	}
+	source := issues[0]
+	target := issues[len(issues)-1]
+	_, _, err = spoke.DB.CreateLinkAndEvent(ctx, db.CreateLinkParams{
+		FromIssueID: source.ID,
+		ToIssueID:   target.ID,
+		Type:        "related",
+		Author:      "historical-linker",
+	}, db.LinkEventParams{
+		EventType:    "issue.linked",
+		EventIssueID: source.ID,
+		FromShortID:  source.ShortID,
+		FromUID:      source.UID,
+		ToShortID:    target.ShortID,
+		ToUID:        target.UID,
+		Actor:        "historical-linker",
+	})
+	require.NoError(t, err)
+
+	var replica api.CreateFederationReplicaBody
+	postJSON(t, spoke.URL, "/api/v1/federation/replicas", map[string]any{
+		"hub_url":                 hub.URL,
+		"hub_project_id":          hubProject.ID,
+		"hub_project_uid":         hubProject.UID,
+		"project_name":            localProject.Name,
+		"replay_horizon_event_id": hubBinding.ReplayHorizonEventID,
+		"token":                   created.Token,
+		"capabilities":            "pull,push",
+		"actor":                   "agent",
+		"push_enabled":            true,
+		"adopt_existing":          true,
+	}, &replica)
+	require.True(t, replica.Adopted)
+	require.Equal(t, int64(len(issueUIDs)), replica.AdoptionSnapshotCount)
+
+	binding, err := spoke.DB.FederationBindingByProject(ctx, replica.Project.ID)
+	require.NoError(t, err)
+	err = SyncFederationOnce(ctx, spoke.DB, binding, config.FederationCredential{
+		HubURL:       hub.URL,
+		HubProjectID: hubProject.ID,
+		Token:        created.Token,
+		Capabilities: "pull,push",
+	})
+	require.NoError(t, err)
+
+	for _, issueUID := range issueUIDs {
+		pushed, err := hub.DB.IssueByUID(ctx, issueUID, db.IncludeDeletedYes)
+		require.NoError(t, err)
+		assert.Equal(t, "historical-author", pushed.Author)
+	}
+	var linkCount int
+	require.NoError(t, hub.DB.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		  FROM links
+		 WHERE from_issue_id IN (SELECT id FROM issues WHERE project_id = ?)
+		   AND from_issue_uid = ? AND to_issue_uid = ? AND type = 'related'
+		   AND author = 'historical-linker'`,
+		hubProject.ID, source.UID, target.UID).Scan(&linkCount))
+	assert.Equal(t, 1, linkCount)
+	var quarantineCount int
+	require.NoError(t, hub.DB.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		  FROM federation_quarantine
+		 WHERE project_id = ? AND direction = 'push' AND skipped_at IS NULL`,
+		hubProject.ID).Scan(&quarantineCount))
+	assert.Zero(t, quarantineCount)
+	require.NoError(t, assertHubOriginEventCount(ctx, hub.DB, hubProject.ID, spoke.DB.InstanceUID(), len(issueUIDs)))
+}
+
+func TestSyncFederationOncePushesLargeAdoptionMetadataWithHistoricalSnapshots(t *testing.T) {
+	ctx := context.Background()
+	hub := testenv.New(t)
+	spoke := testenv.New(t)
+
+	hubProject := createFederatedHubForPush(t, hub)
+	created, err := hub.DB.CreateFederationEnrollment(ctx, db.CreateFederationEnrollmentParams{ //nolint:gosec // test-only bearer token
+		Token:                        "split-metadata-adopt-token",
+		SpokeInstanceUID:             spoke.DB.InstanceUID(),
+		ProjectID:                    &hubProject.ID,
+		Capabilities:                 "pull,push",
+		Actor:                        "agent",
+		AllowAdoptionSnapshotAuthors: true,
+	})
+	require.NoError(t, err)
+	hubBinding, err := hub.DB.FederationBindingByProject(ctx, hubProject.ID)
+	require.NoError(t, err)
+
+	localProject, err := spoke.DB.CreateProject(ctx, "spoke-project")
+	require.NoError(t, err)
+	metadataValue, err := json.Marshal(strings.Repeat("m", 620<<10))
+	require.NoError(t, err)
+	metadataOut, err := spoke.DB.PatchProjectMetadata(ctx, db.PatchProjectMetadataIn{
+		ProjectID:  localProject.ID,
+		IfMatchRev: localProject.Revision,
+		Actor:      "agent",
+		Patch: map[string]json.RawMessage{
+			"large": metadataValue,
+		},
+	})
+	require.NoError(t, err)
+	localProject = metadataOut.Project
+	issue, _, err := spoke.DB.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: localProject.ID,
+		Title:     "adopted issue",
+		Body:      strings.Repeat("example adopted issue body\n", 4096),
+		Author:    "historical-author",
+	})
+	require.NoError(t, err)
+
+	var replica api.CreateFederationReplicaBody
+	postJSON(t, spoke.URL, "/api/v1/federation/replicas", map[string]any{
+		"hub_url":                 hub.URL,
+		"hub_project_id":          hubProject.ID,
+		"hub_project_uid":         hubProject.UID,
+		"project_name":            localProject.Name,
+		"replay_horizon_event_id": hubBinding.ReplayHorizonEventID,
+		"token":                   created.Token,
+		"capabilities":            "pull,push",
+		"actor":                   "agent",
+		"push_enabled":            true,
+		"adopt_existing":          true,
+	}, &replica)
+	require.True(t, replica.Adopted)
+	require.Equal(t, int64(1), replica.AdoptionSnapshotCount)
+
+	binding, err := spoke.DB.FederationBindingByProject(ctx, replica.Project.ID)
+	require.NoError(t, err)
+	err = SyncFederationOnce(ctx, spoke.DB, binding, config.FederationCredential{
+		HubURL:       hub.URL,
+		HubProjectID: hubProject.ID,
+		Token:        created.Token,
+		Capabilities: "pull,push",
+	})
+	require.NoError(t, err)
+
+	pushed, err := hub.DB.IssueByUID(ctx, issue.UID, db.IncludeDeletedYes)
+	require.NoError(t, err)
+	assert.Equal(t, "historical-author", pushed.Author)
+	authorized, err := hub.DB.AuthorizeFederationToken(ctx, created.Token, hubProject.ID, "push")
+	require.NoError(t, err)
+	assert.False(t, authorized.AllowAdoptionSnapshotAuthors)
+}
+
+func TestSyncFederationOnceConsumesAdoptionMarkerForMetadataOnlyProject(t *testing.T) {
+	ctx := context.Background()
+	hub := testenv.New(t)
+	spoke := testenv.New(t)
+
+	hubProject := createFederatedHubForPush(t, hub)
+	created, err := hub.DB.CreateFederationEnrollment(ctx, db.CreateFederationEnrollmentParams{ //nolint:gosec // test-only bearer token
+		Token:                        "metadata-only-adopt-token",
+		SpokeInstanceUID:             spoke.DB.InstanceUID(),
+		ProjectID:                    &hubProject.ID,
+		Capabilities:                 "pull,push",
+		Actor:                        "agent",
+		AllowAdoptionSnapshotAuthors: true,
+	})
+	require.NoError(t, err)
+	hubBinding, err := hub.DB.FederationBindingByProject(ctx, hubProject.ID)
+	require.NoError(t, err)
+
+	localProject, err := spoke.DB.CreateProject(ctx, "spoke-project")
+	require.NoError(t, err)
+	metadataOut, err := spoke.DB.PatchProjectMetadata(ctx, db.PatchProjectMetadataIn{
+		ProjectID:  localProject.ID,
+		IfMatchRev: localProject.Revision,
+		Actor:      "agent",
+		Patch: map[string]json.RawMessage{
+			"area": json.RawMessage(`"docs"`),
+		},
+	})
+	require.NoError(t, err)
+	localProject = metadataOut.Project
+
+	var replica api.CreateFederationReplicaBody
+	postJSON(t, spoke.URL, "/api/v1/federation/replicas", map[string]any{
+		"hub_url":                 hub.URL,
+		"hub_project_id":          hubProject.ID,
+		"hub_project_uid":         hubProject.UID,
+		"project_name":            localProject.Name,
+		"replay_horizon_event_id": hubBinding.ReplayHorizonEventID,
+		"token":                   created.Token,
+		"capabilities":            "pull,push",
+		"actor":                   "agent",
+		"push_enabled":            true,
+		"adopt_existing":          true,
+	}, &replica)
+	require.True(t, replica.Adopted)
+	assert.Equal(t, int64(0), replica.AdoptionSnapshotCount)
+
+	binding, err := spoke.DB.FederationBindingByProject(ctx, replica.Project.ID)
+	require.NoError(t, err)
+	err = SyncFederationOnce(ctx, spoke.DB, binding, config.FederationCredential{
+		HubURL:       hub.URL,
+		HubProjectID: hubProject.ID,
+		Token:        created.Token,
+		Capabilities: "pull,push",
+	})
+	require.NoError(t, err)
+
+	authorized, err := hub.DB.AuthorizeFederationToken(ctx, created.Token, hubProject.ID, "push")
+	require.NoError(t, err)
+	assert.False(t, authorized.AllowAdoptionSnapshotAuthors)
+	require.NoError(t, assertHubOriginEventCount(ctx, hub.DB, hubProject.ID, spoke.DB.InstanceUID(), 1))
+}
+
+func TestSyncFederationOnceConsumesAdoptionMarkerForEmptyProject(t *testing.T) {
+	ctx := context.Background()
+	hub := testenv.New(t)
+	spoke := testenv.New(t)
+
+	hubProject := createFederatedHubForPush(t, hub)
+	created, err := hub.DB.CreateFederationEnrollment(ctx, db.CreateFederationEnrollmentParams{ //nolint:gosec // test-only bearer token
+		Token:                        "empty-adopt-token",
+		SpokeInstanceUID:             spoke.DB.InstanceUID(),
+		ProjectID:                    &hubProject.ID,
+		Capabilities:                 "pull,push",
+		Actor:                        "agent",
+		AllowAdoptionSnapshotAuthors: true,
+	})
+	require.NoError(t, err)
+	hubBinding, err := hub.DB.FederationBindingByProject(ctx, hubProject.ID)
+	require.NoError(t, err)
+
+	localProject, err := spoke.DB.CreateProject(ctx, "spoke-project")
+	require.NoError(t, err)
+	var replica api.CreateFederationReplicaBody
+	postJSON(t, spoke.URL, "/api/v1/federation/replicas", map[string]any{
+		"hub_url":                 hub.URL,
+		"hub_project_id":          hubProject.ID,
+		"hub_project_uid":         hubProject.UID,
+		"project_name":            localProject.Name,
+		"replay_horizon_event_id": hubBinding.ReplayHorizonEventID,
+		"token":                   created.Token,
+		"capabilities":            "pull,push",
+		"actor":                   "agent",
+		"push_enabled":            true,
+		"adopt_existing":          true,
+	}, &replica)
+	require.True(t, replica.Adopted)
+	assert.Equal(t, int64(0), replica.AdoptionSnapshotCount)
+
+	binding, err := spoke.DB.FederationBindingByProject(ctx, replica.Project.ID)
+	require.NoError(t, err)
+	err = SyncFederationOnce(ctx, spoke.DB, binding, config.FederationCredential{
+		HubURL:       hub.URL,
+		HubProjectID: hubProject.ID,
+		Token:        created.Token,
+		Capabilities: "pull,push",
+	})
+	require.NoError(t, err)
+
+	authorized, err := hub.DB.AuthorizeFederationToken(ctx, created.Token, hubProject.ID, "push")
+	require.NoError(t, err)
+	assert.False(t, authorized.AllowAdoptionSnapshotAuthors)
+	require.NoError(t, assertHubOriginEventCount(ctx, hub.DB, hubProject.ID, spoke.DB.InstanceUID(), 1))
+}
+
+func TestNextFederationPushIngestBatchRejectsOversizedAdoptionSnapshotBaseline(t *testing.T) {
+	projectUID := mustTestUID(t)
+	issueUID := mustTestUID(t)
+	events := []db.Event{
+		syncTestEvent(t, 1, projectUID, "spoke-project", nil, "project.metadata_updated",
+			`{"diff":{"area":{"from":null,"to":"docs"}}}`),
+		syncTestEvent(t, 2, projectUID, "spoke-project", &issueUID, "issue.snapshot",
+			`{"uid":"`+issueUID+`","short_id":"`+shortIDForSyncTest(issueUID)+`","title":"huge","body":"`+
+				strings.Repeat("x", 64<<20)+
+				`","author":"historical-author","status":"open","metadata":{},"created_at":"2026-05-23T12:00:00.000Z"}`),
+	}
+
+	_, err := nextFederationPushIngestBatch(events)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "adoption snapshot baseline")
+}
+
 func TestSyncFederationOncePushesAllPendingBatchesBeforePull(t *testing.T) {
 	ctx := context.Background()
 	spoke := testenv.New(t)
@@ -1827,6 +2137,81 @@ func TestSyncFederationOncePushesAllPendingBatchesBeforePull(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, []int{1000, 1}, batchSizes)
+}
+
+func TestSyncFederationOnceSplitsLargePushRequestsBeforePull(t *testing.T) {
+	ctx := context.Background()
+	spoke := testenv.New(t)
+	project, err := spoke.DB.CreateProject(ctx, "spoke-project")
+	require.NoError(t, err)
+	binding, err := spoke.DB.UpsertFederationBinding(ctx, db.FederationBinding{
+		ProjectID:            project.ID,
+		Role:                 db.FederationRoleSpoke,
+		HubURL:               "http://127.0.0.1:1",
+		HubProjectID:         42,
+		HubProjectUID:        project.UID,
+		ReplayHorizonEventID: 1,
+		PushEnabled:          true,
+		Actor:                "agent",
+		Enabled:              true,
+	})
+	require.NoError(t, err)
+	largeBody := strings.Repeat("example issue body\n", 1536)
+	for i := range 40 {
+		_, _, err := spoke.DB.CreateIssue(ctx, db.CreateIssueParams{
+			ProjectID: project.ID,
+			Title:     "pending issue " + strconv.Itoa(i),
+			Body:      largeBody,
+			Author:    "agent",
+		})
+		require.NoError(t, err)
+	}
+	var batchSizes []int
+	var requestSizes []int
+	polled := false
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects/42/federation/events:ingest":
+			assert.False(t, polled, "push batches must drain before pull")
+			raw, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			requestSizes = append(requestSizes, len(raw))
+			var body api.FederationIngestEventsRequestBody
+			require.NoError(t, json.Unmarshal(raw, &body))
+			batchSizes = append(batchSizes, len(body.Events))
+			require.NotEmpty(t, body.Events)
+			require.NoError(t, json.NewEncoder(w).Encode(api.FederationIngestEventsBody{
+				Accepted:          len(body.Events),
+				Duplicates:        0,
+				PushCursorEventID: body.Events[len(body.Events)-1].EventID,
+			}))
+		case "/api/v1/projects/42/federation/events":
+			polled = true
+			require.NoError(t, json.NewEncoder(w).Encode(api.PollEventsBody{
+				Events:      []api.EventEnvelope{},
+				NextAfterID: 1,
+			}))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(hub.Close)
+
+	err = SyncFederationOnce(ctx, spoke.DB, binding, config.FederationCredential{
+		HubURL:       hub.URL,
+		HubProjectID: 42,
+		Token:        "token",
+	})
+	require.NoError(t, err)
+	require.Greater(t, len(batchSizes), 1)
+	pushed := 0
+	for _, batchSize := range batchSizes {
+		pushed += batchSize
+	}
+	assert.Equal(t, 40, pushed)
+	for _, requestSize := range requestSizes {
+		assert.LessOrEqual(t, requestSize, maxFederationPushIngestBodyBytes)
+	}
 }
 
 func TestFederationRunnerNoBindingsMakesNoRequests(t *testing.T) {
@@ -2608,6 +2993,52 @@ func syncTestEnvelope(
 		HLCCounter:        0,
 		ContentHash:       hash,
 		Payload:           raw,
+		CreatedAt:         createdAt,
+	}
+}
+
+func syncTestEvent(
+	t *testing.T,
+	eventID int64,
+	projectUID string,
+	projectName string,
+	issueUID *string,
+	eventType string,
+	payload string,
+) db.Event {
+	t.Helper()
+	createdAt := time.Date(2026, 5, 23, 12, 0, int(eventID), 0, time.UTC)
+	eventUID := mustTestUID(t)
+	raw := json.RawMessage(payload)
+	const originInstanceUID = "01HZNQ7VFPK1XGD8R5MABCD4EY"
+	hash, err := db.EventContentHash(db.EventHashInput{
+		UID:               eventUID,
+		OriginInstanceUID: originInstanceUID,
+		ProjectUID:        projectUID,
+		ProjectName:       projectName,
+		IssueUID:          issueUID,
+		Type:              eventType,
+		Actor:             "agent",
+		HLCPhysicalMS:     eventID,
+		HLCCounter:        0,
+		CreatedAt:         createdAt.Format("2006-01-02T15:04:05.000Z"),
+		Payload:           raw,
+	})
+	require.NoError(t, err)
+	return db.Event{
+		ID:                eventID,
+		UID:               eventUID,
+		OriginInstanceUID: originInstanceUID,
+		ProjectID:         1,
+		ProjectUID:        projectUID,
+		ProjectName:       projectName,
+		IssueUID:          issueUID,
+		Type:              eventType,
+		Actor:             "agent",
+		Payload:           payload,
+		HLCPhysicalMS:     eventID,
+		HLCCounter:        0,
+		ContentHash:       hash,
 		CreatedAt:         createdAt,
 	}
 }
