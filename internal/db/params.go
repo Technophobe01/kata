@@ -583,13 +583,24 @@ type FederationIngestEvent struct {
 // FederationIngestParams is the all-or-nothing DB ingest boundary used by the
 // hub transport handler.
 type FederationIngestParams struct {
-	ProjectID                       int64
-	FederationEnrollmentID          int64
-	SpokeInstanceUID                string
-	BoundActor                      string
-	AllowSnapshotAuthorPreservation bool
-	Events                          []FederationIngestEvent
+	ProjectID                        int64
+	FederationEnrollmentID           int64
+	SpokeInstanceUID                 string
+	BoundActor                       string
+	AllowSnapshotAuthorPreservation  bool
+	AdoptionBaseline                 string
+	AdoptionBaselineEndSourceEventID int64
+	Events                           []FederationIngestEvent
 }
+
+// Federation adoption baseline markers describe whether an ingest batch is a
+// non-terminal or terminal chunk of an adoption snapshot baseline.
+const (
+	// FederationAdoptionBaselineOpen marks a non-terminal adoption baseline chunk.
+	FederationAdoptionBaselineOpen = "open"
+	// FederationAdoptionBaselineComplete marks the terminal adoption baseline chunk.
+	FederationAdoptionBaselineComplete = "complete"
+)
 
 // FederationIngestResult summarizes an accepted batch. InsertedEventUIDs lists
 // only fresh events, including generated claim audit events in insertion order,

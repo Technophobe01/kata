@@ -45,6 +45,9 @@ func (d *Store) createFederationEnrollment(
 	if err := db.ValidateTokenActor(actor); err != nil {
 		return db.CreatedFederationEnrollment{}, fmt.Errorf("federation enrollment actor: %w", err)
 	}
+	if p.AllowAdoptionSnapshotAuthors && p.ProjectID == nil {
+		return db.CreatedFederationEnrollment{}, fmt.Errorf("allow adoption snapshot authors requires project-scoped enrollment")
+	}
 	var projectID any
 	if p.ProjectID != nil {
 		projectID = *p.ProjectID
@@ -136,7 +139,7 @@ func (d *Store) AuthorizeFederationToken(
 	if !db.IsSupportedFederationCapability(capability) {
 		return db.FederationEnrollment{}, db.ErrNotFound
 	}
-	return scanFederationEnrollment(d.QueryRowContext(ctx, federationEnrollmentSelect+`
+	enrollment, err := scanFederationEnrollment(d.QueryRowContext(ctx, federationEnrollmentSelect+`
 		 WHERE token_hash = ?
 		   AND revoked_at IS NULL
 		   AND instr(',' || capabilities || ',', ',' || ? || ',') > 0
@@ -151,6 +154,16 @@ func (d *Store) AuthorizeFederationToken(
 		        AND enabled = 1
 		   )`,
 		db.FederationTokenHash(token), capability, projectID, projectID))
+	if err != nil {
+		return db.FederationEnrollment{}, err
+	}
+	if enrollment.ProjectID == nil {
+		enrollment.AllowAdoptionSnapshotAuthors = false
+		enrollment.AdoptionBaselineOpen = false
+		enrollment.AdoptionBaselineNextSourceEventID = 0
+		enrollment.AdoptionBaselineEndSourceEventID = 0
+	}
+	return enrollment, nil
 }
 
 func generateFederationToken() (string, error) {
@@ -168,6 +181,8 @@ func federationEnrollmentByIDTx(ctx context.Context, tx *sql.Tx, id int64) (db.F
 
 const federationEnrollmentSelect = `SELECT id, token_hash, spoke_instance_uid, project_id,
        capabilities, bound_actor, allow_adoption_snapshot_authors,
+       adoption_baseline_open, adoption_baseline_next_source_event_id,
+       adoption_baseline_end_source_event_id,
        created_at, updated_at, revoked_at
   FROM federation_enrollments`
 
@@ -176,10 +191,12 @@ func scanFederationEnrollment(r rowScanner) (db.FederationEnrollment, error) {
 		e         db.FederationEnrollment
 		projectID sql.NullInt64
 		allow     int
+		open      int
 		revokedAt sql.NullTime
 	)
 	err := r.Scan(&e.ID, &e.TokenHash, &e.SpokeInstanceUID, &projectID,
-		&e.Capabilities, &e.Actor, &allow,
+		&e.Capabilities, &e.Actor, &allow, &open,
+		&e.AdoptionBaselineNextSourceEventID, &e.AdoptionBaselineEndSourceEventID,
 		&e.CreatedAt, &e.UpdatedAt, &revokedAt)
 	if err == nil {
 		if projectID.Valid {
@@ -187,6 +204,7 @@ func scanFederationEnrollment(r rowScanner) (db.FederationEnrollment, error) {
 			e.ProjectID = &v
 		}
 		e.AllowAdoptionSnapshotAuthors = allow != 0
+		e.AdoptionBaselineOpen = open != 0
 		if revokedAt.Valid {
 			e.RevokedAt = &revokedAt.Time
 		}

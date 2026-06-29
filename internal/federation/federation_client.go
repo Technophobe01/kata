@@ -70,12 +70,31 @@ func (c *Client) IngestProjectEvents(
 	hubProjectID int64,
 	events []api.FederationIngestEventEnvelope,
 ) (api.FederationIngestEventsBody, error) {
+	return c.IngestProjectEventsWithOptions(ctx, hubProjectID, events, IngestProjectEventsOptions{})
+}
+
+// IngestProjectEventsOptions carries optional metadata for federation ingest.
+type IngestProjectEventsOptions struct {
+	AdoptionBaseline           string
+	AdoptionBaselineEndEventID int64
+}
+
+// IngestProjectEventsWithOptions pushes local spoke events with optional
+// transport metadata used by chunked adoption baselines.
+func (c *Client) IngestProjectEventsWithOptions(
+	ctx context.Context,
+	hubProjectID int64,
+	events []api.FederationIngestEventEnvelope,
+	opts IngestProjectEventsOptions,
+) (api.FederationIngestEventsBody, error) {
 	var body api.FederationIngestEventsBody
 	err := c.postJSON(ctx,
 		fmt.Sprintf("/api/v1/projects/%d/federation/events:ingest", hubProjectID),
 		api.FederationIngestEventsRequestBody{
-			SchemaVersion: db.CurrentSchemaVersion(),
-			Events:        events,
+			SchemaVersion:              db.CurrentSchemaVersion(),
+			AdoptionBaseline:           opts.AdoptionBaseline,
+			AdoptionBaselineEndEventID: opts.AdoptionBaselineEndEventID,
+			Events:                     events,
 		}, &body)
 	return body, err
 }

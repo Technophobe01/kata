@@ -21,9 +21,8 @@ const federationPollLimit = 1000
 // large baseline snapshots are split before the hub rejects them at transport.
 const maxFederationPushIngestBodyBytes = 768 << 10
 
-// Adoption snapshot baselines intentionally preserve single-request snapshot
-// semantics until chunked baseline validation has a protocol. Keep that
-// unsplittable request under the hub's configured federation ingest cap.
+// A single snapshot can still exceed the proxy-safe soft cap, so keep that
+// unsplittable event under the hub's configured federation ingest cap.
 const maxFederationHubIngestBodyBytes = 64 << 20
 
 const defaultClientTimeout = 5 * time.Second
@@ -121,12 +120,15 @@ func SyncFederationOnceWithPulledEvents(
 				break
 			}
 			for len(pending) > 0 {
-				batch, err := nextFederationPushIngestBatch(pending)
+				batch, adoptionBaseline, adoptionBaselineEndEventID, err := nextFederationPushIngestBatch(pending)
 				if err != nil {
 					return recordFederationSyncError(ctx, store, binding.ProjectID, err)
 				}
-				ack, err := client.IngestProjectEvents(ctx, hubProjectID,
-					federationIngestEnvelopes(batch))
+				ack, err := client.IngestProjectEventsWithOptions(ctx, hubProjectID,
+					federationIngestEnvelopes(batch), IngestProjectEventsOptions{
+						AdoptionBaseline:           adoptionBaseline,
+						AdoptionBaselineEndEventID: adoptionBaselineEndEventID,
+					})
 				if err != nil {
 					if isPoisonedFederationPushError(err) {
 						if qErr := recordFederationPushQuarantine(ctx, store, binding.ProjectID, batch, err); qErr != nil {
@@ -222,6 +224,25 @@ func SyncFederationOnceWithPulledEvents(
 		deliverUIDs := make([]string, 0, len(body.Events))
 		localInstanceUID := store.InstanceUID()
 		for _, ev := range body.Events {
+			if ev.OriginInstanceUID == localInstanceUID {
+				exists, err := store.ReconcileLocalFederationEcho(ctx, binding.ProjectID, remoteEventFromEnvelope(ev))
+				if err != nil {
+					return err
+				}
+				if exists {
+					deliverDuplicate := false
+					if shouldDeliverPage {
+						deliverDuplicate, err = shouldDeliverDuplicatePulledEvent(ctx, store, currentBinding, runStartBinding, ev, localInstanceUID)
+						if err != nil {
+							return err
+						}
+					}
+					if deliverDuplicate {
+						deliverUIDs = append(deliverUIDs, ev.EventUID)
+					}
+					continue
+				}
+			}
 			inserted, err := store.InsertRemoteEvent(ctx, binding.ProjectID, remoteEventFromEnvelope(ev))
 			if err != nil {
 				return err
@@ -320,42 +341,72 @@ func federationIngestEnvelopes(events []db.Event) []api.FederationIngestEventEnv
 	return out
 }
 
-func nextFederationPushIngestBatch(events []db.Event) ([]db.Event, error) {
+func nextFederationPushIngestBatch(events []db.Event) ([]db.Event, string, int64, error) {
 	if len(events) <= 1 {
 		if len(events) == 1 {
-			envelope := federationIngestEnvelope(events[0])
-			size, err := federationIngestRequestSize([]api.FederationIngestEventEnvelope{envelope})
-			if err != nil {
-				return nil, err
-			}
 			shape := federationPushAdoptionBaselineShape(events)
-			if shape.valid && shape.hasSnapshot && size > maxFederationHubIngestBodyBytes {
-				return nil, fmt.Errorf("%w: request body %d bytes exceeds %d bytes",
-					ErrFederationAdoptionBaselineTooLarge, size, maxFederationHubIngestBodyBytes)
+			if shape.valid && shape.hasSnapshot {
+				return nextFederationPushAdoptionBaselineIngestBatch(events)
+			}
+			envelope := federationIngestEnvelope(events[0])
+			if _, err := federationIngestRequestSize([]api.FederationIngestEventEnvelope{envelope}, "", 0); err != nil {
+				return nil, "", 0, err
 			}
 		}
-		return events, nil
+		return events, "", 0, nil
+	}
+	shape := federationPushAdoptionBaselineShape(events)
+	if shape.valid && shape.hasSnapshot {
+		return nextFederationPushAdoptionBaselineIngestBatch(events)
 	}
 	envelopes := make([]api.FederationIngestEventEnvelope, 0, len(events))
 	for i, ev := range events {
 		envelopes = append(envelopes, federationIngestEnvelope(ev))
-		size, err := federationIngestRequestSize(envelopes)
+		size, err := federationIngestRequestSize(envelopes, "", 0)
 		if err != nil {
-			return nil, err
+			return nil, "", 0, err
 		}
 		if size > maxFederationPushIngestBodyBytes && i > 0 {
-			shape := federationPushAdoptionBaselineShape(events[:i+1])
-			if shape.valid && shape.hasSnapshot {
-				if size > maxFederationHubIngestBodyBytes {
-					return nil, fmt.Errorf("%w: request body %d bytes exceeds %d bytes",
-						ErrFederationAdoptionBaselineTooLarge, size, maxFederationHubIngestBodyBytes)
-				}
-				continue
-			}
-			return events[:i], nil
+			return events[:i], "", 0, nil
 		}
 	}
-	return events, nil
+	return events, "", 0, nil
+}
+
+func nextFederationPushAdoptionBaselineIngestBatch(events []db.Event) ([]db.Event, string, int64, error) {
+	endEventID := events[len(events)-1].ID
+	envelopes := make([]api.FederationIngestEventEnvelope, 0, len(events))
+	for i, ev := range events {
+		envelopes = append(envelopes, federationIngestEnvelope(ev))
+		stage := api.FederationAdoptionBaselineComplete
+		if i < len(events)-1 {
+			stage = api.FederationAdoptionBaselineOpen
+		}
+		size, err := federationIngestRequestSize(envelopes, stage, endEventID)
+		if err != nil {
+			return nil, "", 0, err
+		}
+		if size > maxFederationPushIngestBodyBytes && i > 0 {
+			singleStage := api.FederationAdoptionBaselineComplete
+			if i < len(events)-1 {
+				singleStage = api.FederationAdoptionBaselineOpen
+			}
+			singleSize, err := federationIngestRequestSize([]api.FederationIngestEventEnvelope{envelopes[i]}, singleStage, endEventID)
+			if err != nil {
+				return nil, "", 0, err
+			}
+			if singleSize > maxFederationHubIngestBodyBytes {
+				return nil, "", 0, fmt.Errorf("%w: request body %d bytes exceeds %d bytes",
+					ErrFederationAdoptionBaselineTooLarge, singleSize, maxFederationHubIngestBodyBytes)
+			}
+			return events[:i], api.FederationAdoptionBaselineOpen, endEventID, nil
+		}
+		if size > maxFederationHubIngestBodyBytes {
+			return nil, "", 0, fmt.Errorf("%w: request body %d bytes exceeds %d bytes",
+				ErrFederationAdoptionBaselineTooLarge, size, maxFederationHubIngestBodyBytes)
+		}
+	}
+	return events, api.FederationAdoptionBaselineComplete, endEventID, nil
 }
 
 func pendingFederationEventsAfterCursor(events []db.Event, cursor int64) []db.Event {
@@ -391,10 +442,12 @@ func federationPushAdoptionBaselineShape(events []db.Event) federationPushBaseli
 	return shape
 }
 
-func federationIngestRequestSize(events []api.FederationIngestEventEnvelope) (int, error) {
+func federationIngestRequestSize(events []api.FederationIngestEventEnvelope, adoptionBaseline string, adoptionBaselineEndEventID int64) (int, error) {
 	body, err := json.Marshal(api.FederationIngestEventsRequestBody{
-		SchemaVersion: db.CurrentSchemaVersion(),
-		Events:        events,
+		SchemaVersion:              db.CurrentSchemaVersion(),
+		AdoptionBaseline:           adoptionBaseline,
+		AdoptionBaselineEndEventID: adoptionBaselineEndEventID,
+		Events:                     events,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("marshal federation ingest batch for size check: %w", err)

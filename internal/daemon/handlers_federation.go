@@ -162,6 +162,10 @@ func registerFederationHandlers(humaAPI huma.API, cfg ServerConfig) {
 		if _, err := db.CanonicalFederationCapabilities(in.Body.Capabilities); err != nil {
 			return nil, api.NewError(http.StatusBadRequest, "validation", err.Error(), "", nil)
 		}
+		if in.Body.AllowAdoptionSnapshotAuthors && in.Body.ProjectID == nil {
+			return nil, api.NewError(http.StatusBadRequest, "validation",
+				"allow_adoption_snapshot_authors requires project_id", "", nil)
+		}
 		actor, err := attributedActor(ctx, in.Body.Actor)
 		if err != nil {
 			return nil, err
@@ -449,13 +453,18 @@ func registerFederationHandlers(humaAPI huma.API, cfg ServerConfig) {
 		if err := validateFederationIngestSchemaVersion(in.Body.SchemaVersion); err != nil {
 			return nil, err
 		}
+		if err := validateFederationAdoptionBaseline(in.Body.AdoptionBaseline, in.Body.AdoptionBaselineEndEventID); err != nil {
+			return nil, err
+		}
 		result, err := cfg.DB.IngestFederationEvents(ctx, db.FederationIngestParams{
-			ProjectID:                       in.ProjectID,
-			FederationEnrollmentID:          principal.EnrollmentID,
-			SpokeInstanceUID:                principal.SpokeInstanceUID,
-			BoundActor:                      principal.Actor,
-			AllowSnapshotAuthorPreservation: principal.AllowAdoptionSnapshotAuthors,
-			Events:                          federationIngestEventsToDB(in.Body.Events),
+			ProjectID:                        in.ProjectID,
+			FederationEnrollmentID:           principal.EnrollmentID,
+			SpokeInstanceUID:                 principal.SpokeInstanceUID,
+			BoundActor:                       principal.Actor,
+			AllowSnapshotAuthorPreservation:  principal.AllowAdoptionBaseline,
+			AdoptionBaseline:                 in.Body.AdoptionBaseline,
+			AdoptionBaselineEndSourceEventID: in.Body.AdoptionBaselineEndEventID,
+			Events:                           federationIngestEventsToDB(in.Body.Events),
 		})
 		if err != nil {
 			return nil, federationIngestError(err)
@@ -490,6 +499,26 @@ func validateFederationIngestSchemaVersion(schemaVersion int) error {
 			fmt.Sprintf("federation ingest schema_version %d is newer than hub schema_version %d", schemaVersion, current), "", nil)
 	}
 	return nil
+}
+
+func validateFederationAdoptionBaseline(adoptionBaseline string, endEventID int64) error {
+	switch adoptionBaseline {
+	case "":
+		if endEventID != 0 {
+			return api.NewError(http.StatusBadRequest, "invalid_adoption_baseline",
+				"federation ingest adoption_baseline_end_event_id requires adoption_baseline", "", nil)
+		}
+		return nil
+	case api.FederationAdoptionBaselineOpen, api.FederationAdoptionBaselineComplete:
+		if endEventID <= 0 {
+			return api.NewError(http.StatusBadRequest, "invalid_adoption_baseline",
+				"federation ingest adoption_baseline_end_event_id must be positive", "", nil)
+		}
+		return nil
+	default:
+		return api.NewError(http.StatusBadRequest, "invalid_adoption_baseline",
+			fmt.Sprintf("federation ingest adoption_baseline %q is invalid", adoptionBaseline), "", nil)
+	}
 }
 
 func federationIngestEventsToDB(events []api.FederationIngestEventEnvelope) []db.FederationIngestEvent {
