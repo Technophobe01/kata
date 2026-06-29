@@ -738,6 +738,23 @@ components:
         - event
         - changed
       type: object
+    EmbeddingsHealth:
+      properties:
+        backlog:
+          format: int64
+          type: integer
+        configured:
+          type: boolean
+        last_error_status:
+          format: int64
+          type: integer
+        last_success_at:
+          format: date-time
+          type: string
+      required:
+        - configured
+        - backlog
+      type: object
     EnableIssueSyncRequestBody:
       additionalProperties: false
       properties:
@@ -1292,6 +1309,8 @@ components:
           type: string
         db_path:
           type: string
+        embeddings:
+          $ref: "#/components/schemas/EmbeddingsHealth"
         ok:
           type: boolean
         schema_version:
@@ -3004,6 +3023,12 @@ components:
       type: object
     SearchResponseBody:
       properties:
+        degraded:
+          type: boolean
+        degraded_reason:
+          type: string
+        mode:
+          type: string
         query:
           type: string
         results:
@@ -3013,6 +3038,7 @@ components:
           type: array
       required:
         - query
+        - mode
         - results
       type: object
     ShowIssueResponseBody:
@@ -3152,7 +3178,7 @@ components:
       type: object
 info:
   title: kata
-  version: 0.3.0
+  version: 0.4.0
 openapi: 3.0.3
 paths:
   /api/v1/audit/closes:
@@ -5648,6 +5674,16 @@ paths:
           name: include_deleted
           schema:
             type: boolean
+        - explode: false
+          in: query
+          name: mode
+          schema:
+            enum:
+              - auto
+              - lexical
+              - hybrid
+              - semantic
+            type: string
       responses:
         "200":
           content:
