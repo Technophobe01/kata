@@ -2,6 +2,7 @@
 package api //nolint:revive // package name "api" is fixed by Plan 1 §4 wire-types layout.
 
 import (
+	"cmp"
 	"encoding/json"
 	"time"
 
@@ -474,6 +475,92 @@ type ShowIssueRequest struct {
 type ShowIssueByUIDRequest struct {
 	UID            string `path:"uid" required:"true"`
 	IncludeDeleted bool   `query:"include_deleted,omitempty"`
+}
+
+// ReachableGraphRequest is GET /api/v1/projects/{id}/issues/{ref}/graph.
+// Depth accepts "full" or a bounded hop count. HideDone excludes closed
+// non-source issues from traversal and output when callers want an active-work
+// graph.
+type ReachableGraphRequest struct {
+	ProjectID int64  `path:"project_id" required:"true"`
+	Ref       string `path:"ref" required:"true"`
+	Depth     string `query:"depth,omitempty" doc:"full or a bounded hop count such as 1, 2, or 3"`
+	HideDone  bool   `query:"hide_done,omitempty"`
+}
+
+// ReachableGraphNode is the canonical issue node returned by the reachable
+// graph endpoint. It intentionally carries issue data and stable display refs,
+// not frontend layout state.
+type ReachableGraphNode struct {
+	db.Issue
+	QualifiedID string `json:"qualified_id"`
+}
+
+// Compare orders graph nodes by stable issue UID for deterministic graph
+// payloads independent of insertion or query order.
+func (n ReachableGraphNode) Compare(other ReachableGraphNode) int {
+	return cmp.Compare(n.UID, other.UID)
+}
+
+// ReachableGraphEdge is a canonical directed relationship edge. Parent edges
+// are oriented parent -> child even though storage records child -> parent;
+// blocks edges are blocker -> blocked; related edges use storage-canonical
+// endpoint order. Layout=false means the edge remains part of the graph for
+// rendering/highlighting but can be omitted from layout force calculations.
+type ReachableGraphEdge struct {
+	FromUID string `json:"from_uid"`
+	ToUID   string `json:"to_uid"`
+	Kind    string `json:"kind" enum:"parent,blocks,related"`
+	Layout  bool   `json:"layout"`
+}
+
+// Compare orders graph edges by relationship kind and stable endpoint UIDs.
+func (e ReachableGraphEdge) Compare(other ReachableGraphEdge) int {
+	if n := cmp.Compare(e.Kind, other.Kind); n != 0 {
+		return n
+	}
+	if n := cmp.Compare(e.FromUID, other.FromUID); n != 0 {
+		return n
+	}
+	return cmp.Compare(e.ToUID, other.ToUID)
+}
+
+// ReachableGraphUnresolvedRef records a link endpoint that could not be
+// materialized into a node. Normal kata mutations prevent this; the field is
+// still part of the canonical response so clients can tolerate imported,
+// federated, or manually repaired databases without dropping references.
+type ReachableGraphUnresolvedRef struct {
+	UID      string `json:"uid"`
+	Side     string `json:"side" enum:"from,to"`
+	Kind     string `json:"kind" enum:"parent,blocks,related"`
+	OtherUID string `json:"other_uid"`
+}
+
+// Compare orders unresolved graph endpoints by the missing UID, then the
+// relationship metadata that explains how the reference was discovered.
+func (r ReachableGraphUnresolvedRef) Compare(other ReachableGraphUnresolvedRef) int {
+	if n := cmp.Compare(r.UID, other.UID); n != 0 {
+		return n
+	}
+	if n := cmp.Compare(r.Kind, other.Kind); n != 0 {
+		return n
+	}
+	if n := cmp.Compare(r.Side, other.Side); n != 0 {
+		return n
+	}
+	return cmp.Compare(r.OtherUID, other.OtherUID)
+}
+
+// ReachableGraphResponse is the graph payload for one source issue.
+type ReachableGraphResponse struct {
+	Body struct {
+		SourceUID      string                        `json:"source_uid"`
+		Depth          string                        `json:"depth"`
+		HideDone       bool                          `json:"hide_done"`
+		Nodes          []ReachableGraphNode          `json:"nodes"`
+		Edges          []ReachableGraphEdge          `json:"edges"`
+		UnresolvedRefs []ReachableGraphUnresolvedRef `json:"unresolved_refs"`
+	}
 }
 
 // ShowIssueResponse is the per-issue read payload (Plan 2: + links, + labels).
