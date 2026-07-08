@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"go.kenn.io/kata/internal/db"
 	"go.kenn.io/kata/internal/embedding"
+	"go.kenn.io/kata/internal/vector"
+	kitvec "go.kenn.io/kit/vector"
 )
 
 type hybridParams struct {
@@ -40,13 +43,21 @@ const (
 // L2-normalized, so the dot product is cosine similarity in [-1, 1].
 const cosineFloor = 0.3
 
+// knnDeepLimit is the depth of the single retry query the vector leg makes
+// when the first fetchCap-deep KNN batch comes back full but yields too few
+// in-project hits (the index is daemon-global, so another project's chunks
+// can crowd out the requested project). One retry at this fixed depth bounds
+// the work per request; a project buried under more than knnDeepLimit
+// higher-scoring foreign chunks can still miss, by design.
+const knnDeepLimit = 1000
+
 // hybridSearch runs the lexical and (when applicable) vector legs and merges
 // them. The lexical leg never waits on the embedder. A vector-leg failure in
 // an auto/hybrid request degrades to lexical with a reason; an explicit
 // hybrid/semantic request that cannot run returns a *modeError for the handler
 // to map to 400 (unconfigured) or 503 (leg failure).
-func hybridSearch(ctx context.Context, store db.Storage, emb *embedding.Client, p hybridParams) (hybridResult, error) {
-	configured := emb != nil
+func hybridSearch(ctx context.Context, store db.Storage, idx *vector.Index, emb *embedding.Client, p hybridParams) (hybridResult, error) {
+	configured := emb != nil && idx != nil
 	mode, err := resolveMode(p.Requested, configured)
 	if err != nil {
 		return hybridResult{}, &modeError{status: 400, msg: err.Error()}
@@ -81,7 +92,7 @@ func hybridSearch(ctx context.Context, store db.Storage, emb *embedding.Client, 
 	var vector []db.SearchCandidate
 	var vecErr error
 	if mode == modeHybrid || mode == modeSemantic {
-		vector, vecErr = runVectorLeg(ctx, store, emb, p, fetch)
+		vector, vecErr = runVectorLeg(ctx, store, idx, emb, p, fetch)
 	}
 
 	if e := <-lexErrCh; e != nil {
@@ -110,25 +121,93 @@ func hybridSearch(ctx context.Context, store db.Storage, emb *embedding.Client, 
 	}
 }
 
-func runVectorLeg(ctx context.Context, store db.Storage, emb *embedding.Client, p hybridParams, fetch int) ([]db.SearchCandidate, error) {
+// runVectorLeg embeds the query, KNN-searches the active generation, rolls
+// chunk hits up to issues, and hydrates them against live canonical rows. The
+// index is daemon-global while search is project-scoped, so the leg fetches
+// fetchCap candidates, filters by project and liveness afterwards, and
+// retries once at knnDeepLimit when a full batch filters down short;
+// hydrating against kata.db (not the sidecar) preserves the guarantee that
+// soft-deleted or purged issues never leak, whatever the sidecar holds.
+func runVectorLeg(ctx context.Context, store db.Storage, idx *vector.Index, emb *embedding.Client, p hybridParams, fetch int) ([]db.SearchCandidate, error) {
+	if idx == nil {
+		return nil, errors.New("vector index unavailable")
+	}
+	key, ok, err := idx.ActiveGeneration(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("no active embedding generation (backfill in progress)")
+	}
+	// The active generation must match the configured embedder's fingerprint.
+	// After a model change the old generation keeps its vectors while the new
+	// one backfills; ranking a new-model query vector against old-model stored
+	// vectors is meaningless (same dims) or an error (dims change), so the leg
+	// is unavailable until cutover.
+	if key != emb.Generation().Fingerprint() {
+		return nil, errors.New("embedding model changed; new index is backfilling")
+	}
 	ectx, cancel := context.WithTimeout(ctx, queryEmbedTimeout)
 	defer cancel()
-	// Embed only the query text under the recipe cap; the response echoes the
-	// caller's original query unchanged.
 	vecs, err := emb.Embed(ectx, []string{embedding.EmbedText(p.Query, "")})
 	if err != nil {
 		return nil, err
 	}
-	hits, err := store.SearchVector(ctx, p.ProjectID, vecs[0], emb.Fingerprint(), fetch, p.IncludeDeleted)
+	query := kitvec.Vector(vecs[0])
+	hits, err := idx.Query(ctx, key, query, fetchCap)
 	if err != nil {
 		return nil, err
 	}
-	// Drop weak vectors so they do not pad results. Filter in place: hits is a
-	// fresh slice owned by this call.
-	out := hits[:0]
+	out, err := hydrateVectorHits(ctx, store, hits, p, fetch)
+	if err != nil {
+		return nil, err
+	}
+	// Bounded depth retry: a full first batch means more chunks may exist
+	// beyond fetchCap, and coming up short after filtering means another
+	// project's higher-scoring chunks may have crowded this one out. Re-query
+	// once at knnDeepLimit and redo the rollup + filter.
+	if len(out) < fetch && len(hits) == fetchCap {
+		hits, err = idx.Query(ctx, key, query, knnDeepLimit)
+		if err != nil {
+			return nil, err
+		}
+		out, err = hydrateVectorHits(ctx, store, hits, p, fetch)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// hydrateVectorHits rolls chunk hits up to issues and hydrates them against
+// live canonical rows, filtering by project, stopping at the cosine floor or
+// fetch collected candidates. The vector leg serves live issues only — even
+// for include_deleted searches: soft-deleted issues leave the index at the
+// next mirror refresh, and this filter enforces the same contract per
+// request in the window before that refresh runs (include_deleted ranks
+// deleted issues through the lexical leg alone).
+func hydrateVectorHits(ctx context.Context, store db.Storage, hits []kitvec.Hit[string], p hybridParams, fetch int) ([]db.SearchCandidate, error) {
+	hits = kitvec.RollupByDocument(hits)
+	out := make([]db.SearchCandidate, 0, fetch)
 	for _, h := range hits {
-		if h.Score >= cosineFloor {
-			out = append(out, h)
+		if h.Score < cosineFloor {
+			break // hits are sorted by score descending
+		}
+		iss, err := store.IssueByUID(ctx, h.Doc, db.IncludeDeletedNo)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				continue // soft-deleted or purged since the last mirror refresh
+			}
+			return nil, err
+		}
+		if iss.ProjectID != p.ProjectID {
+			continue
+		}
+		out = append(out, db.SearchCandidate{
+			Issue: iss, Score: float64(h.Score), MatchedIn: []string{"semantic"},
+		})
+		if len(out) == fetch {
+			break
 		}
 	}
 	return out, nil

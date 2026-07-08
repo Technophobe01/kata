@@ -6,6 +6,33 @@ description: Release history for kata
 All notable changes to kata, grouped by release. Versioned releases start with
 0.5.0; earlier entries are a retroactive project history grouped by ISO week.
 
+## Unreleased
+
+**Improvements**
+
+- Moved semantic search storage from a single embeddings table in `kata.db`
+  to a sidecar vector index built on the shared `kit` vector layer, named
+  after the database file (`kata.vectors.db` for the default `kata.db`),
+  with chunked embeddings instead of a fixed truncation cap and
+  generation-based model swaps: changing `model`, `dims`, or
+  `fingerprint_salt` fills a new generation in the background and cuts over
+  automatically. During that backfill the vector leg is unavailable — `auto`
+  searches degrade to labeled lexical results and explicit
+  `semantic`/`hybrid` requests return 503 until the cutover — instead of
+  losing the vector index outright; lexical search is unaffected. The
+  sidecar is disposable derived state — safe to delete, excluded from
+  backups, rebuilt by re-embedding.
+- The first daemon start after upgrading re-embeds every issue; the rebuilt
+  index activates immediately and serves partial semantic results while the
+  backfill drains (the `embeddings` backlog in `/health` reports progress).
+  JSONL export no longer carries `issue_embedding` records; import of older
+  archives that still contain them skips those records instead of failing.
+- Soft-deleting an issue now removes its vectors at the next reconcile, so
+  deleted content is never re-sent to the embedding endpoint by later index
+  rebuilds. Searches with `include_deleted` rank soft-deleted issues
+  lexically only; restoring an issue re-embeds it and semantic recall
+  resumes.
+
 ## 0.8.0
 <small>2026-07-04</small>
 

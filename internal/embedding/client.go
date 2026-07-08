@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.kenn.io/kata/internal/config"
+	kitvec "go.kenn.io/kit/vector"
 )
 
 // Config configures an embedding Client. BaseURL and Model are required by the
@@ -114,12 +115,34 @@ func (t *embeddingTransport) RoundTrip(req *http.Request) (*http.Response, error
 // Dims returns the configured/expected vector dimensionality.
 func (c *Client) Dims() int { return c.dims }
 
-// Fingerprint identifies the model/dims/recipe/salt of vectors this client
-// produces.
-func (c *Client) Fingerprint() string { return Fingerprint(c.model, c.dims, c.salt) }
-
 // BatchSize is the maximum number of inputs per request.
 func (c *Client) BatchSize() int { return c.batchSize }
+
+// Generation identifies the vector space this client produces: model, dims,
+// recipe version, and the operator salt ("same model name, different
+// weights"). The endpoint URL is deliberately excluded so moving a host or
+// port never forces a re-embed.
+func (c *Client) Generation() kitvec.Generation {
+	params := map[string]string{"recipe": strconv.Itoa(RecipeVersion)}
+	if c.salt != "" {
+		params["salt"] = c.salt
+	}
+	return kitvec.Generation{Model: c.model, Dimensions: c.dims, Params: params}
+}
+
+// EncodeFunc adapts the client to kit's encoder contract. kit invokes
+// encoders on its own worker goroutines, where a caller's recover cannot
+// reach, so the adapter converts panics to errors.
+func (c *Client) EncodeFunc() kitvec.EncodeFunc {
+	return func(ctx context.Context, texts []string) (vecs [][]float32, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("embedding: encoder panic: %v", r)
+			}
+		}()
+		return c.Embed(ctx, texts)
+	}
+}
 
 type embedRequest struct {
 	Model string   `json:"model"`

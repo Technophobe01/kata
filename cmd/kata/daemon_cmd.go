@@ -26,6 +26,7 @@ import (
 	"go.kenn.io/kata/internal/githubsync"
 	"go.kenn.io/kata/internal/hooks"
 	"go.kenn.io/kata/internal/telemetry"
+	"go.kenn.io/kata/internal/vector"
 	"go.kenn.io/kata/internal/version"
 	kitdaemon "go.kenn.io/kit/daemon"
 )
@@ -554,10 +555,15 @@ func runDaemonWithListen(ctx context.Context, listen string, insecureReadonly bo
 		return err
 	}
 
-	embedder, reconcilerHealth, err := startEmbeddingReconciler(ctx, dcfg, store, broadcaster, daemonLog)
+	embedder, vectorIndex, reconcilerHealth, err := startEmbeddingReconciler(ctx, dcfg, store, dbPath, broadcaster, daemonLog)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if vectorIndex != nil {
+			_ = vectorIndex.Close()
+		}
+	}()
 
 	srv := daemon.NewServer(daemon.ServerConfig{
 		DB:                store,
@@ -576,6 +582,7 @@ func runDaemonWithListen(ctx context.Context, listen string, insecureReadonly bo
 		Auth:             dcfg.Auth,
 		InsecureReadonly: insecureReadonly,
 		Embedder:         embedder,
+		VectorIndex:      vectorIndex,
 		ReconcilerHealth: reconcilerHealth,
 	})
 	defer func() { _ = srv.Close() }()
@@ -730,22 +737,45 @@ func startFederationRunner(
 	return wakeRunner
 }
 
-// startEmbeddingReconciler constructs the embedding client and reconciler when
-// semantic search is configured, starts the reconciler goroutine, subscribes to
-// the broadcaster so new/edited issues are embedded promptly, and triggers an
-// initial backfill sweep. It returns the client and a health snapshot func to
-// wire into ServerConfig. When embeddings are not configured it returns nils so
-// the daemon behaves exactly as it did before semantic search existed.
+// vectorsPathForDSN places the semantic-search sidecar next to the SQLite
+// database file, deriving its name from the database filename
+// (/x/kata.db -> /x/kata.vectors.db) so two databases in one directory never
+// share sidecar state. The mapping must be injective: a filename ending in
+// .db swaps that suffix for .vectors.db, any other filename appends .vectors
+// — the outputs can never coincide (one ends in .vectors.db only when its
+// input ended in .db), so /x/data and /x/data.db get distinct sidecars.
+// Embeddings require the SQLite backend; other DSNs error so
+// startEmbeddingReconciler can refuse clearly instead of guessing a path.
+func vectorsPathForDSN(dsn string) (string, error) {
+	path := strings.TrimPrefix(dsn, "sqlite://")
+	if strings.Contains(path, "://") {
+		return "", fmt.Errorf("semantic search requires the sqlite backend, got dsn %s", config.RedactDSN(dsn))
+	}
+	if stem, ok := strings.CutSuffix(path, ".db"); ok {
+		return stem + ".vectors.db", nil
+	}
+	return path + ".vectors", nil
+}
+
+// startEmbeddingReconciler constructs the embedding client, sidecar vector
+// index, and reconciler when semantic search is configured, starts the
+// reconciler goroutine, subscribes to the broadcaster so new/edited issues are
+// embedded promptly, and triggers an initial backfill sweep. It returns the
+// client, the index, and a health snapshot func to wire into ServerConfig.
+// When embeddings are not configured it returns nils so the daemon behaves
+// exactly as it did before semantic search existed. The caller owns the
+// returned *vector.Index's lifetime and must close it on shutdown.
 func startEmbeddingReconciler(
 	ctx context.Context,
 	dcfg *config.DaemonConfig,
 	store db.Storage,
+	dbPath string,
 	bcast *daemon.EventBroadcaster,
 	daemonLog *log.Logger,
-) (*embedding.Client, func() daemon.ReconcilerHealth, error) {
+) (*embedding.Client, *vector.Index, func() daemon.ReconcilerHealth, error) {
 	ec := dcfg.Search.Embeddings
 	if !ec.Enabled() {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	embedder, err := embedding.New(embedding.Config{
 		BaseURL:             ec.BaseURL,
@@ -758,9 +788,17 @@ func startEmbeddingReconciler(
 		TrustPrivateNetwork: ec.TrustPrivateNetwork,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("embedding client: %w", err)
+		return nil, nil, nil, fmt.Errorf("embedding client: %w", err)
 	}
-	reconciler := daemon.NewReconciler(store, embedder, daemon.ReconcilerConfig{BatchSize: ec.BatchSize})
+	vectorsPath, err := vectorsPathForDSN(dbPath)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("embedding index: %w", err)
+	}
+	idx, err := vector.Open(ctx, vectorsPath)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("embedding index: %w", err)
+	}
+	reconciler := daemon.NewReconciler(store, idx, embedder, daemon.ReconcilerConfig{BatchSize: ec.BatchSize})
 	go func() {
 		if err := reconciler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			daemonLog.Printf("reconciler: %v", err)
@@ -768,7 +806,7 @@ func startEmbeddingReconciler(
 	}()
 	startEmbeddingNudge(ctx, bcast, reconciler)
 	reconciler.Wake() // initial backfill sweep
-	return embedder, reconciler.Health, nil
+	return embedder, idx, reconciler.Health, nil
 }
 
 // startEmbeddingNudge subscribes to the broadcaster and wakes the reconciler on

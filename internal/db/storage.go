@@ -148,10 +148,12 @@ type Storage interface {
 	SearchFTSAny(ctx context.Context, projectID int64, q string, limit int, includeDeleted bool) ([]SearchCandidate, error)
 
 	// embeddings (semantic search)
-	UpsertIssueEmbedding(ctx context.Context, e IssueEmbedding) error
-	ListEmbedTargets(ctx context.Context, fingerprint string, limit int) ([]EmbedTarget, error)
-	EmbeddingStats(ctx context.Context, projectID int64, fingerprint string) (count int64, maxUpdatedAt string, err error)
-	SearchVector(ctx context.Context, projectID int64, queryVec []float32, fingerprint string, k int, includeDeleted bool) ([]SearchCandidate, error)
+	// ListIssueContent returns live issues in live projects (soft-deleted
+	// issues are excluded — the feed's content is sent to the embedding
+	// endpoint, and deletion must stop that outbound flow) with id >
+	// afterID, ordered by id ascending, at most limit rows. It feeds the
+	// vector mirror.
+	ListIssueContent(ctx context.Context, afterID int64, limit int) ([]IssueContent, error)
 
 	// import support
 	ImportBatch(ctx context.Context, p ImportBatchParams) (ImportBatchResult, []Event, error)
@@ -248,7 +250,6 @@ type Storage interface {
 	ExportIssueSyncStatus(ctx context.Context, f ExportFilter) iter.Seq2[IssueSyncStatusExport, error]
 	ExportRecurrences(ctx context.Context, f ExportFilter) iter.Seq2[RecurrenceExport, error]
 	ExportIssues(ctx context.Context, f ExportFilter) iter.Seq2[IssueExport, error]
-	ExportIssueEmbeddings(ctx context.Context, f ExportFilter) iter.Seq2[IssueEmbeddingExport, error]
 	ExportComments(ctx context.Context, f ExportFilter) iter.Seq2[CommentExport, error]
 	ExportIssueLabels(ctx context.Context, f ExportFilter) iter.Seq2[IssueLabelExport, error]
 	ExportLinks(ctx context.Context, f ExportFilter) iter.Seq2[LinkExport, error]
