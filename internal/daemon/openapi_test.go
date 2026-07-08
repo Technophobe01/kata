@@ -187,9 +187,9 @@ func TestOpenAPIDocumentShape(t *testing.T) {
 	}
 }
 
-func TestAPISchemaVersionReflectsSemanticSearchContract(t *testing.T) {
-	if APISchemaVersion != "0.4.0" {
-		t.Fatalf("APISchemaVersion = %q, want 0.4.0 for semantic search response and health contract", APISchemaVersion)
+func TestAPISchemaVersionReflectsBranchOrchestrationContract(t *testing.T) {
+	if APISchemaVersion != "0.5.0" {
+		t.Fatalf("APISchemaVersion = %q, want 0.5.0 for create metadata and list metadata filter contract", APISchemaVersion)
 	}
 }
 
@@ -211,6 +211,13 @@ func TestOpenAPIDocumentIncludesEventsStream(t *testing.T) {
 func TestOpenAPIDocumentJSONBlobShapes(t *testing.T) {
 	doc := OpenAPIDocument()
 	assertSchemaPropertyType(t, doc, "Issue", "metadata", huma.TypeObject)
+	// The create body's optional metadata is an open object (the generic
+	// `metadata` override), so callers can supply arbitrary keys.
+	assertSchemaPropertyType(t, doc, "CreateIssueRequestBody", "metadata", huma.TypeObject)
+	createMeta := doc.Components.Schemas.Map()["CreateIssueRequestBody"].Properties["metadata"]
+	if createMeta.AdditionalProperties != true {
+		t.Fatalf("CreateIssueRequestBody.metadata additionalProperties = %#v, want true", createMeta.AdditionalProperties)
+	}
 	assertSchemaPropertyType(t, doc, "ProjectOut", "metadata", huma.TypeObject)
 	assertSchemaPropertyType(t, doc, "ReadyGlobalIssue", "metadata", huma.TypeObject)
 	assertSchemaPropertyType(t, doc, "Recurrence", "template_labels", huma.TypeArray)

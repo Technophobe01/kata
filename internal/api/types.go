@@ -338,6 +338,12 @@ type CreateIssueRequest struct {
 		Labels   []string                `json:"labels,omitempty"`
 		Links    []CreateInitialLinkBody `json:"links,omitempty"`
 		ForceNew bool                    `json:"force_new,omitempty"`
+		// Metadata is optional initial issue metadata. Keys are validated
+		// against metadata.IssueRegistry (reserved keys through their type
+		// validator; unknown keys pass opaquely). JSON null values are
+		// rejected — there is nothing to clear at creation. On idempotent
+		// replay this field is ignored (the stored issue is returned as-is).
+		Metadata map[string]json.RawMessage `json:"metadata,omitempty"`
 	}
 }
 
@@ -384,6 +390,11 @@ type ListIssuesRequest struct {
 	Owner         string   `query:"owner,omitempty"`
 	Labels        []string `query:"label,omitempty"`
 	ExcludeLabels []string `query:"exclude_label,omitempty"`
+	// Meta is a repeatable metadata filter. Each entry is "key" (key present
+	// in top-level metadata) or "key=value" (the key's JSON string value
+	// equals value); split on the FIRST "=". Multiple entries AND together.
+	// An empty key is a validation error.
+	Meta []string `query:"meta,omitempty"`
 }
 
 // ListAllIssuesRequest is GET /api/v1/issues — the cross-project list. The
@@ -1323,6 +1334,8 @@ type DeleteRecurrenceRequest struct {
 type DeleteRecurrenceResponse struct{}
 
 // PatchIssueMetadataRequest is POST /api/v1/projects/{project_id}/issues/{ref}/metadata.
+// If-Match is optional: absent means an unconditional last-write-wins patch;
+// present it must be the current `"rev-N"` ETag (412 on mismatch).
 type PatchIssueMetadataRequest struct {
 	ProjectID int64  `path:"project_id" required:"true"`
 	Ref       string `path:"ref" required:"true"`
@@ -1344,6 +1357,7 @@ type PatchIssueMetadataResponse struct {
 }
 
 // PatchProjectMetadataRequest is POST /api/v1/projects/{project_id}/metadata.
+// If-Match is optional, with the same semantics as PatchIssueMetadataRequest.
 type PatchProjectMetadataRequest struct {
 	ProjectID int64  `path:"project_id" required:"true"`
 	IfMatch   string `header:"If-Match"`

@@ -27,13 +27,30 @@ func registerMetadataHandlers(humaAPI huma.API, cfg ServerConfig) {
 	}, patchProjectMetadataHandler(cfg))
 }
 
+// parseOptionalIfMatchRevision parses the metadata patch endpoints' OPTIONAL
+// If-Match header. An absent header returns nil: the patch is unconditional
+// last-write-wins, the intended default for convention keys (a stop hook and
+// an agent writing work.attention concurrently must never see a spurious
+// 412). A present header must still be a well-formed "rev-N" ETag — unlike
+// move/recurrences, absence here is a choice, not an error.
+func parseOptionalIfMatchRevision(raw string) (*int64, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	rev, err := parseIfMatchRevision(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &rev, nil
+}
+
 func patchIssueMetadataHandler(cfg ServerConfig) func(context.Context, *api.PatchIssueMetadataRequest) (*api.PatchIssueMetadataResponse, error) {
 	return func(ctx context.Context, in *api.PatchIssueMetadataRequest) (*api.PatchIssueMetadataResponse, error) {
 		actor, err := attributedActor(ctx, in.Body.Actor)
 		if err != nil {
 			return nil, err
 		}
-		rev, err := parseIfMatchRevision(in.IfMatch)
+		rev, err := parseOptionalIfMatchRevision(in.IfMatch)
 		if err != nil {
 			return nil, err
 		}
@@ -72,6 +89,12 @@ func patchIssueMetadataHandler(cfg ServerConfig) func(context.Context, *api.Patc
 		if res.Changed {
 			ev := res.Event
 			out.Body.Event = &ev
+			// Wake SSE followers (kata events --tail) and hook consumers on
+			// the persisted issue.metadata_updated event. Only broadcast when
+			// the patch actually changed something — a no-op patch persists no
+			// event and must not spuriously wake subscribers.
+			cfg.Broadcaster.Broadcast(StreamMsg{Kind: "event", Event: &ev, ProjectID: in.ProjectID})
+			cfg.Hooks.Enqueue(ev)
 		}
 		return out, nil
 	}
@@ -83,7 +106,7 @@ func patchProjectMetadataHandler(cfg ServerConfig) func(context.Context, *api.Pa
 		if err != nil {
 			return nil, err
 		}
-		rev, err := parseIfMatchRevision(in.IfMatch)
+		rev, err := parseOptionalIfMatchRevision(in.IfMatch)
 		if err != nil {
 			return nil, err
 		}
@@ -117,6 +140,10 @@ func patchProjectMetadataHandler(cfg ServerConfig) func(context.Context, *api.Pa
 		if res.Changed {
 			ev := res.Event
 			out.Body.Event = &ev
+			// Wake SSE followers and hook consumers on the persisted
+			// project.metadata_updated event. No broadcast on a no-op patch.
+			cfg.Broadcaster.Broadcast(StreamMsg{Kind: "event", Event: &ev, ProjectID: in.ProjectID})
+			cfg.Hooks.Enqueue(ev)
 		}
 		return out, nil
 	}

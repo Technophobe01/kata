@@ -16,6 +16,21 @@ var ErrInvalidValue = errors.New("invalid value")
 // reULID matches a 26-character Crockford base32 ULID.
 var reULID = regexp.MustCompile(`^[0-9A-HJKMNP-TV-Z]{26}$`)
 
+// ValidateCreateValue validates raw as a metadata value supplied at creation
+// time. Unlike Validate — which accepts a JSON null as "clear this key" — an
+// empty or null value is rejected here: at creation there is nothing to clear,
+// so a null value is a caller error. The rejection error wraps ErrInvalidValue
+// (as every validation error does) so callers can map it to a 400. Non-null
+// values delegate to Validate. Callers add their own framing/context; the
+// returned error carries only the "null values are not allowed at creation"
+// phrasing, no per-key prefix.
+func ValidateCreateValue(registry map[string]Entry, key string, raw json.RawMessage) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return fmt.Errorf("%w: null values are not allowed at creation", ErrInvalidValue)
+	}
+	return Validate(registry, key, raw)
+}
+
 // Validate checks raw against the validator for key, if any. Reserved keys
 // (those present in registry) go through their type-specific validator; any
 // other key is accepted as an opaque pass-through value and Validate returns

@@ -429,6 +429,9 @@ components:
             $ref: "#/components/schemas/CreateInitialLinkBody"
           nullable: true
           type: array
+        metadata:
+          additionalProperties: true
+          type: object
         owner:
           type: string
         priority:
@@ -3321,7 +3324,7 @@ components:
       type: object
 info:
   title: kata
-  version: 0.4.0
+  version: 0.5.0
 openapi: 3.0.3
 paths:
   /api/v1/audit/closes:
@@ -4550,6 +4553,14 @@ paths:
         - explode: true
           in: query
           name: exclude_label
+          schema:
+            items:
+              type: string
+            nullable: true
+            type: array
+        - explode: true
+          in: query
+          name: meta
           schema:
             items:
               type: string

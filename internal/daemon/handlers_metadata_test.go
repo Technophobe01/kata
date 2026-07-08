@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/kata/internal/daemon"
 	"go.kenn.io/kata/internal/db"
 	"go.kenn.io/kata/internal/testenv"
 )
@@ -102,6 +105,34 @@ func TestPatchMetadata_HappyPath_200(t *testing.T) {
 			assert.Equal(t, rev+1, newRev)
 			assert.Contains(t, metadata, c.expect)
 			assert.Contains(t, string(raw), `"changed":true`)
+		})
+	}
+}
+
+// TestPatchMetadata_PresentEmptyIfMatch_400 pins that a present-but-empty
+// If-Match header is treated as a malformed conditional write, not as an
+// absent header. Huma's typed binding reads headers via Header.Get, which
+// collapses absent and present-empty to "", so an empty conditional would
+// otherwise be silently downgraded to an unconditional last-write-wins patch.
+// It must be rejected with the standard 400 validation error instead.
+func TestPatchMetadata_PresentEmptyIfMatch_400(t *testing.T) {
+	for _, subject := range metadataSubjects() {
+		t.Run(subject.name, func(t *testing.T) {
+			env := testenv.New(t, testenv.WithAuthToken("tok"))
+			url, _ := subject.setup(t, env)
+
+			req, err := http.NewRequest(http.MethodPost, url,
+				strings.NewReader(`{"actor":"tester","patch":{}}`))
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer tok")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("If-Match", "") // present but empty
+			resp, err := env.HTTP.Do(req)  //nolint:gosec // G704: test server URL.
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+
+			body, _ := io.ReadAll(resp.Body)
+			require.Equalf(t, http.StatusBadRequest, resp.StatusCode, "body: %s", body)
 		})
 	}
 }
@@ -219,14 +250,39 @@ func TestPatchIssueMetadata_UnknownKey_Accepted(t *testing.T) {
 		"GET-after must surface the opaque key alongside the reserved ones")
 }
 
-func TestPatchIssueMetadata_MissingIfMatch_400(t *testing.T) {
-	env := testenv.New(t, testenv.WithAuthToken("tok"))
-	p, iss := seedProjectAndIssue(t, env)
+// TestPatchMetadata_NoIfMatch_UnconditionalWrite pins the concurrency contract
+// for both subjects: If-Match is OPTIONAL on the metadata patch endpoints.
+// Without it the patch is unconditional last-write-wins — the intended default
+// for convention keys (e.g. work.attention) whose writers must never see a
+// spurious 412 from a concurrent same-key update. The write must succeed even
+// when the entity's revision has advanced past its creation value; a caller
+// that genuinely needs read-modify-write opts in by sending If-Match.
+func TestPatchMetadata_NoIfMatch_UnconditionalWrite(t *testing.T) {
+	for _, subject := range metadataSubjects() {
+		t.Run(subject.name, func(t *testing.T) {
+			env := testenv.New(t, testenv.WithAuthToken("tok"))
+			url, rev := subject.setup(t, env)
 
-	url := fmt.Sprintf("%s/api/v1/projects/%d/issues/%s/metadata", env.URL, p.ID, iss.ShortID)
-	resp := doPostWithIfMatch(t, env, url, `{"actor":"tester","patch":{"scheduled_on":"2026-05-20"}}`, "")
-	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			// Advance the revision with a conditional patch so the follow-up
+			// unconditional write cannot accidentally match the initial rev.
+			resp := doPostWithIfMatch(t, env, url,
+				`{"actor":"tester","patch":{"advance_marker":"one"}}`,
+				fmt.Sprintf(`"rev-%d"`, rev))
+			raw := readClose(t, resp)
+			require.Equalf(t, http.StatusOK, resp.StatusCode, "setup patch body: %s", raw)
+
+			resp = doPostWithIfMatch(t, env, url,
+				`{"actor":"tester","patch":{"work.attention":"needs-human"}}`, "")
+			raw = readClose(t, resp)
+			require.Equalf(t, http.StatusOK, resp.StatusCode, "body: %s", raw)
+			assert.Equal(t, fmt.Sprintf(`"rev-%d"`, rev+2), resp.Header.Get("ETag"))
+
+			metadata, newRev := decodeMetadataEnvelope(t, raw, subject.envKey)
+			assert.Equal(t, rev+2, newRev)
+			assert.Contains(t, metadata, `"work.attention":"needs-human"`)
+			assert.Contains(t, string(raw), `"changed":true`)
+		})
+	}
 }
 
 // TestPatchProjectMetadata_UnknownKey_Accepted mirrors the issue test: the
@@ -265,4 +321,62 @@ func TestPatchProjectMetadata_UnknownKey_Accepted(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(stored.Metadata), `"definitely_not_a_key":"yellow"`,
 		"opaque key must survive a fresh DB read")
+}
+
+// TestPatchIssueMetadata_Broadcasts pins that a metadata patch that actually
+// changes something wakes SSE followers: the handler must broadcast the
+// issue.metadata_updated event through cfg.Broadcaster (the same path
+// kata events --tail subscribes to). A no-op patch must NOT broadcast.
+func TestPatchIssueMetadata_Broadcasts(t *testing.T) {
+	env := testenv.New(t, testenv.WithAuthToken("tok"))
+	p, iss := seedProjectAndIssue(t, env)
+	sub := env.Broadcaster.Subscribe(daemon.SubFilter{ProjectID: p.ID})
+	defer sub.Unsub()
+
+	url := fmt.Sprintf("%s/api/v1/projects/%d/issues/%s/metadata", env.URL, p.ID, iss.ShortID)
+	resp := doPostWithIfMatch(t, env, url,
+		`{"actor":"tester","patch":{"scheduled_on":"2026-05-20"}}`,
+		fmt.Sprintf(`"rev-%d"`, iss.Revision))
+	require.Equalf(t, http.StatusOK, resp.StatusCode, "body: %s", readClose(t, resp))
+
+	msg := receiveMsg(t, sub.Ch, time.Second, "issue metadata patch broadcast")
+	require.NotNil(t, msg.Event)
+	assert.Equal(t, "issue.metadata_updated", msg.Event.Type)
+	assert.Equal(t, p.ID, msg.ProjectID)
+
+	// A no-op patch (deleting an absent key) must not broadcast.
+	resp = doPostWithIfMatch(t, env, url,
+		`{"actor":"tester","patch":{"nonexistent_key":null}}`, "")
+	raw := readClose(t, resp)
+	require.Equalf(t, http.StatusOK, resp.StatusCode, "no-op body: %s", raw)
+	assert.Contains(t, string(raw), `"changed":false`, "no-op patch must report changed=false")
+	assertNoReceive(t, sub.Ch, 200*time.Millisecond, "no-op issue metadata patch must not broadcast")
+}
+
+// TestPatchProjectMetadata_Broadcasts is the project-subject mirror: a changing
+// project metadata patch must broadcast project.metadata_updated, and a no-op
+// patch must stay silent.
+func TestPatchProjectMetadata_Broadcasts(t *testing.T) {
+	env := testenv.New(t, testenv.WithAuthToken("tok"))
+	p := seedProject(t, env, "bcast")
+	sub := env.Broadcaster.Subscribe(daemon.SubFilter{ProjectID: p.ID})
+	defer sub.Unsub()
+
+	url := fmt.Sprintf("%s/api/v1/projects/%d/metadata", env.URL, p.ID)
+	resp := doPostWithIfMatch(t, env, url,
+		`{"actor":"tester","patch":{"area":"Work"}}`,
+		fmt.Sprintf(`"rev-%d"`, p.Revision))
+	require.Equalf(t, http.StatusOK, resp.StatusCode, "body: %s", readClose(t, resp))
+
+	msg := receiveMsg(t, sub.Ch, time.Second, "project metadata patch broadcast")
+	require.NotNil(t, msg.Event)
+	assert.Equal(t, "project.metadata_updated", msg.Event.Type)
+	assert.Equal(t, p.ID, msg.ProjectID)
+
+	resp = doPostWithIfMatch(t, env, url,
+		`{"actor":"tester","patch":{"nonexistent_key":null}}`, "")
+	raw := readClose(t, resp)
+	require.Equalf(t, http.StatusOK, resp.StatusCode, "no-op body: %s", raw)
+	assert.Contains(t, string(raw), `"changed":false`, "no-op patch must report changed=false")
+	assertNoReceive(t, sub.Ch, 200*time.Millisecond, "no-op project metadata patch must not broadcast")
 }
