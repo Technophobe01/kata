@@ -424,6 +424,41 @@ func TestEditIssue_LinksDelta_AddBlocks(t *testing.T) {
 	assert.Equal(t, target, show.Links[0].To.ShortID)
 }
 
+// TestEditIssue_LinksDelta_PeerCarriesStatus pins that edit-delta LinkPeer
+// entries carry the peer issue's own status (0.9.0), matching the list
+// response's LinkPeer contract — the wire schema marks status required, so
+// edit responses must not serialize an empty string.
+func TestEditIssue_LinksDelta_PeerCarriesStatus(t *testing.T) {
+	_, ts, pid, src := bootstrapProjectWithIssue(t)
+	resp, bs := postJSON(t, ts, issuesURL(pid),
+		map[string]any{"actor": "tester", "title": "blocked target"})
+	require.Equal(t, 200, resp.StatusCode)
+	var created struct {
+		Issue struct {
+			ShortID string `json:"short_id"`
+		} `json:"issue"`
+	}
+	require.NoError(t, json.Unmarshal(bs, &created))
+	target := created.Issue.ShortID
+
+	resp, bs = patchJSON(t, ts, issueURL(pid, src, ""), map[string]any{
+		"actor": "tester",
+		"links_delta": map[string]any{
+			"add_blocks": []string{target},
+		},
+	})
+	require.Equalf(t, 200, resp.StatusCode, "patch: %s", string(bs))
+
+	var out struct {
+		Changes struct {
+			BlocksAdded []linkPeerTest `json:"blocks_added"`
+		} `json:"changes"`
+	}
+	require.NoError(t, json.Unmarshal(bs, &out))
+	require.Len(t, out.Changes.BlocksAdded, 1)
+	assert.Equal(t, "open", out.Changes.BlocksAdded[0].Status)
+}
+
 // TestEditIssue_LinksDelta_AddBlockedBy verifies the inverse-direction add:
 // `add_blocked_by: [N]` on URL issue X stores a `blocks` link from N to X
 // (i.e. N blocks X). The Changes block reports it under blocked_by_added.
@@ -1986,6 +2021,129 @@ func TestListIssues_IncludesBlockerMetadata(t *testing.T) {
 	assert.Equal(t, project.Name, byShort[blockerShort][0].Project)
 	assert.Equal(t, project.Name+"#"+blockedShort, byShort[blockerShort][0].QualifiedID)
 	assert.Empty(t, byShort[blockedShort])
+}
+
+// TestListIssues_BlockedByPeerCarriesStatus pins that a list response's
+// blocked_by LinkPeer entries carry the blocker issue's own status (0.9.0),
+// so `kata list` human output can render a blocked glyph without a
+// per-peer lookup. Status must reflect the blocker's current state: open
+// while unresolved, closed once the blocker is closed.
+func TestListIssues_BlockedByPeerCarriesStatus(t *testing.T) {
+	env := testenv.New(t)
+	pid := initLocalWorkspace(t, env, "kata")
+	blocker := createIssueViaHTTP(t, env, pid, "blocker")
+	blocked := createIssueViaHTTP(t, env, pid, "blocked")
+	postLink(t, env, pid, blocker, "blocks", blocked)
+	blockerShort := refForIssue(t, env, blocker)
+	blockedShort := refForIssue(t, env, blocked)
+
+	fetchBlockedBy := func() map[string][]linkPeerTest {
+		var out struct {
+			Issues []struct {
+				ShortID   string         `json:"short_id"`
+				BlockedBy []linkPeerTest `json:"blocked_by,omitempty"`
+			} `json:"issues"`
+		}
+		envGetJSON(t, env, projectPath(pid)+"/issues", &out)
+		byShort := map[string][]linkPeerTest{}
+		for _, iss := range out.Issues {
+			byShort[iss.ShortID] = iss.BlockedBy
+		}
+		return byShort
+	}
+
+	byShort := fetchBlockedBy()
+	require.Len(t, byShort[blockedShort], 1)
+	assert.Equal(t, blockerShort, byShort[blockedShort][0].ShortID)
+	assert.Equal(t, "open", byShort[blockedShort][0].Status)
+
+	closeIssueAs(t, env, pid, blocker, "tester", "done")
+
+	byShort = fetchBlockedBy()
+	require.Len(t, byShort[blockedShort], 1)
+	assert.Equal(t, "closed", byShort[blockedShort][0].Status)
+}
+
+// TestListIssues_BlockedFieldFollowsReadyPredicate pins the server-computed
+// `blocked` field: true when an issue has an open blocker in an active
+// project, false when the only blocker's project is archived — mirroring the
+// ready predicate. Crucially it also asserts wire completeness: the
+// archived-project blocker still appears in blocked_by (relationship
+// hydration is not display policy), so `kata show`/`kata list --json`
+// consumers see the full edge set even though the row reads as unblocked.
+func TestListIssues_BlockedFieldFollowsReadyPredicate(t *testing.T) {
+	env := testenv.New(t)
+	hubPID := initLocalWorkspace(t, env, "hub-project")
+	spokePID := mkProject(t, env, "", "spoke-project")
+
+	// Active blocker in the same project → blocked:true.
+	blockedActive := createIssueViaHTTP(t, env, hubPID, "blocked-active")
+	blockerActive := createIssueViaHTTP(t, env, hubPID, "blocker-active")
+	postLink(t, env, hubPID, blockerActive, "blocks", blockedActive)
+
+	// Blocker in a soon-to-be-archived project → blocked:false, but the edge
+	// must still hydrate into blocked_by.
+	blockedArchived := createIssueViaHTTP(t, env, hubPID, "blocked-archived")
+	blockerArchived := createIssueViaHTTP(t, env, spokePID, "blocker-archived")
+	_, err := env.DB.CreateLink(t.Context(), db.CreateLinkParams{
+		FromIssueID: blockerArchived, ToIssueID: blockedArchived,
+		Type: "blocks", Author: "tester",
+	})
+	require.NoError(t, err)
+	_, _, err = env.DB.RemoveProject(t.Context(), db.RemoveProjectParams{
+		ProjectID: spokePID, Actor: "tester", Force: true,
+	})
+	require.NoError(t, err)
+
+	// Closed target with an open blocker → blocked must be false/omitted:
+	// "actively blocked" requires the target itself to be open, so closed
+	// rows never serialize blocked:true on all-status list responses (the
+	// unfiltered request below returns every status).
+	blockedClosed := createIssueViaHTTP(t, env, hubPID, "blocked-closed")
+	blockerOfClosed := createIssueViaHTTP(t, env, hubPID, "blocker-of-closed")
+	postLink(t, env, hubPID, blockerOfClosed, "blocks", blockedClosed)
+	closeIssueAs(t, env, hubPID, blockedClosed, "tester", "done")
+
+	blockedActiveShort := refForIssue(t, env, blockedActive)
+	blockedArchivedShort := refForIssue(t, env, blockedArchived)
+	blockerArchivedShort := refForIssue(t, env, blockerArchived)
+	blockedClosedShort := refForIssue(t, env, blockedClosed)
+
+	var out struct {
+		Issues []struct {
+			ShortID   string         `json:"short_id"`
+			Blocked   bool           `json:"blocked"`
+			BlockedBy []linkPeerTest `json:"blocked_by,omitempty"`
+		} `json:"issues"`
+	}
+	envGetJSON(t, env, projectPath(hubPID)+"/issues", &out)
+	byShort := map[string]struct {
+		blocked   bool
+		blockedBy []linkPeerTest
+	}{}
+	for _, iss := range out.Issues {
+		byShort[iss.ShortID] = struct {
+			blocked   bool
+			blockedBy []linkPeerTest
+		}{iss.Blocked, iss.BlockedBy}
+	}
+
+	assert.True(t, byShort[blockedActiveShort].blocked,
+		"open blocker in an active project must set blocked:true")
+
+	archivedRow := byShort[blockedArchivedShort]
+	assert.False(t, archivedRow.blocked,
+		"blocker in an archived project must not set blocked (ready predicate)")
+	require.Len(t, archivedRow.blockedBy, 1,
+		"archived-project blocker edge must still hydrate into blocked_by")
+	assert.Equal(t, blockerArchivedShort, archivedRow.blockedBy[0].ShortID,
+		"blocked_by must carry the archived-project peer (wire completeness)")
+
+	closedRow := byShort[blockedClosedShort]
+	assert.False(t, closedRow.blocked,
+		"closed issue with an open blocker must not serialize blocked:true")
+	require.Len(t, closedRow.blockedBy, 1,
+		"closed issue's blocker edge must still hydrate into blocked_by")
 }
 
 // TestListAllIssues_AcrossProjects pins #22's wire contract: GET /api/v1/issues

@@ -468,3 +468,75 @@ func TestChildCountsByParents_ExcludesArchivedProjectChildren(t *testing.T) {
 	assert.Equal(t, db.ChildCounts{Open: 1, Total: 1}, got[parent.ID],
 		"archived-project child must not count toward open or total")
 }
+
+// TestBlockedByNumbersByIssues_IncludesBlockerInArchivedProject pins that
+// blocked_by hydration carries the FULL relationship set: a blocker whose
+// project is archived is still returned, because this is relationship data on
+// the wire, not display policy. `kata show` exposes the same link via
+// LinksByIssue, so `kata list --json` must not silently drop it. "Actively
+// blocked" display state is a separate concern (ActivelyBlockedIssueIDs).
+func TestBlockedByNumbersByIssues_IncludesBlockerInArchivedProject(t *testing.T) {
+	d, ctx, p1 := setupTestProject(t)
+	p2, err := d.CreateProject(ctx, "blocker-project")
+	require.NoError(t, err)
+	blocked := makeIssue(t, ctx, d, p1.ID, "blocked", "tester")
+	blocker := makeIssue(t, ctx, d, p2.ID, "blocker", "tester")
+	makeLink(ctx, t, d, blocker.ID, blocked.ID, "blocks")
+	archiveProjectByID(ctx, t, d, p2.ID)
+
+	got, err := d.BlockedByNumbersByIssues(ctx, []int64{blocked.ID})
+	require.NoError(t, err)
+	assert.Contains(t, got[blocked.ID], blocker.ID,
+		"archived-project blocker is still a relationship edge and must hydrate")
+}
+
+// TestActivelyBlockedIssueIDs pins the display-policy predicate that mirrors
+// ReadyIssues: true iff the target issue is itself open and live AND an
+// incoming blocker is open, live, and in a non-archived project. Closed
+// blockers, archived-project blockers, issues with no blocker, and closed
+// target issues are all not actively blocked (absent from the map).
+func TestActivelyBlockedIssueIDs(t *testing.T) {
+	d, ctx, p1 := setupTestProject(t)
+	p2, err := d.CreateProject(ctx, "blocker-project")
+	require.NoError(t, err)
+
+	openBlocked := makeIssue(t, ctx, d, p1.ID, "open-blocked", "tester")
+	openBlocker := makeIssue(t, ctx, d, p1.ID, "open-blocker", "tester")
+	makeLink(ctx, t, d, openBlocker.ID, openBlocked.ID, "blocks")
+
+	closedBlocked := makeIssue(t, ctx, d, p1.ID, "closed-blocked", "tester")
+	closedBlocker := makeIssue(t, ctx, d, p1.ID, "closed-blocker", "tester")
+	makeLink(ctx, t, d, closedBlocker.ID, closedBlocked.ID, "blocks")
+	_, _, _, err = d.CloseIssue(ctx, closedBlocker.ID, "done", "tester", "", nil)
+	require.NoError(t, err)
+
+	archivedBlocked := makeIssue(t, ctx, d, p1.ID, "archived-blocked", "tester")
+	archivedBlocker := makeIssue(t, ctx, d, p2.ID, "archived-blocker", "tester")
+	makeLink(ctx, t, d, archivedBlocker.ID, archivedBlocked.ID, "blocks")
+	archiveProjectByID(ctx, t, d, p2.ID)
+
+	unblocked := makeIssue(t, ctx, d, p1.ID, "unblocked", "tester")
+
+	// A CLOSED target with an open blocker is not actively blocked: the
+	// predicate is two-sided (target must itself be open, mirroring the
+	// blocked-side conditions of the ready predicate), so closed rows never
+	// serialize blocked:true on status=closed|all list responses.
+	closedTarget := makeIssue(t, ctx, d, p1.ID, "closed-target", "tester")
+	closedTargetBlocker := makeIssue(t, ctx, d, p1.ID, "closed-target-blocker", "tester")
+	makeLink(ctx, t, d, closedTargetBlocker.ID, closedTarget.ID, "blocks")
+	_, _, _, err = d.CloseIssue(ctx, closedTarget.ID, "done", "tester", "", nil)
+	require.NoError(t, err)
+
+	got, err := d.ActivelyBlockedIssueIDs(ctx, []int64{
+		openBlocked.ID, closedBlocked.ID, archivedBlocked.ID, unblocked.ID,
+		closedTarget.ID,
+	})
+	require.NoError(t, err)
+	assert.True(t, got[openBlocked.ID], "open blocker must mark issue actively blocked")
+	assert.False(t, got[closedBlocked.ID], "closed blocker must not mark issue blocked")
+	assert.False(t, got[archivedBlocked.ID],
+		"blocker in an archived project must not mark issue blocked")
+	assert.False(t, got[unblocked.ID], "issue with no blocker must not be blocked")
+	assert.False(t, got[closedTarget.ID],
+		"closed target with an open blocker must not be actively blocked")
+}

@@ -448,6 +448,11 @@ type IssueOut struct {
 	Blocks      []LinkPeer      `json:"blocks,omitempty"`
 	BlockedBy   []LinkPeer      `json:"blocked_by,omitempty"`
 	Related     []LinkPeer      `json:"related,omitempty"`
+	// Blocked reports whether this issue is actively blocked per the ready
+	// predicate: at least one open blocker in a non-archived project. It is
+	// server-computed display state, distinct from BlockedBy which carries
+	// the full (policy-free) set of blocker relationship edges.
+	Blocked bool `json:"blocked,omitempty"`
 }
 
 // ListIssuesResponse is the list payload. Plan 8 commit 5b: each row
@@ -753,12 +758,15 @@ type CreateLinkRequest struct {
 // LinkPeer identifies one endpoint of a link. Project and QualifiedID are
 // always populated (0.2.0): links may span projects, so a bare short_id
 // is ambiguous without them. ShortID stays bare — it never carries a
-// "project#" prefix.
+// "project#" prefix. Status carries the peer issue's own status (0.9.0)
+// so clients (e.g. `kata list` human output) can render a blocked glyph
+// without an extra per-peer lookup.
 type LinkPeer struct {
 	UID         string `json:"uid"`
 	ShortID     string `json:"short_id"`
 	Project     string `json:"project"`
 	QualifiedID string `json:"qualified_id"`
+	Status      string `json:"status"`
 }
 
 // LinkOut is the wire projection of a link with both endpoints rendered as

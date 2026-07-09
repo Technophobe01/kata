@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"go.kenn.io/kata/internal/textsafe"
 )
 
 func newListCmd() *cobra.Command {
@@ -120,6 +119,7 @@ func newListCmd() *cobra.Command {
 					Owner       *string  `json:"owner"`
 					Priority    *int64   `json:"priority"`
 					Labels      []string `json:"labels"`
+					Blocked     bool     `json:"blocked"`
 				} `json:"issues"`
 			}
 			if err := json.Unmarshal(bs, &b); err != nil {
@@ -150,24 +150,40 @@ func newListCmd() *cobra.Command {
 			// list and ready confused users (hammer-test finding #10).
 			// Unowned issues render as "(unowned)" so the trailing
 			// "(...)" cell is never empty.
-			for _, i := range b.Issues {
+			rows := make([]issueRow, len(b.Issues))
+			for idx, i := range b.Issues {
 				owner := "unowned"
 				if i.Owner != nil && *i.Owner != "" {
 					owner = *i.Owner
 				}
-				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%-8s  %-8s  %s  (%s)\n",
-					i.ShortID, i.Status,
-					textsafe.Line(i.Title), textsafe.Line(owner)); err != nil {
+				rows[idx] = issueRow{
+					ID:       i.ShortID,
+					Title:    i.Title,
+					Owner:    owner,
+					Priority: i.Priority,
+					Status:   i.Status,
+					Blocked:  i.Blocked,
+					Labels:   i.Labels,
+				}
+			}
+			renderer := newRowRenderer(cmd.OutOrStdout())
+			if err := renderer.renderRows(cmd.OutOrStdout(), rows); err != nil {
+				return err
+			}
+			// Truncation heuristic: when we got exactly --limit rows back
+			// the daemon may have more. Has a false positive when the
+			// project has exactly --limit issues, which we accept as a
+			// much smaller harm than silently reporting a total that
+			// isn't one.
+			truncated := len(b.Issues) == limit
+			if !flags.Quiet && len(rows) > 0 {
+				if err := renderer.renderListFooter(cmd.OutOrStdout(), rows, truncated); err != nil {
 					return err
 				}
 			}
-			// Truncation hint: when we got exactly --limit rows back the
-			// daemon may have more. Print to stderr so pipelines stay
-			// clean (kata list | grep ...). Quiet suppresses it. Has a
-			// false positive when the project has exactly --limit issues,
-			// which we accept as a much smaller harm than silent
-			// truncation on projects above the default.
-			if !flags.Quiet && len(b.Issues) == limit {
+			// Truncation hint: print to stderr so pipelines stay clean
+			// (kata list | grep ...). Quiet suppresses it.
+			if !flags.Quiet && truncated {
 				if _, err := fmt.Fprintf(cmd.ErrOrStderr(),
 					"... showing %d (raise --limit to see more)\n", limit); err != nil {
 					return err
