@@ -757,6 +757,19 @@ func renderFederationDetail(m Model, rows []FederationProjectStatus, cursor int)
 		fmt.Sprintf("pending claims: %d", row.PendingClaimCount),
 		fmt.Sprintf("live claims: %d", row.LiveClaimCount),
 		fmt.Sprintf("quarantine count: %d", row.ActiveQuarantineCount),
+	)
+	for _, quarantine := range row.ActiveQuarantines {
+		body = append(body, fmt.Sprintf(
+			"quarantine #%d: %s events %d-%d at %s: %s",
+			quarantine.ID,
+			sanitizeForLine(quarantine.Direction),
+			quarantine.FirstEventID,
+			quarantine.LastEventID,
+			quarantine.CreatedAt.UTC().Format("2006-01-02 15:04:05Z"),
+			sanitizeForLine(quarantine.Error),
+		))
+	}
+	body = append(body,
 		"reset blocker: "+sanitizeForLine(emptyDash(row.ResetBlocker)),
 		fmt.Sprintf("claim violations: %d unresolved, %d recent", row.UnresolvedViolationCount, row.RecentViolationCount),
 		"last pull success: "+formatOptionalTime(row.LastPullSuccessAt),

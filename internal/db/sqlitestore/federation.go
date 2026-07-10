@@ -2053,6 +2053,17 @@ func reconcileFederationBindingTransitionLinks(
 		); err != nil {
 			return err
 		}
+		stillMember := false
+		for _, projectID := range remainingProjectIDs {
+			stillMember = stillMember || projectID == previous.ProjectID
+		}
+		if !stillMember {
+			if err := removeFederatedBoundaryLinksBetweenProjectAndGroup(
+				ctx, tx, previous.ProjectID, remainingProjectIDs,
+			); err != nil {
+				return err
+			}
+		}
 	}
 	if !current.Enabled {
 		return nil
@@ -2061,7 +2072,93 @@ func reconcileFederationBindingTransitionLinks(
 	if err != nil {
 		return err
 	}
+	if err := removeIncompatibleFederatedBoundaryLinks(ctx, tx, current.ProjectID, currentProjectIDs); err != nil {
+		return err
+	}
 	return reconcileFederatedLinkGroup(ctx, tx, currentProjectIDs, currentProjectIDs, 0, nil)
+}
+
+func removeFederatedBoundaryLinksBetweenProjectAndGroup(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID int64,
+	groupProjectIDs []int64,
+) error {
+	if len(groupProjectIDs) == 0 {
+		return nil
+	}
+	placeholders, groupArgs := projectIDPlaceholders(groupProjectIDs)
+	args := make([]any, 0, 2+len(groupArgs)*2)
+	args = append(args, projectID)
+	args = append(args, groupArgs...)
+	args = append(args, projectID)
+	args = append(args, groupArgs...)
+	//nolint:gosec // IN values use generated ? placeholders with separately bound integer IDs.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM links
+		 WHERE id IN (
+			SELECT l.id
+			  FROM links l
+			  JOIN issues f ON f.id = l.from_issue_id
+			  JOIN issues t ON t.id = l.to_issue_id
+			 WHERE (f.project_id = ? AND t.project_id IN (`+placeholders+`))
+			    OR (t.project_id = ? AND f.project_id IN (`+placeholders+`))
+		 )`, args...); err != nil {
+		return fmt.Errorf("remove former federation group boundary links: %w", err)
+	}
+	return nil
+}
+
+func removeIncompatibleFederatedBoundaryLinks(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID int64,
+	compatibleProjectIDs []int64,
+) error {
+	compatible := make(map[int64]struct{}, len(compatibleProjectIDs))
+	for _, id := range compatibleProjectIDs {
+		compatible[id] = struct{}{}
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT l.id,
+		       CASE WHEN f.project_id = ? THEN t.project_id ELSE f.project_id END AS peer_project_id
+		  FROM links l
+		  JOIN issues f ON f.id = l.from_issue_id
+		  JOIN issues t ON t.id = l.to_issue_id
+		  JOIN federation_bindings peer_binding
+		    ON peer_binding.project_id = CASE
+		         WHEN f.project_id = ? THEN t.project_id ELSE f.project_id
+		       END
+		   AND peer_binding.enabled = 1
+		 WHERE f.project_id <> t.project_id
+		   AND (f.project_id = ? OR t.project_id = ?)`,
+		projectID, projectID, projectID, projectID)
+	if err != nil {
+		return fmt.Errorf("list incompatible federation boundary links: %w", err)
+	}
+	var stale []int64
+	for rows.Next() {
+		var linkID, peerProjectID int64
+		if err := rows.Scan(&linkID, &peerProjectID); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan incompatible federation boundary link: %w", err)
+		}
+		if _, ok := compatible[peerProjectID]; !ok {
+			stale = append(stale, linkID)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close incompatible federation boundary links: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate incompatible federation boundary links: %w", err)
+	}
+	for _, linkID := range stale {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM links WHERE id = ?`, linkID); err != nil {
+			return fmt.Errorf("delete incompatible federation boundary link %d: %w", linkID, err)
+		}
+	}
+	return nil
 }
 
 func normalizedFederationHubOrigin(raw string) (string, error) {
@@ -2200,9 +2297,10 @@ func federationGroupIssueIDs(
 	return out, nil
 }
 
-// federatedLinkRows returns every existing link touching a federation group.
-// Group reconciliation owns both insertion and deletion so one member cannot
-// remove an edge represented by another member's event stream.
+// federatedLinkRows returns links whose endpoints are both inside a federation
+// group. A group cannot delete a link owned by an event stream that has not
+// joined it; binding transitions remove only the departing project's former
+// group boundaries through removeFederatedBoundaryLinksBetweenProjectAndGroup.
 func federatedLinkRows(ctx context.Context, tx *sql.Tx, projectIDs []int64) (map[db.FoldLinkKey]federatedLinkRow, error) {
 	if len(projectIDs) == 0 {
 		return map[db.FoldLinkKey]federatedLinkRow{}, nil
@@ -2218,7 +2316,7 @@ func federatedLinkRows(ctx context.Context, tx *sql.Tx, projectIDs []int64) (map
 		  JOIN issues f ON f.id = l.from_issue_id
 		  JOIN issues t ON t.id = l.to_issue_id
 		 WHERE f.project_id IN (`+placeholders+`)
-		    OR t.project_id IN (`+placeholders+`)`, queryArgs...)
+		   AND t.project_id IN (`+placeholders+`)`, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list federated links: %w", err)
 	}
