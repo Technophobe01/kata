@@ -164,7 +164,7 @@ func (p *FoldProjection) applyIssueCreated(e FoldEvent) {
 			continue
 		}
 		from, to := uid, link.ToIssueUID
-		if link.Incoming && link.Type == "blocks" {
+		if link.Incoming && link.Type != "related" {
 			from, to = to, from
 		}
 		author := link.Author
@@ -397,6 +397,13 @@ func (p *FoldProjection) applyLinkEvent(e FoldEvent, payload map[string]json.Raw
 	to, toOK := stringValue(payload["to_uid"])
 	if !fromOK || !toOK {
 		return
+	}
+	if !present {
+		linkFrom, linkFromOK := stringValue(payload["link_from_uid"])
+		linkTo, linkToOK := stringValue(payload["link_to_uid"])
+		if linkFromOK && linkToOK {
+			from, to = linkFrom, linkTo
+		}
 	}
 	p.setLink(from, to, typ, present, clockOf(e), e.Actor)
 	p.touchIssue(issueUID(e, payload), issueUpdatedAt(e, payload))

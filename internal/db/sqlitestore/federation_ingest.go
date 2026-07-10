@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"go.kenn.io/kata/internal/db"
+	katauid "go.kenn.io/kata/internal/uid"
 )
 
 type preparedFederationIngestEvent struct {
@@ -54,10 +55,6 @@ func (d *Store) ingestFederationEventsOnce(
 	if err != nil {
 		return db.FederationIngestResult{}, err
 	}
-	batchCreateSnapshotUIDs, err := federationIngestCreateSnapshotUIDSet(p.Events)
-	if err != nil {
-		return db.FederationIngestResult{}, err
-	}
 	adoptionSnapshotAuthorState, err := computeFederationIngestAdoptionSnapshotAuthorState(ctx, tx,
 		p.ProjectID, p.FederationEnrollmentID, p.SpokeInstanceUID,
 		p.AllowSnapshotAuthorPreservation, p.AdoptionBaseline, p.AdoptionBaselineEndSourceEventID, p.Events)
@@ -80,8 +77,7 @@ func (d *Store) ingestFederationEventsOnce(
 		if len(ev.Payload) == 0 {
 			ev.Payload = json.RawMessage(`{}`)
 		}
-		if err := validateFederationProjectEvent(projectUID, p.SpokeInstanceUID, ev,
-			knownIssueUIDs, batchCreateSnapshotUIDs, adoptionSnapshotAuthorState.allowFutureSnapshotLinks); err != nil {
+		if err := validateFederationProjectEvent(projectUID, p.SpokeInstanceUID, ev, knownIssueUIDs); err != nil {
 			return db.FederationIngestResult{}, err
 		}
 		if boundActor != "" && ev.Actor != boundActor {
@@ -177,7 +173,7 @@ func (d *Store) ingestFederationEventsOnce(
 		// claim.violated is best-effort audit metadata evaluated against
 		// current hub claim state at ingest time. It is not a causally precise
 		// historical authorization judgment for offline work.
-		auditEvents, err := d.annotateFederationIngestClaimWorkTx(ctx, tx, p.ProjectID, projectName, ev)
+		auditEvents, err := d.annotateFederationIngestClaimWorkTx(ctx, tx, p.ProjectID, ev)
 		if err != nil {
 			return db.FederationIngestResult{}, err
 		}
@@ -190,11 +186,6 @@ func (d *Store) ingestFederationEventsOnce(
 	if result.Accepted > 0 {
 		if err := d.materializeFederatedProjectTx(ctx, tx, p.ProjectID); err != nil {
 			return db.FederationIngestResult{}, err
-		}
-		if adoptionSnapshotAuthorState.verifySnapshotLinks {
-			if err := validateFederationAdoptionSnapshotLinksResolved(ctx, tx, p.ProjectID, p.SpokeInstanceUID); err != nil {
-				return db.FederationIngestResult{}, err
-			}
 		}
 		if !adoptionSnapshotAuthorState.shouldDeferMarker {
 			if err := consumeFederationAdoptionSnapshotAuthorMarker(ctx, tx,
@@ -255,8 +246,6 @@ func validateFederationBoundActorPayload(
 
 type federationIngestAdoptionSnapshotAuthorState struct {
 	allowAuthorPreservation      bool
-	allowFutureSnapshotLinks     bool
-	verifySnapshotLinks          bool
 	shouldDeferMarker            bool
 	deferAuthorPreservationGrant bool
 	overrideSnapshotAuthors      bool
@@ -354,9 +343,8 @@ func computeFederationIngestConsumedAdoptionBaselineRetryState(
 		return federationIngestAdoptionSnapshotAuthorState{}, err
 	}
 	return federationIngestAdoptionSnapshotAuthorState{
-		allowFutureSnapshotLinks: true,
-		overrideSnapshotAuthors:  baselineShape.hasSnapshot,
-		duplicateOnly:            true,
+		overrideSnapshotAuthors: baselineShape.hasSnapshot,
+		duplicateOnly:           true,
 	}, nil
 }
 
@@ -378,7 +366,6 @@ func computeFederationIngestOpenAdoptionBaselineState(
 ) (federationIngestAdoptionSnapshotAuthorState, error) {
 	state := federationIngestAdoptionSnapshotAuthorState{
 		allowAuthorPreservation:      baselineShape.hasSnapshot && marker.allowSnapshotAuthors,
-		allowFutureSnapshotLinks:     true,
 		shouldDeferMarker:            true,
 		deferAuthorPreservationGrant: marker.allowSnapshotAuthors && !baselineShape.hasSnapshot,
 		overrideSnapshotAuthors:      baselineShape.hasSnapshot && marker.baselineOpen && !marker.allowSnapshotAuthors,
@@ -419,7 +406,6 @@ func computeFederationIngestCompleteAdoptionBaselineState(
 ) (federationIngestAdoptionSnapshotAuthorState, error) {
 	state := federationIngestAdoptionSnapshotAuthorState{
 		allowAuthorPreservation: baselineShape.hasSnapshot && marker.allowSnapshotAuthors,
-		verifySnapshotLinks:     baselineShape.hasSnapshot || marker.baselineOpen,
 		overrideSnapshotAuthors: baselineShape.hasSnapshot && marker.baselineOpen && !marker.allowSnapshotAuthors,
 		endSourceEventID:        adoptionBaselineEndSourceEventID,
 	}
@@ -432,7 +418,6 @@ func computeFederationIngestCompleteAdoptionBaselineState(
 		}
 		if baselineShape.minSourceEventID < marker.nextSourceEventID {
 			state.duplicateOnly = true
-			state.allowFutureSnapshotLinks = true
 		}
 		return state, nil
 	}
@@ -956,8 +941,6 @@ func validateFederationProjectEvent(
 	projectUID, spokeInstanceUID string,
 	ev db.RemoteEvent,
 	knownIssueUIDs map[string]struct{},
-	batchCreateSnapshotUIDs map[string]struct{},
-	allowFutureSnapshotLinks bool,
 ) error {
 	if ev.ProjectUID != projectUID {
 		return fmt.Errorf("%w: event %s targets project %s", db.ErrFederationIngestValidation, ev.EventUID, ev.ProjectUID)
@@ -1001,57 +984,26 @@ func validateFederationProjectEvent(
 	default:
 		return fmt.Errorf("%w: unsupported event type %s", db.ErrFederationIngestValidation, ev.Type)
 	}
-	snapshotLinkRefs := map[string]struct{}{}
-	deferredSnapshotLinks := map[string]struct{}{}
-	if ev.Type == "issue.snapshot" {
-		for _, ref := range payloadLinkIssueUIDs(ev) {
-			snapshotLinkRefs[ref] = struct{}{}
-			if _, ok := batchCreateSnapshotUIDs[ref]; ok {
-				deferredSnapshotLinks[ref] = struct{}{}
-			}
-		}
+	deferredLinkUIDs, err := payloadDeferredLinkIssueUIDs(ev, payload, issueUID)
+	if err != nil {
+		return err
 	}
-	for _, ref := range payloadReferencedIssueUIDs(ev, payload) {
+	referencedIssueUIDs, err := payloadReferencedIssueUIDs(ev, payload)
+	if err != nil {
+		return err
+	}
+	for _, ref := range referencedIssueUIDs {
 		if ref == issueUID {
 			continue
 		}
 		if _, ok := knownIssueUIDs[ref]; !ok {
-			if _, deferred := deferredSnapshotLinks[ref]; deferred {
-				continue
-			}
-			if allowFutureSnapshotLinks && ev.Type == "issue.snapshot" {
-				if _, ok := snapshotLinkRefs[ref]; !ok {
-					return fmt.Errorf("%w: event %s references unknown issue %s", db.ErrFederationIngestValidation, ev.EventUID, ref)
-				}
+			if _, deferred := deferredLinkUIDs[ref]; deferred {
 				continue
 			}
 			return fmt.Errorf("%w: event %s references unknown issue %s", db.ErrFederationIngestValidation, ev.EventUID, ref)
 		}
 	}
 	return nil
-}
-
-func federationIngestCreateSnapshotUIDSet(events []db.FederationIngestEvent) (map[string]struct{}, error) {
-	out := map[string]struct{}{}
-	for _, in := range events {
-		ev := in.Event
-		if len(ev.Payload) == 0 {
-			ev.Payload = json.RawMessage(`{}`)
-		}
-		switch ev.Type {
-		case "issue.created", "issue.snapshot":
-		default:
-			continue
-		}
-		uid, err := payloadIssueUID(ev, db.PayloadMap(ev.Payload))
-		if err != nil {
-			return nil, err
-		}
-		if uid != "" {
-			out[uid] = struct{}{}
-		}
-	}
-	return out, nil
 }
 
 func rejectFreshCreateSnapshotForKnownIssue(ev db.RemoteEvent, knownIssueUIDs map[string]struct{}) error {
@@ -1091,88 +1043,258 @@ func payloadIssueUID(ev db.RemoteEvent, payload map[string]json.RawMessage) (str
 	return payloadUID, nil
 }
 
-func payloadReferencedIssueUIDs(ev db.RemoteEvent, payload map[string]json.RawMessage) []string {
+func payloadReferencedIssueUIDs(ev db.RemoteEvent, payload map[string]json.RawMessage) ([]string, error) {
 	var refs []string
 	if ev.RelatedIssueUID != nil && *ev.RelatedIssueUID != "" {
 		refs = append(refs, *ev.RelatedIssueUID)
 	}
 	for _, key := range []string{
 		"from_uid", "to_uid", "from_issue_uid", "to_issue_uid",
-		"parent_set_uid", "parent_removed_uid",
 	} {
 		if uid, ok := db.StringValue(payload[key]); ok {
 			refs = append(refs, uid)
 		}
+	}
+	changedRefs, err := payloadLinksChangedIssueUIDs(ev, payload)
+	if err != nil {
+		return nil, err
+	}
+	refs = append(refs, changedRefs...)
+	links, err := payloadLinks(ev)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decode links: %v", db.ErrFederationIngestValidation, err)
+	}
+	for _, link := range links {
+		if link.ToIssueUID != "" {
+			refs = append(refs, link.ToIssueUID)
+		}
+	}
+	return refs, nil
+}
+
+func payloadDeferredLinkIssueUIDs(
+	ev db.RemoteEvent,
+	payload map[string]json.RawMessage,
+	primaryIssueUID string,
+) (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+	add := func(uid string) {
+		if uid != "" {
+			out[uid] = struct{}{}
+		}
+	}
+	switch ev.Type {
+	case "issue.created", "issue.snapshot":
+		links, err := payloadLinks(ev)
+		if err != nil {
+			return nil, fmt.Errorf("%w: decode links: %v", db.ErrFederationIngestValidation, err)
+		}
+		for _, link := range links {
+			if err := validateFederationLinkType(link.Type); err != nil {
+				return nil, fmt.Errorf("links: %w", err)
+			}
+			if err := validateFederationLinkPeer(primaryIssueUID, link.ToIssueUID); err != nil {
+				return nil, fmt.Errorf("links: %w", err)
+			}
+			if ev.Type == "issue.created" && link.Type == "parent" && link.Incoming {
+				return nil, fmt.Errorf("%w: parent link cannot be incoming", db.ErrFederationIngestValidation)
+			}
+			add(link.ToIssueUID)
+		}
+	case "issue.linked", "issue.unlinked":
+		fromUID, fromOK, err := payloadLinkEndpointUID(payload, "from_uid", "from_issue_uid")
+		if err != nil {
+			return nil, err
+		}
+		toUID, toOK, err := payloadLinkEndpointUID(payload, "to_uid", "to_issue_uid")
+		if err != nil {
+			return nil, err
+		}
+		if !fromOK || !toOK {
+			return nil, fmt.Errorf("%w: %s missing link endpoint uid", db.ErrFederationIngestValidation, ev.Type)
+		}
+		linkType, ok := db.StringValue(payload["type"])
+		if !ok {
+			return nil, fmt.Errorf("%w: %s missing link type", db.ErrFederationIngestValidation, ev.Type)
+		}
+		if err := validateFederationLinkType(linkType); err != nil {
+			return nil, err
+		}
+		peerUID := ""
+		switch primaryIssueUID {
+		case fromUID:
+			peerUID = toUID
+		case toUID:
+			peerUID = fromUID
+		default:
+			return nil, fmt.Errorf("%w: %s primary issue %s is not a link endpoint",
+				db.ErrFederationIngestValidation, ev.Type, primaryIssueUID)
+		}
+		if ev.RelatedIssueUID != nil && *ev.RelatedIssueUID != peerUID {
+			return nil, fmt.Errorf("%w: %s related issue %s is not the opposite endpoint %s",
+				db.ErrFederationIngestValidation, ev.Type, *ev.RelatedIssueUID, peerUID)
+		}
+		if err := validateFederationLinkPeer(primaryIssueUID, peerUID); err != nil {
+			return nil, err
+		}
+		if err := validateFederationUnlinkStorageEndpoints(ev, payload, linkType, fromUID, toUID); err != nil {
+			return nil, err
+		}
+		add(peerUID)
+	case "issue.links_changed":
+		peerUIDs, err := payloadLinksChangedIssueUIDs(ev, payload)
+		if err != nil {
+			return nil, err
+		}
+		for _, uid := range peerUIDs {
+			add(uid)
+		}
+		if ev.RelatedIssueUID != nil {
+			if _, ok := out[*ev.RelatedIssueUID]; !ok {
+				return nil, fmt.Errorf("%w: %s related issue %s is not a payload peer",
+					db.ErrFederationIngestValidation, ev.Type, *ev.RelatedIssueUID)
+			}
+		}
+		for peerUID := range out {
+			if err := validateFederationLinkPeer(primaryIssueUID, peerUID); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}
+
+func payloadLinksChangedIssueUIDs(
+	ev db.RemoteEvent,
+	payload map[string]json.RawMessage,
+) ([]string, error) {
+	if ev.Type != "issue.links_changed" {
+		return nil, nil
+	}
+	var refs []string
+	for _, key := range []string{"parent_set_uid", "parent_removed_uid"} {
+		raw, ok := payload[key]
+		if !ok {
+			continue
+		}
+		var uid string
+		if err := json.Unmarshal(raw, &uid); err != nil {
+			return nil, fmt.Errorf("%w: %s must be a string: %v",
+				db.ErrFederationIngestValidation, key, err)
+		}
+		refs = append(refs, uid)
 	}
 	for _, key := range []string{
 		"blocks_added_uids", "blocks_removed_uids",
 		"blocked_by_added_uids", "blocked_by_removed_uids",
 		"related_added_uids", "related_removed_uids",
 	} {
-		refs = append(refs, db.StringSlice(payload[key])...)
-	}
-	refs = append(refs, payloadLinkIssueUIDs(ev)...)
-	return refs
-}
-
-func payloadLinkIssueUIDs(ev db.RemoteEvent) []string {
-	var created struct {
-		Links []struct {
-			ToIssueUID string `json:"to_issue_uid"`
-		} `json:"links"`
-	}
-	_ = json.Unmarshal(ev.Payload, &created)
-	var refs []string
-	for _, link := range created.Links {
-		if link.ToIssueUID != "" {
-			refs = append(refs, link.ToIssueUID)
+		raw, ok := payload[key]
+		if !ok {
+			continue
 		}
+		if trimmed := strings.TrimSpace(string(raw)); len(trimmed) == 0 || trimmed[0] != '[' {
+			return nil, fmt.Errorf("%w: %s must be an array of strings",
+				db.ErrFederationIngestValidation, key)
+		}
+		var uids []string
+		if err := json.Unmarshal(raw, &uids); err != nil {
+			return nil, fmt.Errorf("%w: %s must be an array of strings: %v",
+				db.ErrFederationIngestValidation, key, err)
+		}
+		refs = append(refs, uids...)
 	}
-	return refs
+	return refs, nil
 }
 
-func validateFederationAdoptionSnapshotLinksResolved(
-	ctx context.Context,
-	tx *sql.Tx,
-	projectID int64,
-	spokeInstanceUID string,
+func validateFederationUnlinkStorageEndpoints(
+	ev db.RemoteEvent,
+	payload map[string]json.RawMessage,
+	linkType, fromUID, toUID string,
 ) error {
-	knownIssueUIDs, err := materializedIssueUIDSet(ctx, tx, projectID)
-	if err != nil {
-		return err
+	if ev.Type != "issue.unlinked" {
+		return nil
 	}
-	rows, err := tx.QueryContext(ctx, `
-		SELECT uid, payload
-		  FROM events
-		 WHERE project_id = ?
-		   AND origin_instance_uid = ?
-		   AND type = 'issue.snapshot'
-		 ORDER BY id ASC`,
-		projectID, spokeInstanceUID)
-	if err != nil {
-		return fmt.Errorf("list adoption snapshot links: %w", err)
+	rawFrom, fromPresent := payload["link_from_uid"]
+	rawTo, toPresent := payload["link_to_uid"]
+	if fromPresent != toPresent {
+		return fmt.Errorf("%w: issue.unlinked storage endpoints must be paired", db.ErrFederationIngestValidation)
 	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var (
-			eventUID string
-			payload  string
-		)
-		if err := rows.Scan(&eventUID, &payload); err != nil {
-			return fmt.Errorf("scan adoption snapshot link: %w", err)
+	if !fromPresent {
+		if linkType == "blocks" || linkType == "parent" {
+			return fmt.Errorf("%w: issue.unlinked missing directional storage endpoints",
+				db.ErrFederationIngestValidation)
 		}
-		for _, ref := range payloadLinkIssueUIDs(db.RemoteEvent{Payload: json.RawMessage(payload)}) {
-			if _, ok := knownIssueUIDs[ref]; ok {
-				continue
-			}
-			return fmt.Errorf("%w: adoption baseline unresolved snapshot link %s references unknown issue %s",
-				db.ErrFederationIngestValidation, eventUID, ref)
-		}
+		return nil
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate adoption snapshot links: %w", err)
+	linkFromUID, fromOK := db.StringValue(rawFrom)
+	linkToUID, toOK := db.StringValue(rawTo)
+	if !fromOK || !toOK {
+		return fmt.Errorf("%w: issue.unlinked storage endpoints must be strings",
+			db.ErrFederationIngestValidation)
+	}
+	if !katauid.Valid(linkFromUID) || !katauid.Valid(linkToUID) || linkFromUID == linkToUID {
+		return fmt.Errorf("%w: issue.unlinked has invalid storage endpoints",
+			db.ErrFederationIngestValidation)
+	}
+	matchesForward := linkFromUID == fromUID && linkToUID == toUID
+	matchesReverse := linkFromUID == toUID && linkToUID == fromUID
+	if !matchesForward && !matchesReverse {
+		return fmt.Errorf("%w: issue.unlinked storage endpoints disagree with payload endpoints",
+			db.ErrFederationIngestValidation)
 	}
 	return nil
+}
+
+func validateFederationLinkType(linkType string) error {
+	switch linkType {
+	case "parent", "blocks", "related":
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported link type %q", db.ErrFederationIngestValidation, linkType)
+	}
+}
+
+func validateFederationLinkPeer(primaryIssueUID, peerUID string) error {
+	if !katauid.Valid(peerUID) {
+		return fmt.Errorf("%w: invalid link peer uid %q", db.ErrFederationIngestValidation, peerUID)
+	}
+	if peerUID == primaryIssueUID {
+		return fmt.Errorf("%w: issue cannot link to itself", db.ErrFederationIngestValidation)
+	}
+	return nil
+}
+
+func payloadLinkEndpointUID(
+	payload map[string]json.RawMessage,
+	canonicalKey, alternateKey string,
+) (string, bool, error) {
+	canonical, canonicalOK := db.StringValue(payload[canonicalKey])
+	alternate, alternateOK := db.StringValue(payload[alternateKey])
+	if !canonicalOK && alternateOK {
+		return "", false, fmt.Errorf("%w: link endpoint must use %s",
+			db.ErrFederationIngestValidation, canonicalKey)
+	}
+	if canonicalOK && alternateOK && canonical != alternate {
+		return "", false, fmt.Errorf("%w: link endpoint uid disagreement", db.ErrFederationIngestValidation)
+	}
+	return canonical, canonicalOK, nil
+}
+
+type payloadLink struct {
+	Type       string `json:"type"`
+	ToIssueUID string `json:"to_issue_uid"`
+	Incoming   bool   `json:"incoming"`
+}
+
+func payloadLinks(ev db.RemoteEvent) ([]payloadLink, error) {
+	var created struct {
+		Links []payloadLink `json:"links"`
+	}
+	if err := json.Unmarshal(ev.Payload, &created); err != nil {
+		return nil, err
+	}
+	return created.Links, nil
 }
 
 func currentFederatedIssueUIDSet(ctx context.Context, tx *sql.Tx, projectID int64) (map[string]struct{}, error) {
@@ -1181,10 +1303,11 @@ func currentFederatedIssueUIDSet(ctx context.Context, tx *sql.Tx, projectID int6
 		return nil, err
 	}
 	eventRows, err := tx.QueryContext(ctx, `
-		SELECT issue_uid FROM events WHERE project_id = ? AND issue_uid IS NOT NULL
-		UNION
-		SELECT related_issue_uid FROM events WHERE project_id = ? AND related_issue_uid IS NOT NULL`,
-		projectID, projectID)
+		SELECT issue_uid
+		  FROM events
+		 WHERE project_id = ?
+		   AND issue_uid IS NOT NULL
+		   AND type IN ('issue.created', 'issue.snapshot')`, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("list event issue uids: %w", err)
 	}

@@ -856,6 +856,63 @@ func TestAdoptProjectIntoFederationSnapshotsEditedCommentWithoutLeakedBody(t *te
 	assert.Equal(t, "[redacted]", payload.Comments[0].Body)
 }
 
+func TestAdoptProjectIntoFederationReconcilesDeferredGroupLinks(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	firstProject := createProject(ctx, t, d, "spoke-project")
+	peerProject := createProject(ctx, t, d, "peer-project")
+	peerIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: peerProject.ID,
+		Title:     "peer",
+		Author:    "tester",
+	})
+	require.NoError(t, err)
+	_, err = d.UpsertFederationBinding(ctx, db.FederationBinding{
+		ProjectID:            firstProject.ID,
+		Role:                 db.FederationRoleSpoke,
+		HubURL:               "http://hub.example:7373/projects/first",
+		HubProjectID:         41,
+		HubProjectUID:        firstProject.UID,
+		ReplayHorizonEventID: 1,
+		Enabled:              true,
+	})
+	require.NoError(t, err)
+
+	firstIssueUID := newTestUID(t)
+	for _, event := range []db.RemoteEvent{
+		remoteEvent(t, firstProject.UID, firstProject.Name, nil, nil,
+			"project.federation_enabled", "remote-agent", 99,
+			`{"project_uid":"`+firstProject.UID+`","project_name":"`+firstProject.Name+`"}`),
+		remoteEvent(t, firstProject.UID, firstProject.Name, &firstIssueUID, nil,
+			"issue.snapshot", "remote-agent", 100,
+			`{"uid":"`+firstIssueUID+`","short_id":"`+shortID(firstIssueUID)+`","title":"first","body":"","author":"remote-agent","status":"open","metadata":{},"links":[{"type":"blocks","to_issue_uid":"`+peerIssue.UID+`","author":"remote-agent"}],"created_at":"2026-05-23T12:00:00.000Z"}`),
+	} {
+		inserted, err := d.InsertRemoteEvent(ctx, firstProject.ID, event)
+		require.NoError(t, err)
+		require.True(t, inserted)
+	}
+	require.NoError(t, d.MaterializeFederatedProject(ctx, firstProject.ID))
+	assertRowCount(ctx, t, d, 0, "link waits for adopted peer project",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssueUID, peerIssue.UID)
+
+	_, err = d.AdoptProjectIntoFederation(ctx, db.AdoptProjectIntoFederationParams{
+		ProjectID:            peerProject.ID,
+		HubURL:               "http://hub.example:7373/projects/peer",
+		HubProjectID:         42,
+		HubProjectUID:        newTestUID(t),
+		ReplayHorizonEventID: 10,
+		Actor:                "bound-agent",
+	})
+
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 1, "adoption reconciles deferred link",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssueUID, peerIssue.UID)
+}
+
 func TestFederationBindingPhase1StyleDefaultsPushState(t *testing.T) {
 	d, ctx, p := setupTestProject(t)
 
@@ -1856,6 +1913,374 @@ func TestIngestFederationEvents(t *testing.T) {
 	})
 }
 
+func TestIngestFederationEventsDefersUnknownLinkPeer(t *testing.T) {
+	d, ctx, project, spokeUID := setupFederationIngestHub(t)
+	issueUID := newTestUID(t)
+	peerUID := newTestUID(t)
+	event := ingestEventWithPayload(t, project.UID, project.Name, spokeUID, &issueUID, nil,
+		"issue.created", 100,
+		`{"uid":"`+issueUID+`","short_id":"`+shortID(issueUID)+`","title":"subject","body":"","author":"spoke","status":"open","metadata":{},"links":[{"type":"blocks","to_issue_uid":"`+peerUID+`","author":"spoke"}],"created_at":"2026-05-23T12:00:00.000Z"}`)
+
+	result, err := d.IngestFederationEvents(ctx, ingestParams(project.ID, spokeUID, event))
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Accepted)
+	issue, err := d.IssueByUID(ctx, issueUID, db.IncludeDeletedYes)
+	require.NoError(t, err)
+	links, err := d.LinksByIssue(ctx, issue.ID)
+	require.NoError(t, err)
+	assert.Empty(t, links, "the peer is unresolved, so the edge must stay absent")
+}
+
+func TestIngestFederationEventsDeferredPeerDoesNotBecomeKnownPrimary(t *testing.T) {
+	d, ctx, project, spokeUID := setupFederationIngestHub(t)
+	primaryUID := newTestUID(t)
+	peerUID := newTestUID(t)
+	create := ingestIssueCreatedEvent(t, project.UID, project.Name, spokeUID, primaryUID, 100)
+	_, err := d.IngestFederationEvents(ctx, ingestParams(project.ID, spokeUID, create))
+	require.NoError(t, err)
+
+	link := ingestEventWithPayload(t, project.UID, project.Name, spokeUID, &primaryUID, &peerUID,
+		"issue.linked", 101,
+		`{"issue_uid":"`+primaryUID+`","from_uid":"`+primaryUID+`","to_uid":"`+peerUID+`","type":"blocks"}`)
+	_, err = d.IngestFederationEvents(ctx, db.FederationIngestParams{
+		ProjectID:        project.ID,
+		SpokeInstanceUID: spokeUID,
+		Events:           []db.FederationIngestEvent{{SourceEventID: 2, Event: link}},
+	})
+	require.NoError(t, err)
+	_, err = d.IssueByUID(ctx, peerUID, db.IncludeDeletedYes)
+	assert.ErrorIs(t, err, db.ErrNotFound)
+
+	update := ingestEventWithPayload(t, project.UID, project.Name, spokeUID, &peerUID, nil,
+		"issue.updated", 102,
+		`{"issue_uid":"`+peerUID+`","title":"phantom","updated_at":"2026-05-23T12:01:00.000Z"}`)
+	_, err = d.IngestFederationEvents(ctx, db.FederationIngestParams{
+		ProjectID:        project.ID,
+		SpokeInstanceUID: spokeUID,
+		Events:           []db.FederationIngestEvent{{SourceEventID: 3, Event: update}},
+	})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
+	assertIngestedEventCount(ctx, t, d, project.ID, 2)
+	_, err = d.IssueByUID(ctx, peerUID, db.IncludeDeletedYes)
+	assert.ErrorIs(t, err, db.ErrNotFound)
+}
+
+func TestIngestFederationEventsConvergesCircularCrossProjectLinks(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	firstProject := createProject(ctx, t, d, "spoke-project")
+	secondProject := createProject(ctx, t, d, "peer-project")
+	_, err := d.EnableProjectFederation(ctx, firstProject.ID, "tester")
+	require.NoError(t, err)
+	_, err = d.EnableProjectFederation(ctx, secondProject.ID, "tester")
+	require.NoError(t, err)
+
+	spokeUID := newTestUID(t)
+	firstIssueUID := newTestUID(t)
+	secondIssueUID := newTestUID(t)
+	first := ingestEventWithPayload(t, firstProject.UID, firstProject.Name, spokeUID,
+		&firstIssueUID, nil, "issue.created", 100,
+		`{"uid":"`+firstIssueUID+`","short_id":"`+shortID(firstIssueUID)+`","title":"first","body":"","author":"spoke","status":"open","metadata":{},"links":[{"type":"blocks","to_issue_uid":"`+secondIssueUID+`","author":"spoke"}],"created_at":"2026-05-23T12:00:00.000Z"}`)
+	firstResult, err := d.IngestFederationEvents(ctx, ingestParams(firstProject.ID, spokeUID, first))
+	require.NoError(t, err)
+	assert.Equal(t, 1, firstResult.Accepted)
+	assertRowCount(ctx, t, d, 0, "link waits for peer issue",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssueUID, secondIssueUID)
+
+	second := ingestEventWithPayload(t, secondProject.UID, secondProject.Name, spokeUID,
+		&secondIssueUID, nil, "issue.created", 101,
+		`{"uid":"`+secondIssueUID+`","short_id":"`+shortID(secondIssueUID)+`","title":"second","body":"","author":"spoke","status":"open","metadata":{},"links":[{"type":"blocks","to_issue_uid":"`+firstIssueUID+`","incoming":true,"author":"spoke"}],"created_at":"2026-05-23T12:00:00.000Z"}`)
+	secondResult, err := d.IngestFederationEvents(ctx, ingestParams(secondProject.ID, spokeUID, second))
+	require.NoError(t, err)
+	assert.Equal(t, 1, secondResult.Accepted)
+	assertRowCount(ctx, t, d, 1, "deferred cross-project link materialized",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssueUID, secondIssueUID)
+
+	unlink := ingestEventWithPayload(t, firstProject.UID, firstProject.Name, spokeUID,
+		&firstIssueUID, &secondIssueUID, "issue.unlinked", 102,
+		`{"issue_uid":"`+firstIssueUID+`","from_uid":"`+firstIssueUID+`","to_uid":"`+secondIssueUID+`","link_from_uid":"`+firstIssueUID+`","link_to_uid":"`+secondIssueUID+`","type":"blocks"}`)
+	_, err = d.IngestFederationEvents(ctx, db.FederationIngestParams{
+		ProjectID:        firstProject.ID,
+		SpokeInstanceUID: spokeUID,
+		Events:           []db.FederationIngestEvent{{SourceEventID: 2, Event: unlink}},
+	})
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 0, "cross-project unlink reconciled",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssueUID, secondIssueUID)
+}
+
+func TestIngestFederationEventsRejectsDeferredCrossProjectParentCycle(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	firstProject := createProject(ctx, t, d, "spoke-project")
+	secondProject := createProject(ctx, t, d, "peer-project")
+	_, err := d.EnableProjectFederation(ctx, firstProject.ID, "tester")
+	require.NoError(t, err)
+	_, err = d.EnableProjectFederation(ctx, secondProject.ID, "tester")
+	require.NoError(t, err)
+
+	spokeUID := newTestUID(t)
+	firstIssueUID := newTestUID(t)
+	secondIssueUID := newTestUID(t)
+	first := ingestEventWithPayload(t, firstProject.UID, firstProject.Name, spokeUID,
+		&firstIssueUID, nil, "issue.created", 100,
+		`{"uid":"`+firstIssueUID+`","short_id":"`+shortID(firstIssueUID)+`","title":"first","body":"","author":"spoke","status":"open","metadata":{},"links":[{"type":"parent","to_issue_uid":"`+secondIssueUID+`","author":"spoke"}],"created_at":"2026-05-23T12:00:00.000Z"}`)
+	_, err = d.IngestFederationEvents(ctx, ingestParams(firstProject.ID, spokeUID, first))
+	require.NoError(t, err)
+
+	second := ingestEventWithPayload(t, secondProject.UID, secondProject.Name, spokeUID,
+		&secondIssueUID, nil, "issue.created", 101,
+		`{"uid":"`+secondIssueUID+`","short_id":"`+shortID(secondIssueUID)+`","title":"second","body":"","author":"spoke","status":"open","metadata":{},"links":[{"type":"parent","to_issue_uid":"`+firstIssueUID+`","author":"spoke"}],"created_at":"2026-05-23T12:00:00.000Z"}`)
+	_, err = d.IngestFederationEvents(ctx, ingestParams(secondProject.ID, spokeUID, second))
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
+	assertRowCount(ctx, t, d, 0, "invalid parent cycle is not materialized",
+		`SELECT count(*) FROM links WHERE type = 'parent'`)
+}
+
+func TestIngestFederationEventsUnlinksDirectionalEdgeThroughDestination(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	firstProject := createProject(ctx, t, d, "spoke-project")
+	secondProject := createProject(ctx, t, d, "peer-project")
+	_, err := d.EnableProjectFederation(ctx, firstProject.ID, "tester")
+	require.NoError(t, err)
+	_, err = d.EnableProjectFederation(ctx, secondProject.ID, "tester")
+	require.NoError(t, err)
+
+	spokeUID := newTestUID(t)
+	firstIssueUID := newTestUID(t)
+	secondIssueUID := newTestUID(t)
+	first := ingestEventWithPayload(t, firstProject.UID, firstProject.Name, spokeUID,
+		&firstIssueUID, nil, "issue.created", 100,
+		`{"uid":"`+firstIssueUID+`","short_id":"`+shortID(firstIssueUID)+`","title":"first","body":"","author":"spoke","status":"open","metadata":{},"links":[{"type":"blocks","to_issue_uid":"`+secondIssueUID+`","author":"spoke"}],"created_at":"2026-05-23T12:00:00.000Z"}`)
+	_, err = d.IngestFederationEvents(ctx, ingestParams(firstProject.ID, spokeUID, first))
+	require.NoError(t, err)
+	second := ingestIssueCreatedEvent(t, secondProject.UID, secondProject.Name, spokeUID, secondIssueUID, 101)
+	_, err = d.IngestFederationEvents(ctx, ingestParams(secondProject.ID, spokeUID, second))
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 1, "directional edge materialized",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssueUID, secondIssueUID)
+
+	unlink := ingestEventWithPayload(t, secondProject.UID, secondProject.Name, spokeUID,
+		&secondIssueUID, &firstIssueUID, "issue.unlinked", 102,
+		`{"issue_uid":"`+secondIssueUID+`","from_uid":"`+secondIssueUID+`","to_uid":"`+firstIssueUID+`","link_from_uid":"`+firstIssueUID+`","link_to_uid":"`+secondIssueUID+`","type":"blocks"}`)
+	_, err = d.IngestFederationEvents(ctx, db.FederationIngestParams{
+		ProjectID:        secondProject.ID,
+		SpokeInstanceUID: spokeUID,
+		Events:           []db.FederationIngestEvent{{SourceEventID: 2, Event: unlink}},
+	})
+
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 0, "destination-side unlink removes storage-oriented edge",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssueUID, secondIssueUID)
+}
+
+func TestEnableProjectFederationReconcilesDeferredGroupLinks(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	firstProject := createProject(ctx, t, d, "spoke-project")
+	secondProject := createProject(ctx, t, d, "peer-project")
+	firstIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: firstProject.ID,
+		Title:     "first",
+		Author:    "tester",
+	})
+	require.NoError(t, err)
+	secondIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: secondProject.ID,
+		Title:     "second",
+		Author:    "tester",
+	})
+	require.NoError(t, err)
+	_, err = d.EnableProjectFederation(ctx, firstProject.ID, "tester")
+	require.NoError(t, err)
+
+	spokeUID := newTestUID(t)
+	link := ingestEventWithPayload(t, firstProject.UID, firstProject.Name, spokeUID,
+		&firstIssue.UID, &secondIssue.UID, "issue.linked", 100,
+		`{"issue_uid":"`+firstIssue.UID+`","from_uid":"`+firstIssue.UID+`","to_uid":"`+secondIssue.UID+`","type":"blocks"}`)
+	_, err = d.IngestFederationEvents(ctx, ingestParams(firstProject.ID, spokeUID, link))
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 0, "link waits for standalone peer project",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssue.UID, secondIssue.UID)
+
+	_, err = d.EnableProjectFederation(ctx, secondProject.ID, "tester")
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 1, "enabling peer reconciles deferred link",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssue.UID, secondIssue.UID)
+}
+
+func TestFederationMembershipDestinationFirstPreservesIncomingLink(t *testing.T) {
+	t.Run("hub enable", func(t *testing.T) {
+		d := openTestDB(t)
+		ctx := context.Background()
+		firstProject := createProject(ctx, t, d, "spoke-project")
+		secondProject := createProject(ctx, t, d, "peer-project")
+		firstIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+			ProjectID: firstProject.ID,
+			Title:     "first",
+			Author:    "tester",
+		})
+		require.NoError(t, err)
+		secondIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+			ProjectID: secondProject.ID,
+			Title:     "second",
+			Author:    "tester",
+		})
+		require.NoError(t, err)
+		_, _, err = d.CreateLinkAndEvent(ctx, db.CreateLinkParams{
+			FromIssueID: firstIssue.ID,
+			ToIssueID:   secondIssue.ID,
+			Type:        "blocks",
+			Author:      "tester",
+		}, db.LinkEventParams{
+			EventType:    "issue.linked",
+			EventIssueID: firstIssue.ID,
+			FromShortID:  firstIssue.ShortID,
+			FromUID:      firstIssue.UID,
+			ToShortID:    secondIssue.ShortID,
+			ToUID:        secondIssue.UID,
+			Actor:        "tester",
+		})
+		require.NoError(t, err)
+
+		_, err = d.EnableProjectFederation(ctx, secondProject.ID, "tester")
+		require.NoError(t, err)
+		_, err = d.EnableProjectFederation(ctx, firstProject.ID, "tester")
+		require.NoError(t, err)
+		assertRowCount(ctx, t, d, 1, "source enrollment restores incoming snapshot link",
+			`SELECT count(*) FROM links
+			  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+			firstIssue.UID, secondIssue.UID)
+	})
+
+	t.Run("spoke adoption", func(t *testing.T) {
+		d := openTestDB(t)
+		ctx := context.Background()
+		firstProject := createProject(ctx, t, d, "spoke-project")
+		secondProject := createProject(ctx, t, d, "peer-project")
+		firstIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+			ProjectID: firstProject.ID,
+			Title:     "first",
+			Author:    "tester",
+		})
+		require.NoError(t, err)
+		secondIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+			ProjectID: secondProject.ID,
+			Title:     "second",
+			Author:    "tester",
+		})
+		require.NoError(t, err)
+		_, _, err = d.CreateLinkAndEvent(ctx, db.CreateLinkParams{
+			FromIssueID: firstIssue.ID,
+			ToIssueID:   secondIssue.ID,
+			Type:        "blocks",
+			Author:      "tester",
+		}, db.LinkEventParams{
+			EventType:    "issue.linked",
+			EventIssueID: firstIssue.ID,
+			FromShortID:  firstIssue.ShortID,
+			FromUID:      firstIssue.UID,
+			ToShortID:    secondIssue.ShortID,
+			ToUID:        secondIssue.UID,
+			Actor:        "tester",
+		})
+		require.NoError(t, err)
+
+		_, err = d.AdoptProjectIntoFederation(ctx, db.AdoptProjectIntoFederationParams{
+			ProjectID:            secondProject.ID,
+			HubURL:               "https://hub.example/projects/second",
+			HubProjectID:         42,
+			HubProjectUID:        newTestUID(t),
+			ReplayHorizonEventID: 10,
+			Actor:                "bound-agent",
+		})
+		require.NoError(t, err)
+		_, err = d.AdoptProjectIntoFederation(ctx, db.AdoptProjectIntoFederationParams{
+			ProjectID:            firstProject.ID,
+			HubURL:               "https://hub.example/projects/first",
+			HubProjectID:         41,
+			HubProjectUID:        newTestUID(t),
+			ReplayHorizonEventID: 10,
+			Actor:                "bound-agent",
+		})
+		require.NoError(t, err)
+		assertRowCount(ctx, t, d, 1, "source adoption restores incoming snapshot link",
+			`SELECT count(*) FROM links
+			  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+			firstIssue.UID, secondIssue.UID)
+	})
+}
+
+func TestUpsertFederationBindingReconcilesChangedGroupMembership(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	firstProject := createProject(ctx, t, d, "spoke-project")
+	secondProject := createProject(ctx, t, d, "peer-project")
+	firstIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: firstProject.ID,
+		Title:     "first",
+		Author:    "tester",
+	})
+	require.NoError(t, err)
+	secondIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: secondProject.ID,
+		Title:     "second",
+		Author:    "tester",
+	})
+	require.NoError(t, err)
+	_, err = d.EnableProjectFederation(ctx, firstProject.ID, "tester")
+	require.NoError(t, err)
+	secondBinding, err := d.EnableProjectFederation(ctx, secondProject.ID, "tester")
+	require.NoError(t, err)
+
+	spokeUID := newTestUID(t)
+	link := ingestEventWithPayload(t, firstProject.UID, firstProject.Name, spokeUID,
+		&firstIssue.UID, &secondIssue.UID, "issue.linked", 100,
+		`{"issue_uid":"`+firstIssue.UID+`","from_uid":"`+firstIssue.UID+`","to_uid":"`+secondIssue.UID+`","type":"blocks"}`)
+	_, err = d.IngestFederationEvents(ctx, ingestParams(firstProject.ID, spokeUID, link))
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 1, "link exists while both projects are enabled",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssue.UID, secondIssue.UID)
+
+	secondBinding.Enabled = false
+	_, err = d.UpsertFederationBinding(ctx, secondBinding)
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 0, "disabling peer removes old group projection",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssue.UID, secondIssue.UID)
+
+	secondBinding.Enabled = true
+	_, err = d.UpsertFederationBinding(ctx, secondBinding)
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 1, "re-enabling peer restores deferred link",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssue.UID, secondIssue.UID)
+}
+
 func TestIngestFederationEvents_Validation(t *testing.T) {
 	t.Run("rejects project uid mismatch", func(t *testing.T) {
 		d, ctx, p, spokeUID := setupFederationIngestHub(t)
@@ -2664,7 +3089,7 @@ func TestIngestFederationEvents_Validation(t *testing.T) {
 		assertIngestedEventCount(ctx, t, d, p.ID, 0)
 	})
 
-	t.Run("rejects complete adoption baseline with unresolved open chunk snapshot link", func(t *testing.T) {
+	t.Run("accepts complete adoption baseline with unresolved open chunk snapshot link", func(t *testing.T) {
 		d, ctx, p, spokeUID := setupFederationIngestHub(t)
 		markerValue := strings.Join([]string{"snapshot", "adoption", "missing", "link"}, "-")
 		created, err := d.CreateFederationEnrollment(ctx, db.CreateFederationEnrollmentParams{
@@ -2713,16 +3138,14 @@ func TestIngestFederationEvents_Validation(t *testing.T) {
 			Events:                           []db.FederationIngestEvent{{SourceEventID: 2, Event: second}},
 		})
 
-		require.Error(t, err)
-		assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
-		assert.Contains(t, err.Error(), "unresolved snapshot link")
+		require.NoError(t, err)
 		authorized, err := d.AuthorizeFederationToken(ctx, markerValue, p.ID, "push")
 		require.NoError(t, err)
 		assert.False(t, authorized.AllowAdoptionSnapshotAuthors)
-		assertIngestedEventCount(ctx, t, d, p.ID, 1)
+		assertIngestedEventCount(ctx, t, d, p.ID, 2)
 	})
 
-	t.Run("rejects metadata-only complete adoption baseline with unresolved open chunk snapshot link", func(t *testing.T) {
+	t.Run("accepts metadata-only complete adoption baseline with unresolved open chunk snapshot link", func(t *testing.T) {
 		d, ctx, p, spokeUID := setupFederationIngestHub(t)
 		markerValue := strings.Join([]string{"snapshot", "adoption", "metadata", "missing"}, "-")
 		created, err := d.CreateFederationEnrollment(ctx, db.CreateFederationEnrollmentParams{
@@ -2770,16 +3193,14 @@ func TestIngestFederationEvents_Validation(t *testing.T) {
 			Events:                           []db.FederationIngestEvent{{SourceEventID: 2, Event: metadata}},
 		})
 
-		require.Error(t, err)
-		assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
-		assert.Contains(t, err.Error(), "unresolved snapshot link")
+		require.NoError(t, err)
 		authorized, err := d.AuthorizeFederationToken(ctx, markerValue, p.ID, "push")
 		require.NoError(t, err)
 		assert.False(t, authorized.AllowAdoptionSnapshotAuthors)
-		assertIngestedEventCount(ctx, t, d, p.ID, 1)
+		assertIngestedEventCount(ctx, t, d, p.ID, 2)
 	})
 
-	t.Run("rejects deferred snapshot link when only related envelope mentions missing issue", func(t *testing.T) {
+	t.Run("accepts deferred snapshot link when related envelope also mentions missing issue", func(t *testing.T) {
 		d, ctx, p, spokeUID := setupFederationIngestHub(t)
 		markerValue := strings.Join([]string{"snapshot", "adoption", "related", "missing"}, "-")
 		created, err := d.CreateFederationEnrollment(ctx, db.CreateFederationEnrollmentParams{
@@ -2827,13 +3248,11 @@ func TestIngestFederationEvents_Validation(t *testing.T) {
 			Events:                           []db.FederationIngestEvent{{SourceEventID: 2, Event: metadata}},
 		})
 
-		require.Error(t, err)
-		assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
-		assert.Contains(t, err.Error(), "unresolved snapshot link")
+		require.NoError(t, err)
 		authorized, err := d.AuthorizeFederationToken(ctx, markerValue, p.ID, "push")
 		require.NoError(t, err)
 		assert.False(t, authorized.AllowAdoptionSnapshotAuthors)
-		assertIngestedEventCount(ctx, t, d, p.ID, 1)
+		assertIngestedEventCount(ctx, t, d, p.ID, 2)
 	})
 
 	t.Run("recovers v22 imported open adoption baseline without terminal cursor", func(t *testing.T) {
@@ -3358,6 +3777,203 @@ func TestIngestFederationEvents_Validation(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("rejects link whose primary is not an endpoint", func(t *testing.T) {
+		d, ctx, p, spokeUID := setupFederationIngestHub(t)
+		primaryUID := newTestUID(t)
+		create := ingestIssueCreatedEvent(t, p.UID, p.Name, spokeUID, primaryUID, 100)
+		_, err := d.IngestFederationEvents(ctx, ingestParams(p.ID, spokeUID, create))
+		require.NoError(t, err)
+
+		fromUID := newTestUID(t)
+		toUID := newTestUID(t)
+		link := ingestEventWithPayload(t, p.UID, p.Name, spokeUID, &primaryUID, &toUID,
+			"issue.linked", 101,
+			`{"issue_uid":"`+primaryUID+`","from_uid":"`+fromUID+`","to_uid":"`+toUID+`","type":"blocks"}`)
+
+		_, err = d.IngestFederationEvents(ctx, db.FederationIngestParams{
+			ProjectID:        p.ID,
+			SpokeInstanceUID: spokeUID,
+			Events:           []db.FederationIngestEvent{{SourceEventID: 2, Event: link}},
+		})
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
+		assertIngestedEventCount(ctx, t, d, p.ID, 1)
+	})
+
+	t.Run("rejects related issue that is not the opposite endpoint", func(t *testing.T) {
+		d, ctx, p, spokeUID := setupFederationIngestHub(t)
+		primaryUID := newTestUID(t)
+		create := ingestIssueCreatedEvent(t, p.UID, p.Name, spokeUID, primaryUID, 100)
+		_, err := d.IngestFederationEvents(ctx, ingestParams(p.ID, spokeUID, create))
+		require.NoError(t, err)
+
+		peerUID := newTestUID(t)
+		unrelatedUID := newTestUID(t)
+		link := ingestEventWithPayload(t, p.UID, p.Name, spokeUID, &primaryUID, &unrelatedUID,
+			"issue.linked", 101,
+			`{"issue_uid":"`+primaryUID+`","from_uid":"`+primaryUID+`","to_uid":"`+peerUID+`","type":"blocks"}`)
+
+		_, err = d.IngestFederationEvents(ctx, db.FederationIngestParams{
+			ProjectID:        p.ID,
+			SpokeInstanceUID: spokeUID,
+			Events:           []db.FederationIngestEvent{{SourceEventID: 2, Event: link}},
+		})
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
+		assertIngestedEventCount(ctx, t, d, p.ID, 1)
+	})
+
+	t.Run("rejects alternate-only link endpoint fields", func(t *testing.T) {
+		d, ctx, p, spokeUID := setupFederationIngestHub(t)
+		primaryUID := newTestUID(t)
+		create := ingestIssueCreatedEvent(t, p.UID, p.Name, spokeUID, primaryUID, 100)
+		_, err := d.IngestFederationEvents(ctx, ingestParams(p.ID, spokeUID, create))
+		require.NoError(t, err)
+
+		peerUID := newTestUID(t)
+		link := ingestEventWithPayload(t, p.UID, p.Name, spokeUID, &primaryUID, &peerUID,
+			"issue.linked", 101,
+			`{"issue_uid":"`+primaryUID+`","from_issue_uid":"`+primaryUID+`","to_issue_uid":"`+peerUID+`","type":"blocks"}`)
+
+		_, err = d.IngestFederationEvents(ctx, db.FederationIngestParams{
+			ProjectID:        p.ID,
+			SpokeInstanceUID: spokeUID,
+			Events:           []db.FederationIngestEvent{{SourceEventID: 2, Event: link}},
+		})
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
+		assertIngestedEventCount(ctx, t, d, p.ID, 1)
+	})
+
+	for _, tc := range []struct {
+		name  string
+		links string
+	}{
+		{
+			name:  "rejects malformed snapshot links container",
+			links: `{}`,
+		},
+		{
+			name:  "rejects malformed snapshot link field",
+			links: `[{"type":"blocks","to_issue_uid":"%s","incoming":"yes"}]`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, ctx, p, spokeUID := setupFederationIngestHub(t)
+			issueUID := newTestUID(t)
+			peerUID := newTestUID(t)
+			links := tc.links
+			if strings.Contains(links, "%s") {
+				links = fmt.Sprintf(links, peerUID)
+			}
+			snapshot := ingestEventWithPayload(t, p.UID, p.Name, spokeUID, &issueUID, nil,
+				"issue.snapshot", 100,
+				`{"uid":"`+issueUID+`","short_id":"`+shortID(issueUID)+`","title":"subject","body":"","author":"spoke","status":"open","metadata":{},"links":`+links+`,"created_at":"2026-05-23T12:00:00.000Z"}`)
+
+			_, err := d.IngestFederationEvents(ctx, ingestParams(p.ID, spokeUID, snapshot))
+
+			require.Error(t, err)
+			assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
+			assertIngestedEventCount(ctx, t, d, p.ID, 0)
+		})
+	}
+
+	for _, tc := range []struct {
+		name         string
+		payloadField string
+	}{
+		{
+			name:         "rejects non-array links changed uid list",
+			payloadField: `"blocks_added_uids":{}`,
+		},
+		{
+			name:         "rejects null links changed uid list",
+			payloadField: `"blocks_removed_uids":null`,
+		},
+		{
+			name:         "rejects mixed links changed uid list",
+			payloadField: `"related_added_uids":["%s",42]`,
+		},
+		{
+			name:         "rejects non-string links changed parent uid",
+			payloadField: `"parent_set_uid":42`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, ctx, p, spokeUID := setupFederationIngestHub(t)
+			primaryUID := newTestUID(t)
+			create := ingestIssueCreatedEvent(t, p.UID, p.Name, spokeUID, primaryUID, 100)
+			_, err := d.IngestFederationEvents(ctx, ingestParams(p.ID, spokeUID, create))
+			require.NoError(t, err)
+
+			payloadField := tc.payloadField
+			if strings.Contains(payloadField, "%s") {
+				payloadField = fmt.Sprintf(payloadField, newTestUID(t))
+			}
+			changed := ingestEventWithPayload(t, p.UID, p.Name, spokeUID, &primaryUID, nil,
+				"issue.links_changed", 101,
+				`{"issue_uid":"`+primaryUID+`",`+payloadField+`,"updated_at":"2026-05-23T12:01:00.000Z"}`)
+
+			_, err = d.IngestFederationEvents(ctx, db.FederationIngestParams{
+				ProjectID:        p.ID,
+				SpokeInstanceUID: spokeUID,
+				Events:           []db.FederationIngestEvent{{SourceEventID: 2, Event: changed}},
+			})
+
+			require.Error(t, err)
+			assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
+			assertIngestedEventCount(ctx, t, d, p.ID, 1)
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		linkType string
+		peerUID  func(*testing.T, string) string
+	}{
+		{
+			name:     "rejects deferred link with unsupported type",
+			linkType: "depends",
+			peerUID:  func(t *testing.T, _ string) string { return newTestUID(t) },
+		},
+		{
+			name:     "rejects deferred link with invalid peer uid",
+			linkType: "blocks",
+			peerUID:  func(*testing.T, string) string { return "not-an-issue-uid" },
+		},
+		{
+			name:     "rejects deferred self link",
+			linkType: "blocks",
+			peerUID:  func(_ *testing.T, primaryUID string) string { return primaryUID },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, ctx, p, spokeUID := setupFederationIngestHub(t)
+			primaryUID := newTestUID(t)
+			create := ingestIssueCreatedEvent(t, p.UID, p.Name, spokeUID, primaryUID, 100)
+			_, err := d.IngestFederationEvents(ctx, ingestParams(p.ID, spokeUID, create))
+			require.NoError(t, err)
+
+			peerUID := tc.peerUID(t, primaryUID)
+			link := ingestEventWithPayload(t, p.UID, p.Name, spokeUID, &primaryUID, &peerUID,
+				"issue.linked", 101,
+				`{"issue_uid":"`+primaryUID+`","from_uid":"`+primaryUID+`","to_uid":"`+peerUID+`","type":"`+tc.linkType+`"}`)
+
+			_, err = d.IngestFederationEvents(ctx, db.FederationIngestParams{
+				ProjectID:        p.ID,
+				SpokeInstanceUID: spokeUID,
+				Events:           []db.FederationIngestEvent{{SourceEventID: 2, Event: link}},
+			})
+
+			require.Error(t, err)
+			assert.ErrorIs(t, err, db.ErrFederationIngestValidation)
+			assertIngestedEventCount(ctx, t, d, p.ID, 1)
+		})
+	}
+
 	for _, eventType := range []string{"issue.created", "issue.snapshot"} {
 		t.Run("rejects fresh "+eventType+" for known issue uid", func(t *testing.T) {
 			d, ctx, p, spokeUID := setupFederationIngestHub(t)
@@ -3411,7 +4027,7 @@ func TestIngestFederationEvents_Validation(t *testing.T) {
 		assert.Equal(t, "after create", issue.Title)
 	})
 
-	t.Run("rejects related issue outside project", func(t *testing.T) {
+	t.Run("accepts related issue outside federation group without materializing edge", func(t *testing.T) {
 		d, ctx, p, spokeUID := setupFederationIngestHub(t)
 		foreignProject, err := d.CreateProject(ctx, "foreign")
 		require.NoError(t, err)
@@ -3435,7 +4051,12 @@ func TestIngestFederationEvents_Validation(t *testing.T) {
 			},
 		})
 
-		require.Error(t, err)
+		require.NoError(t, err)
+		issue, err := d.IssueByUID(ctx, *base.IssueUID, db.IncludeDeletedYes)
+		require.NoError(t, err)
+		links, err := d.LinksByIssue(ctx, issue.ID)
+		require.NoError(t, err)
+		assert.Empty(t, links)
 	})
 
 	for _, eventType := range []string{"issue.moved", "recurrence.created", "recurrence.updated", "recurrence.deleted"} {
@@ -3562,6 +4183,49 @@ func TestIngestClaimViolationWorkMutationCoverage(t *testing.T) {
 	}
 }
 
+func TestIngestClaimViolationAuditsCompatibleCrossProjectPeer(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	firstProject := createProject(ctx, t, d, "spoke-project")
+	secondProject := createProject(ctx, t, d, "peer-project")
+	firstIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: firstProject.ID,
+		Title:     "first",
+		Author:    "tester",
+	})
+	require.NoError(t, err)
+	secondIssue, _, err := d.CreateIssue(ctx, db.CreateIssueParams{
+		ProjectID: secondProject.ID,
+		Title:     "second",
+		Author:    "tester",
+	})
+	require.NoError(t, err)
+	_, err = d.EnableProjectFederation(ctx, firstProject.ID, "tester")
+	require.NoError(t, err)
+	_, err = d.EnableProjectFederation(ctx, secondProject.ID, "tester")
+	require.NoError(t, err)
+	_, err = d.AcquireClaim(ctx, db.AcquireClaimParams{
+		ProjectID: secondProject.ID,
+		IssueRef:  secondIssue.ShortID,
+		Principal: db.ClaimPrincipal{HolderInstanceUID: newTestUID(t), Holder: "holder"},
+		ClaimKind: "hard",
+		Now:       time.Now().UTC(),
+	})
+	require.NoError(t, err)
+
+	spokeUID := newTestUID(t)
+	link := ingestEventWithPayload(t, firstProject.UID, firstProject.Name, spokeUID,
+		&firstIssue.UID, &secondIssue.UID, "issue.linked", 100,
+		`{"issue_uid":"`+firstIssue.UID+`","from_uid":"`+firstIssue.UID+`","to_uid":"`+secondIssue.UID+`","type":"blocks"}`)
+	_, err = d.IngestFederationEvents(ctx, ingestParams(firstProject.ID, spokeUID, link))
+
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 1, "peer claim violation emitted in owning project",
+		`SELECT count(*) FROM events
+		  WHERE project_id = ? AND issue_uid = ? AND type = 'claim.violated'`,
+		secondProject.ID, secondIssue.UID)
+}
+
 func TestIngestClaimViolationExpiresTimedClaimBeforeAudit(t *testing.T) {
 	d, ctx, p, spokeUID, issue, _ := setupIngestClaimIssue(t)
 	_, err := d.AcquireClaim(ctx, db.AcquireClaimParams{
@@ -3679,6 +4343,79 @@ func TestMaterializeFederatedProject(t *testing.T) {
 		`SELECT count(*) FROM links
 		   WHERE from_issue_id IN (SELECT id FROM issues WHERE project_id = ?)
 		     AND type = 'related'`, p.ID)
+}
+
+func TestMaterializeFederatedProjectGroupsCrossProjectLinksByHubOrigin(t *testing.T) {
+	cases := []struct {
+		name      string
+		firstURL  string
+		secondURL string
+		wantLinks int
+	}{
+		{
+			name:      "same normalized hub origin",
+			firstURL:  "https://Hub.Example:443/path-a",
+			secondURL: "https://hub.example/path-b",
+			wantLinks: 1,
+		},
+		{
+			name:      "different hub origin",
+			firstURL:  "https://hub-a.example",
+			secondURL: "https://hub-b.example",
+			wantLinks: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := openTestDB(t)
+			ctx := context.Background()
+			firstProject := createProject(ctx, t, d, "spoke-project")
+			secondProject := createProject(ctx, t, d, "peer-project")
+			_, err := d.UpsertFederationBinding(ctx, db.FederationBinding{
+				ProjectID:     firstProject.ID,
+				Role:          db.FederationRoleSpoke,
+				HubURL:        tc.firstURL,
+				HubProjectID:  41,
+				HubProjectUID: firstProject.UID,
+				Enabled:       true,
+			})
+			require.NoError(t, err)
+			_, err = d.UpsertFederationBinding(ctx, db.FederationBinding{
+				ProjectID:     secondProject.ID,
+				Role:          db.FederationRoleSpoke,
+				HubURL:        tc.secondURL,
+				HubProjectID:  42,
+				HubProjectUID: secondProject.UID,
+				Enabled:       true,
+			})
+			require.NoError(t, err)
+
+			firstIssueUID := newTestUID(t)
+			secondIssueUID := newTestUID(t)
+			firstSnapshot := remoteEvent(t, firstProject.UID, firstProject.Name,
+				&firstIssueUID, nil, "issue.snapshot", "remote-agent", 100,
+				`{"uid":"`+firstIssueUID+`","short_id":"`+shortID(firstIssueUID)+`","title":"first","body":"","author":"remote-agent","status":"open","metadata":{},"links":[{"type":"related","to_issue_uid":"`+secondIssueUID+`","author":"remote-agent"}],"created_at":"2026-05-23T12:00:00.000Z"}`)
+			secondSnapshot := remoteEvent(t, secondProject.UID, secondProject.Name,
+				&secondIssueUID, nil, "issue.snapshot", "remote-agent", 101,
+				`{"uid":"`+secondIssueUID+`","short_id":"`+shortID(secondIssueUID)+`","title":"second","body":"","author":"remote-agent","status":"open","metadata":{},"created_at":"2026-05-23T12:00:00.000Z"}`)
+			inserted, err := d.InsertRemoteEvent(ctx, firstProject.ID, firstSnapshot)
+			require.NoError(t, err)
+			require.True(t, inserted)
+			inserted, err = d.InsertRemoteEvent(ctx, secondProject.ID, secondSnapshot)
+			require.NoError(t, err)
+			require.True(t, inserted)
+
+			require.NoError(t, d.MaterializeFederatedProject(ctx, firstProject.ID))
+			require.NoError(t, d.MaterializeFederatedProject(ctx, secondProject.ID))
+
+			assertRowCount(ctx, t, d, tc.wantLinks, "cross-project link count",
+				`SELECT count(*) FROM links
+				  WHERE type = 'related'
+				    AND (from_issue_uid = ? OR to_issue_uid = ?)
+				    AND (from_issue_uid = ? OR to_issue_uid = ?)`,
+				firstIssueUID, firstIssueUID, secondIssueUID, secondIssueUID)
+		})
+	}
 }
 
 func TestMaterializeFederatedProject_ReconcilesExistingRowsAndEdges(t *testing.T) {
@@ -4529,6 +5266,68 @@ func TestLeaveFederationReplicaDetachesSpoke(t *testing.T) {
 	if _, err := d.ProjectByID(ctx, projectID); err != nil {
 		t.Fatalf("project should survive detach: %v", err)
 	}
+}
+
+func TestLeaveFederationReplicaPreservesDetachedProjectState(t *testing.T) {
+	d := openTestDB(t)
+	ctx := context.Background()
+	firstProject := createProject(ctx, t, d, "spoke-project")
+	secondProject := createProject(ctx, t, d, "peer-project")
+	for _, project := range []db.Project{firstProject, secondProject} {
+		_, err := d.UpsertFederationBinding(ctx, db.FederationBinding{
+			ProjectID:     project.ID,
+			Role:          db.FederationRoleSpoke,
+			HubURL:        "https://hub.example/projects/" + project.Name,
+			HubProjectID:  project.ID,
+			HubProjectUID: project.UID,
+			Enabled:       true,
+		})
+		require.NoError(t, err)
+	}
+
+	firstIssueUID := newTestUID(t)
+	secondIssueUID := newTestUID(t)
+	thirdIssueUID := newTestUID(t)
+	firstSnapshot := remoteEvent(t, firstProject.UID, firstProject.Name,
+		&firstIssueUID, nil, "issue.snapshot", "remote-agent", 100,
+		`{"uid":"`+firstIssueUID+`","short_id":"`+shortID(firstIssueUID)+`","title":"first","body":"","author":"remote-agent","status":"open","metadata":{},"links":[{"type":"blocks","to_issue_uid":"`+secondIssueUID+`","author":"remote-agent"}],"created_at":"2026-05-23T12:00:00.000Z"}`)
+	secondSnapshot := remoteEvent(t, secondProject.UID, secondProject.Name,
+		&secondIssueUID, nil, "issue.snapshot", "remote-agent", 101,
+		`{"uid":"`+secondIssueUID+`","short_id":"`+shortID(secondIssueUID)+`","title":"second","body":"","author":"remote-agent","status":"open","metadata":{},"links":[{"type":"blocks","to_issue_uid":"`+thirdIssueUID+`","author":"remote-agent"}],"created_at":"2026-05-23T12:00:00.000Z"}`)
+	thirdSnapshot := remoteEvent(t, secondProject.UID, secondProject.Name,
+		&thirdIssueUID, nil, "issue.snapshot", "remote-agent", 102,
+		`{"uid":"`+thirdIssueUID+`","short_id":"`+shortID(thirdIssueUID)+`","title":"third","body":"","author":"remote-agent","status":"open","metadata":{},"created_at":"2026-05-23T12:00:00.000Z"}`)
+	inserted, err := d.InsertRemoteEvent(ctx, firstProject.ID, firstSnapshot)
+	require.NoError(t, err)
+	require.True(t, inserted)
+	inserted, err = d.InsertRemoteEvent(ctx, secondProject.ID, secondSnapshot)
+	require.NoError(t, err)
+	require.True(t, inserted)
+	inserted, err = d.InsertRemoteEvent(ctx, secondProject.ID, thirdSnapshot)
+	require.NoError(t, err)
+	require.True(t, inserted)
+	require.NoError(t, d.MaterializeFederatedProject(ctx, firstProject.ID))
+	require.NoError(t, d.MaterializeFederatedProject(ctx, secondProject.ID))
+	assertRowCount(ctx, t, d, 1, "link exists before leaving group",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssueUID, secondIssueUID)
+	assertRowCount(ctx, t, d, 1, "same-project link exists before leaving group",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		secondIssueUID, thirdIssueUID)
+
+	_, err = d.LeaveFederationReplica(ctx, secondProject.ID)
+
+	require.NoError(t, err)
+	assertRowCount(ctx, t, d, 0, "leaving peer removes former group link",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		firstIssueUID, secondIssueUID)
+	assertRowCount(ctx, t, d, 1, "leaving preserves the detached project's same-project link",
+		`SELECT count(*) FROM links
+		  WHERE from_issue_uid = ? AND to_issue_uid = ? AND type = 'blocks'`,
+		secondIssueUID, thirdIssueUID)
 }
 
 func TestLeaveFederationReplicaIdempotentWhenStandalone(t *testing.T) {
