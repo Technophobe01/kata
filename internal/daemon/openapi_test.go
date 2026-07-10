@@ -187,9 +187,9 @@ func TestOpenAPIDocumentShape(t *testing.T) {
 	}
 }
 
-func TestAPISchemaVersionReflectsBranchOrchestrationContract(t *testing.T) {
-	if APISchemaVersion != "0.5.0" {
-		t.Fatalf("APISchemaVersion = %q, want 0.5.0 for create metadata and list metadata filter contract", APISchemaVersion)
+func TestAPISchemaVersionReflectsReadyHydrationContract(t *testing.T) {
+	if APISchemaVersion != "0.6.0" {
+		t.Fatalf("APISchemaVersion = %q, want 0.6.0 for hydrated ready rows (IssueOut projection with required qualified_id)", APISchemaVersion)
 	}
 }
 
@@ -219,7 +219,7 @@ func TestOpenAPIDocumentJSONBlobShapes(t *testing.T) {
 		t.Fatalf("CreateIssueRequestBody.metadata additionalProperties = %#v, want true", createMeta.AdditionalProperties)
 	}
 	assertSchemaPropertyType(t, doc, "ProjectOut", "metadata", huma.TypeObject)
-	assertSchemaPropertyType(t, doc, "ReadyGlobalIssue", "metadata", huma.TypeObject)
+	assertSchemaPropertyType(t, doc, "ReadyGlobalIssueOut", "metadata", huma.TypeObject)
 	assertSchemaPropertyType(t, doc, "Recurrence", "template_labels", huma.TypeArray)
 	assertSchemaPropertyType(t, doc, "Recurrence", "template_metadata", huma.TypeObject)
 	assertSchemaPropertyType(t, doc, "RecurrenceTemplateUpdateInput", "metadata", huma.TypeObject)
