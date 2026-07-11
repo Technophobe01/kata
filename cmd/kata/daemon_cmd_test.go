@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -37,7 +38,32 @@ func TestDaemonStatus_NoDaemonReportsAbsent(t *testing.T) {
 	setupKataEnv(t)
 
 	out := executeRoot(t, newDaemonCmd(), "status")
-	assert.Contains(t, string(out), "no daemon")
+	assert.Equal(t, "No kata daemon is running.\n", string(out))
+}
+
+func TestDaemonStatus_HumanReportsLifecycleDetails(t *testing.T) {
+	resetFlags(t)
+	setupKataEnv(t)
+
+	ns, err := daemon.NewNamespace()
+	require.NoError(t, err)
+	require.NoError(t, ns.EnsureDirs())
+	started := time.Now().Add(-52*time.Minute - 33*time.Second)
+	_, err = (kitdaemon.RuntimeStore{Dir: ns.DataDir}).Write(kitdaemon.RuntimeRecord{
+		PID:       os.Getpid(),
+		Network:   "tcp",
+		Address:   "127.0.0.1:7777",
+		Version:   "v-test-status",
+		StartedAt: started,
+	})
+	require.NoError(t, err)
+
+	out := string(executeRoot(t, newRootCmd(), "daemon", "status"))
+
+	assert.Contains(t, out, "kata running at http://127.0.0.1:7777\n")
+	assert.Contains(t, out, "  pid:     "+strconv.Itoa(os.Getpid())+"\n")
+	assert.Contains(t, out, "  version: v-test-status\n")
+	assert.Regexp(t, `(?m)^  uptime:  52m3[3-4]s$`, out)
 }
 
 func TestDaemonStatus_JSONReportsDaemonsWithVersion(t *testing.T) {
@@ -481,6 +507,250 @@ func TestDaemonStop_JSONReportsMultiplePIDs(t *testing.T) {
 	assert.Equal(t, "stop", got.Action)
 	assert.Equal(t, 2, got.Stopped)
 	assert.ElementsMatch(t, []int{first.Process.Pid, second.Process.Pid}, got.PIDs)
+}
+
+func TestDaemonRestart_StartsWhenNoDaemonIsRunning(t *testing.T) {
+	resetFlags(t)
+	setupKataEnv(t)
+
+	orig := startDetachedDaemon
+	t.Cleanup(func() { startDetachedDaemon = orig })
+	startDetachedDaemon = func(context.Context, string, bool) (daemonStartOutput, error) {
+		return daemonStartOutput{
+			Action:  "started",
+			PID:     4242,
+			Address: "127.0.0.1:7777",
+		}, nil
+	}
+
+	out := executeRoot(t, newRootCmd(), "daemon", "restart")
+
+	assert.Equal(t, "started pid=4242 address=127.0.0.1:7777 (was not running)\n", string(out))
+}
+
+func TestDaemonRestart_StopsRunningDaemonBeforeStarting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the test helper does not install the Windows daemon stop event watcher")
+	}
+	resetFlags(t)
+	tmp := setupKataEnv(t)
+
+	child := exec.Command(os.Args[0], "-test.run=TestDaemonCommandSleepHelperProcess", "--") //nolint:gosec // test helper starts this test binary
+	child.Env = append(os.Environ(), "KATA_DAEMON_CMD_SLEEP_HELPER=1")
+	require.NoError(t, child.Start())
+	exited := make(chan struct{})
+	go func() {
+		_ = child.Wait()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		<-exited
+	})
+	writeRuntimePID(t, tmp, child.Process.Pid)
+
+	orig := startDetachedDaemon
+	t.Cleanup(func() { startDetachedDaemon = orig })
+	startDetachedDaemon = func(context.Context, string, bool) (daemonStartOutput, error) {
+		select {
+		case <-exited:
+			return daemonStartOutput{Action: "started", PID: 4243, Address: "127.0.0.1:7777"}, nil
+		default:
+			return daemonStartOutput{}, errors.New("new daemon started before old daemon stopped")
+		}
+	}
+
+	out := executeRoot(t, newRootCmd(), "daemon", "restart")
+
+	assert.Equal(t, "restarted pid=4243 address=127.0.0.1:7777\n", string(out))
+}
+
+func TestDaemonRestart_AllowsFullGracefulShutdownBudget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the test helper does not install the Windows daemon stop event watcher")
+	}
+	resetFlags(t)
+	tmp := setupKataEnv(t)
+	readyPath := filepath.Join(tmp, "shutdown-delay-ready")
+
+	child := exec.Command(os.Args[0], "-test.run=TestDaemonCommandSleepHelperProcess", "--") //nolint:gosec // test helper starts this test binary
+	child.Env = append(os.Environ(),
+		"KATA_DAEMON_CMD_SLEEP_HELPER=1",
+		"KATA_DAEMON_CMD_SHUTDOWN_DELAY=4s",
+		"KATA_DAEMON_CMD_READY_PATH="+readyPath,
+	)
+	require.NoError(t, child.Start())
+	exited := make(chan struct{})
+	go func() {
+		_ = child.Wait()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		<-exited
+	})
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(readyPath)
+		return err == nil
+	}, time.Second, 10*time.Millisecond)
+	writeRuntimePID(t, tmp, child.Process.Pid)
+
+	orig := startDetachedDaemon
+	t.Cleanup(func() { startDetachedDaemon = orig })
+	startDetachedDaemon = func(context.Context, string, bool) (daemonStartOutput, error) {
+		return daemonStartOutput{Action: "started", PID: 4244, Address: "127.0.0.1:7777"}, nil
+	}
+
+	out := executeRoot(t, newRootCmd(), "daemon", "restart")
+
+	assert.Equal(t, "restarted pid=4244 address=127.0.0.1:7777\n", string(out))
+}
+
+func TestDaemonRestart_JSONReportsStartedDaemon(t *testing.T) {
+	resetFlags(t)
+	setupKataEnv(t)
+
+	orig := startDetachedDaemon
+	t.Cleanup(func() { startDetachedDaemon = orig })
+	startDetachedDaemon = func(context.Context, string, bool) (daemonStartOutput, error) {
+		return daemonStartOutput{Action: "started", PID: 4242, Address: "127.0.0.1:7777"}, nil
+	}
+
+	out := executeRoot(t, newRootCmd(), "--json", "daemon", "restart")
+
+	var got struct {
+		KataAPIVersion int    `json:"kata_api_version"`
+		Action         string `json:"action"`
+		Stopped        int    `json:"stopped"`
+		PIDs           []int  `json:"pids"`
+		PID            int    `json:"pid"`
+		Address        string `json:"address"`
+	}
+	require.NoError(t, json.Unmarshal(out, &got))
+	assert.Equal(t, 1, got.KataAPIVersion)
+	assert.Equal(t, "restart", got.Action)
+	assert.Zero(t, got.Stopped)
+	assert.Empty(t, got.PIDs)
+	assert.Equal(t, 4242, got.PID)
+	assert.Equal(t, "127.0.0.1:7777", got.Address)
+}
+
+func TestDaemonRestart_AgentReportsStartedDaemon(t *testing.T) {
+	resetFlags(t)
+	setupKataEnv(t)
+
+	orig := startDetachedDaemon
+	t.Cleanup(func() { startDetachedDaemon = orig })
+	startDetachedDaemon = func(context.Context, string, bool) (daemonStartOutput, error) {
+		return daemonStartOutput{Action: "started", PID: 4242, Address: "127.0.0.1:7777"}, nil
+	}
+
+	out := executeRoot(t, newRootCmd(), "--agent", "daemon", "restart")
+
+	assert.Equal(t, "OK daemon action=restart pid=4242 stopped=0\n", string(out))
+}
+
+func TestDaemonRestart_PassesStartupOverrides(t *testing.T) {
+	resetFlags(t)
+	setupKataEnv(t)
+
+	orig := startDetachedDaemon
+	t.Cleanup(func() { startDetachedDaemon = orig })
+	var gotListen string
+	var gotInsecureReadonly bool
+	startDetachedDaemon = func(_ context.Context, listen string, insecureReadonly bool) (daemonStartOutput, error) {
+		gotListen = listen
+		gotInsecureReadonly = insecureReadonly
+		return daemonStartOutput{Action: "started", PID: 4242, Address: listen}, nil
+	}
+
+	executeRoot(t, newRootCmd(), "daemon", "restart", "--listen", "100.64.0.5:7777", "--insecure-readonly")
+
+	assert.Equal(t, "100.64.0.5:7777", gotListen)
+	assert.True(t, gotInsecureReadonly)
+}
+
+func TestDaemonRestart_ValidatesReplacementBeforeStopping(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the test helper does not install the Windows daemon stop event watcher")
+	}
+	tests := []struct {
+		name    string
+		setup   func(*testing.T, string)
+		wantErr string
+	}{
+		{
+			name: "auth config",
+			setup: func(t *testing.T, tmp string) {
+				require.NoError(t, os.WriteFile(filepath.Join(tmp, "config.toml"),
+					[]byte("listen = \"100.64.0.5:7777\"\n"), 0o600))
+			},
+			wantErr: "pass --insecure-readonly",
+		},
+		{
+			name: "storage DSN",
+			setup: func(t *testing.T, _ string) {
+				t.Setenv("KATA_DSN", "postgres://db.example/kata")
+			},
+			wantErr: "postgres backend is not selectable",
+		},
+		{
+			name: "hooks config",
+			setup: func(t *testing.T, tmp string) {
+				require.NoError(t, os.WriteFile(filepath.Join(tmp, "hooks.toml"),
+					[]byte("[[hook]\nevent =\n"), 0o600))
+			},
+			wantErr: "parse hooks config",
+		},
+		{
+			name: "embedding config",
+			setup: func(t *testing.T, tmp string) {
+				require.NoError(t, os.WriteFile(filepath.Join(tmp, "config.toml"), []byte(`
+[search.embeddings]
+base_url = "http://embedding.example"
+model = "example-model"
+`), 0o600))
+			},
+			wantErr: "embedding client",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetFlags(t)
+			tmp := setupKataEnv(t)
+
+			child := exec.Command(os.Args[0], "-test.run=TestDaemonCommandSleepHelperProcess", "--") //nolint:gosec // test helper starts this test binary
+			child.Env = append(os.Environ(), "KATA_DAEMON_CMD_SLEEP_HELPER=1")
+			require.NoError(t, child.Start())
+			exited := make(chan struct{})
+			go func() {
+				_ = child.Wait()
+				close(exited)
+			}()
+			t.Cleanup(func() {
+				_ = child.Process.Kill()
+				<-exited
+			})
+			writeRuntimePID(t, tmp, child.Process.Pid)
+			tt.setup(t, tmp)
+
+			orig := startDetachedDaemon
+			t.Cleanup(func() { startDetachedDaemon = orig })
+			startCalled := false
+			startDetachedDaemon = func(context.Context, string, bool) (daemonStartOutput, error) {
+				startCalled = true
+				return daemonStartOutput{}, errors.New("replacement startup attempted")
+			}
+
+			_, _, err := executeRootCapture(t, context.Background(), "daemon", "restart")
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+			assert.False(t, startCalled)
+			assert.True(t, kitdaemon.ProcessAlive(child.Process.Pid), "invalid replacement config must leave the daemon running")
+		})
+	}
 }
 
 func TestDaemonReload_AgentReportsReloadedPID(t *testing.T) {
@@ -1309,6 +1579,22 @@ func startSleepProcess(t *testing.T) *exec.Cmd {
 func TestDaemonCommandSleepHelperProcess(_ *testing.T) {
 	if os.Getenv("KATA_DAEMON_CMD_SLEEP_HELPER") != "1" {
 		return
+	}
+	if rawDelay := os.Getenv("KATA_DAEMON_CMD_SHUTDOWN_DELAY"); rawDelay != "" {
+		delay, err := time.ParseDuration(rawDelay)
+		if err != nil {
+			os.Exit(2)
+		}
+		shutdown := make(chan os.Signal, 1)
+		signal.Notify(shutdown)
+		if readyPath := os.Getenv("KATA_DAEMON_CMD_READY_PATH"); readyPath != "" {
+			if err := os.WriteFile(readyPath, nil, 0o600); err != nil { //nolint:gosec // test-controlled path under t.TempDir
+				os.Exit(3)
+			}
+		}
+		<-shutdown
+		time.Sleep(delay)
+		os.Exit(0)
 	}
 	_, _ = io.Copy(io.Discard, os.Stdin)
 	os.Exit(0)

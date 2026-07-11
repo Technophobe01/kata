@@ -33,11 +33,15 @@ import (
 
 func newDaemonCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "daemon", Short: "manage the kata daemon"}
-	cmd.AddCommand(daemonStartCmd(), daemonStatusCmd(), daemonStopCmd(), daemonReloadCmd(), daemonLogsCmd())
+	cmd.AddCommand(daemonStartCmd(), daemonStatusCmd(), daemonStopCmd(), daemonRestartCmd(), daemonReloadCmd(), daemonLogsCmd())
 	return cmd
 }
 
 const daemonTelemetryHeartbeatInterval = 24 * time.Hour
+
+// daemonRestartShutdownTimeout covers the sequential 10-second HTTP and hook
+// shutdown budgets, plus a small allowance for the remaining process cleanup.
+const daemonRestartShutdownTimeout = 25 * time.Second
 
 var newTelemetryReporter = func(opts telemetry.Options) telemetry.Client {
 	return telemetry.NewReporterOrDisabled(opts)
@@ -300,16 +304,28 @@ func daemonStatusCmd() *cobra.Command {
 				return emitJSON(cmd.OutOrStdout(), out)
 			}
 			if len(out.Daemons) == 0 {
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "no daemon running")
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No kata daemon is running.")
 				return nil
 			}
 			for _, d := range out.Daemons {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "daemon pid=%d version=%s address=%s db=%s started_at=%s\n",
-					d.PID, d.Version, d.Address, d.DBPath, d.StartedAt.Format(time.RFC3339))
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "kata running at %s\n", daemonStatusAddress(d.Address))
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  pid:     %d\n", d.PID)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  version: %s\n", d.Version)
+				if !d.StartedAt.IsZero() {
+					uptime := time.Since(d.StartedAt).Round(time.Second)
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  uptime:  %s\n", uptime)
+				}
 			}
 			return nil
 		},
 	}
+}
+
+func daemonStatusAddress(address string) string {
+	if strings.Contains(address, "://") {
+		return address
+	}
+	return "http://" + address
 }
 
 type daemonStatusOutput struct {
@@ -390,6 +406,177 @@ type daemonStopOutput struct {
 	Action  string `json:"action"`
 	Stopped int    `json:"stopped"`
 	PIDs    []int  `json:"pids"`
+}
+
+func daemonRestartCmd() *cobra.Command {
+	var (
+		listen           string
+		insecureReadonly bool
+	)
+	cmd := &cobra.Command{
+		Use:   "restart",
+		Short: "restart the daemon",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			startup, err := preflightDaemonStartup(cmd.Context(), listen, insecureReadonly)
+			if err != nil {
+				return fmt.Errorf("restart: validate replacement: %w", err)
+			}
+			ns := startup.Namespace
+			recs, err := (kitdaemon.RuntimeStore{Dir: ns.DataDir}).List()
+			if err != nil {
+				return err
+			}
+			pids := make([]int, 0, len(recs))
+			for _, rec := range recs {
+				if !kitdaemon.ProcessAlive(rec.PID) {
+					continue
+				}
+				if err := daemon.SignalDaemonStop(rec, ns.DBHash); err != nil {
+					return fmt.Errorf("restart: stop pid %d: %w", rec.PID, err)
+				}
+				pids = append(pids, rec.PID)
+			}
+			if err := waitForDaemonProcesses(cmd.Context(), pids, daemonRestartShutdownTimeout); err != nil {
+				return err
+			}
+			out, err := startDetachedDaemon(cmd.Context(), listen, insecureReadonly)
+			if err != nil {
+				return err
+			}
+			switch currentOutputMode() {
+			case outputJSON:
+				return emitJSON(cmd.OutOrStdout(), daemonRestartOutput{
+					Action:  "restart",
+					Stopped: len(pids),
+					PIDs:    pids,
+					PID:     out.PID,
+					Address: out.Address,
+					DBPath:  out.DBPath,
+				})
+			case outputAgent:
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "OK daemon action=restart pid=%d stopped=%d", out.PID, len(pids))
+				if len(pids) > 0 {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), " pids=%s", agentValue(joinInts(pids, ",")))
+				}
+				_, _ = fmt.Fprintln(cmd.OutOrStdout())
+			case outputHuman:
+				if len(pids) == 0 {
+					_, err = fmt.Fprintf(cmd.OutOrStdout(), "started pid=%d address=%s (was not running)\n", out.PID, out.Address)
+				} else {
+					_, err = fmt.Fprintf(cmd.OutOrStdout(), "restarted pid=%d address=%s\n", out.PID, out.Address)
+				}
+			}
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&listen, "listen", "",
+		"bind the replacement daemon to host:port (overrides config.toml)")
+	cmd.Flags().BoolVar(&insecureReadonly, "insecure-readonly", false,
+		"permit unauthenticated GETs on non-loopback TCP when no token is configured (DEV ONLY)")
+	return cmd
+}
+
+type daemonStartupPreflight struct {
+	Config         *config.DaemonConfig
+	Listen         string
+	Namespace      *daemon.Namespace
+	Endpoint       kitdaemon.Endpoint
+	DBPath         string
+	KataHome       string
+	HookConfigPath string
+	HookConfig     hooks.LoadedConfig
+	Embedder       *embedding.Client
+	VectorsPath    string
+}
+
+func preflightDaemonStartup(ctx context.Context, listen string, insecureReadonly bool) (daemonStartupPreflight, error) {
+	dcfg, err := config.ReadDaemonConfig()
+	if err != nil {
+		return daemonStartupPreflight{}, err
+	}
+	listen = effectiveDaemonListenWithConfig(listen, dcfg)
+	ns, err := daemon.NewNamespace()
+	if err != nil {
+		return daemonStartupPreflight{}, err
+	}
+	endpoint, err := chooseEndpoint(ns, listen)
+	if err != nil {
+		return daemonStartupPreflight{}, err
+	}
+	if err := daemon.CheckAuthStartup(listen, dcfg.Auth, insecureReadonly); err != nil {
+		return daemonStartupPreflight{}, err
+	}
+	dbPath, err := config.KataDSN(ctx)
+	if err != nil {
+		return daemonStartupPreflight{}, err
+	}
+	if err := storeopen.Validate(dbPath); err != nil {
+		return daemonStartupPreflight{}, err
+	}
+	home, err := config.KataHome()
+	if err != nil {
+		return daemonStartupPreflight{}, err
+	}
+	hookCfgPath, err := config.HookConfigPath()
+	if err != nil {
+		return daemonStartupPreflight{}, err
+	}
+	loadedHooks, err := hooks.LoadStartup(hookCfgPath)
+	if err != nil {
+		return daemonStartupPreflight{}, fmt.Errorf("hooks: %w", err)
+	}
+	embedder, vectorsPath, err := preflightEmbeddingStartup(dcfg.Search.Embeddings, dbPath)
+	if err != nil {
+		return daemonStartupPreflight{}, err
+	}
+	return daemonStartupPreflight{
+		Config:         dcfg,
+		Listen:         listen,
+		Namespace:      ns,
+		Endpoint:       endpoint,
+		DBPath:         dbPath,
+		KataHome:       home,
+		HookConfigPath: hookCfgPath,
+		HookConfig:     loadedHooks,
+		Embedder:       embedder,
+		VectorsPath:    vectorsPath,
+	}, nil
+}
+
+type daemonRestartOutput struct {
+	Action  string `json:"action"`
+	Stopped int    `json:"stopped"`
+	PIDs    []int  `json:"pids"`
+	PID     int    `json:"pid"`
+	Address string `json:"address"`
+	DBPath  string `json:"db_path,omitempty"`
+}
+
+func waitForDaemonProcesses(ctx context.Context, pids []int, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		allStopped := true
+		for _, pid := range pids {
+			if kitdaemon.ProcessAlive(pid) {
+				allStopped = false
+				break
+			}
+		}
+		if allStopped {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("daemon did not stop within %s", timeout)
+		case <-tick.C:
+		}
+	}
 }
 
 func joinInts(values []int, sep string) string {
@@ -476,26 +663,14 @@ func redactRuntimeDSN(dsn string) string {
 // config value is used. CLI flag always wins over config.
 // insecureReadonly is the dev escape hatch from --insecure-readonly.
 func runDaemonWithListen(ctx context.Context, listen string, insecureReadonly bool) error {
-	dcfg, err := config.ReadDaemonConfig()
+	startup, err := preflightDaemonStartup(ctx, listen, insecureReadonly)
 	if err != nil {
 		return err
 	}
-	listen = effectiveDaemonListenWithConfig(listen, dcfg)
-	ns, err := daemon.NewNamespace()
-	if err != nil {
-		return err
-	}
-	// chooseEndpoint validates the listen shape and address rules (e.g.
-	// rejecting literal public IPs like 8.8.8.8) without binding. Run it
-	// before the auth-startup guard so a public-address user sees the
-	// "non-public" error rather than a generic auth-required message.
-	endpoint, err := chooseEndpoint(ns, listen)
-	if err != nil {
-		return err
-	}
-	if err := daemon.CheckAuthStartup(listen, dcfg.Auth, insecureReadonly); err != nil {
-		return err
-	}
+	dcfg := startup.Config
+	listen = startup.Listen
+	ns := startup.Namespace
+	endpoint := startup.Endpoint
 	if msg, ok := daemon.TrustPrivateNetworkWarning(listen, dcfg.Auth); ok {
 		fmt.Fprintln(os.Stderr, msg)
 	}
@@ -515,21 +690,19 @@ func runDaemonWithListen(ctx context.Context, listen string, insecureReadonly bo
 	stopCleanup := installStopWatcher(ns.DBHash, cancel)
 	defer stopCleanup()
 
-	dbPath, err := config.KataDSN(ctx)
-	if err != nil {
-		return err
-	}
+	dbPath := startup.DBPath
 	store, err := storeopen.Open(ctx, dbPath)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
-	disp, daemonLog, hookCfgPath, err := setupHooks(store, dbPath)
+	disp, daemonLog, err := setupHooks(store, dbPath, startup.KataHome, startup.HookConfig)
 	if err != nil {
 		return err
 	}
 	defer shutdownHooks(disp)
+	hookCfgPath := startup.HookConfigPath
 
 	telemetryReporter := newDaemonTelemetryReporter(store)
 	defer func() {
@@ -555,7 +728,9 @@ func runDaemonWithListen(ctx context.Context, listen string, insecureReadonly bo
 		return err
 	}
 
-	embedder, vectorIndex, reconcilerHealth, err := startEmbeddingReconciler(ctx, dcfg, store, dbPath, broadcaster, daemonLog)
+	embedder, vectorIndex, reconcilerHealth, err := startEmbeddingReconciler(
+		ctx, dcfg.Search.Embeddings, startup.Embedder, startup.VectorsPath, store, broadcaster, daemonLog,
+	)
 	if err != nil {
 		return err
 	}
@@ -757,25 +932,12 @@ func vectorsPathForDSN(dsn string) (string, error) {
 	return path + ".vectors", nil
 }
 
-// startEmbeddingReconciler constructs the embedding client, sidecar vector
-// index, and reconciler when semantic search is configured, starts the
-// reconciler goroutine, subscribes to the broadcaster so new/edited issues are
-// embedded promptly, and triggers an initial backfill sweep. It returns the
-// client, the index, and a health snapshot func to wire into ServerConfig.
-// When embeddings are not configured it returns nils so the daemon behaves
-// exactly as it did before semantic search existed. The caller owns the
-// returned *vector.Index's lifetime and must close it on shutdown.
-func startEmbeddingReconciler(
-	ctx context.Context,
-	dcfg *config.DaemonConfig,
-	store db.Storage,
+func preflightEmbeddingStartup(
+	ec config.EmbeddingsConfig,
 	dbPath string,
-	bcast *daemon.EventBroadcaster,
-	daemonLog *log.Logger,
-) (*embedding.Client, *vector.Index, func() daemon.ReconcilerHealth, error) {
-	ec := dcfg.Search.Embeddings
+) (*embedding.Client, string, error) {
 	if !ec.Enabled() {
-		return nil, nil, nil, nil
+		return nil, "", nil
 	}
 	embedder, err := embedding.New(embedding.Config{
 		BaseURL:             ec.BaseURL,
@@ -788,11 +950,34 @@ func startEmbeddingReconciler(
 		TrustPrivateNetwork: ec.TrustPrivateNetwork,
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("embedding client: %w", err)
+		return nil, "", fmt.Errorf("embedding client: %w", err)
 	}
 	vectorsPath, err := vectorsPathForDSN(dbPath)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("embedding index: %w", err)
+		return nil, "", fmt.Errorf("embedding index: %w", err)
+	}
+	return embedder, vectorsPath, nil
+}
+
+// startEmbeddingReconciler opens the sidecar vector index for the embedding
+// client validated during startup preflight, starts the reconciler goroutine,
+// subscribes to the broadcaster so new/edited issues are embedded promptly,
+// and triggers an initial backfill sweep. It returns the client, the index, and
+// a health snapshot func to wire into ServerConfig. When embeddings are not
+// configured it returns nils so the daemon behaves exactly as it did before
+// semantic search existed. The caller owns the returned *vector.Index's
+// lifetime and must close it on shutdown.
+func startEmbeddingReconciler(
+	ctx context.Context,
+	ec config.EmbeddingsConfig,
+	embedder *embedding.Client,
+	vectorsPath string,
+	store db.Storage,
+	bcast *daemon.EventBroadcaster,
+	daemonLog *log.Logger,
+) (*embedding.Client, *vector.Index, func() daemon.ReconcilerHealth, error) {
+	if embedder == nil {
+		return nil, nil, nil, nil
 	}
 	idx, err := vector.Open(ctx, vectorsPath)
 	if err != nil {
@@ -986,26 +1171,16 @@ func listenFromPortEnv() (string, bool) {
 	return net.JoinHostPort("0.0.0.0", port), true
 }
 
-// setupHooks loads hooks.toml, materializes $KATA_HOME, and constructs
-// the dispatcher with DB-backed resolvers. Returned values are wired
-// into runDaemon: the dispatcher feeds ServerConfig.Hooks, the logger
-// is shared with runReloadLoop, and the config path is passed to
-// runReloadLoop so SIGHUP re-reads the same file.
-func setupHooks(store db.Storage, dbPath string) (*hooks.Dispatcher, *log.Logger, string, error) {
-	home, err := config.KataHome()
-	if err != nil {
-		return nil, nil, "", err
-	}
+// setupHooks materializes $KATA_HOME and constructs the dispatcher from the
+// hook configuration parsed during startup preflight.
+func setupHooks(
+	store db.Storage,
+	dbPath string,
+	home string,
+	loaded hooks.LoadedConfig,
+) (*hooks.Dispatcher, *log.Logger, error) {
 	if err := os.MkdirAll(home, 0o700); err != nil {
-		return nil, nil, "", err
-	}
-	hookCfgPath, err := config.HookConfigPath()
-	if err != nil {
-		return nil, nil, "", err
-	}
-	loaded, err := hooks.LoadStartup(hookCfgPath)
-	if err != nil {
-		return nil, nil, "", fmt.Errorf("hooks: %w", err)
+		return nil, nil, err
 	}
 	daemonLog := log.New(os.Stderr, "kata-daemon: ", log.LstdFlags)
 	deps := hooks.DispatcherDeps{
@@ -1021,9 +1196,9 @@ func setupHooks(store db.Storage, dbPath string) (*hooks.Dispatcher, *log.Logger
 	}
 	disp, err := hooks.New(loaded, deps)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("hooks: %w", err)
+		return nil, nil, fmt.Errorf("hooks: %w", err)
 	}
-	return disp, daemonLog, hookCfgPath, nil
+	return disp, daemonLog, nil
 }
 
 // shutdownHooks drives the dispatcher's Shutdown with a 10s ceiling.
