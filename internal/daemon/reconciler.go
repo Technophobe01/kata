@@ -134,6 +134,30 @@ func (r *Reconciler) Health() ReconcilerHealth {
 // safety sweep, and after backoff on failure.
 func (r *Reconciler) Run(ctx context.Context) error {
 	backoff := r.cfg.MinBackoff
+	for {
+		release, err := r.idx.AcquireReconcilerLease(ctx)
+		if err == nil {
+			backoff = r.cfg.MinBackoff
+			err = r.runLeader(ctx)
+			err = errors.Join(err, release())
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		r.markError(err)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		backoff = r.nextBackoff(backoff, err)
+	}
+}
+
+func (r *Reconciler) runLeader(ctx context.Context) error {
+	backoff := r.cfg.MinBackoff
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -147,6 +171,9 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			backoff = r.cfg.MinBackoff
 			timer.Reset(r.cfg.SweepEvery)
 		} else {
+			if leaseErr := r.idx.ValidateReconcilerLease(ctx); leaseErr != nil {
+				return errors.Join(err, leaseErr)
+			}
 			backoff = r.nextBackoff(backoff, err)
 			timer.Reset(backoff)
 		}

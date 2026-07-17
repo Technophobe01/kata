@@ -469,19 +469,40 @@ The TUI appends local daemon transport diagnostics to
 and request paths. Use that file when an interactive fetch reports a local
 daemon connection error.
 
+### PostgreSQL schema operations
+
+```sh
+kata storage postgres migrate [--dsn POSTGRES_DSN] [--schema NAME]
+kata storage postgres status [--dsn POSTGRES_DSN] [--schema NAME]
+```
+
+`migrate` installs or advances the dedicated schema with a privileged
+credential. `status` performs a read-only exact-version readiness check and is
+safe for the restricted runtime credential. Both commands honor `KATA_DSN`,
+`KATA_POSTGRES_SCHEMA`, and `[storage.postgres]`; neither prints the DSN. Prefer
+environment or PostgreSQL password-file credentials over `--dsn` so secrets do
+not appear in process listings. See [PostgreSQL
+operations](../operations/postgres.md).
+
 ## Backup and import
 
 ```sh
 kata export [--project NAME] [--project-id N] [--output PATH]
 kata export --allow-running-daemon --output PATH
 
-kata import --input PATH --target PATH [--force]
+kata import --input PATH --target PATH_OR_POSTGRES_DSN [--force]
 kata import --source-format beads
 ```
 
-The kata-format `import` creates a fresh database at the target path; it is not a
-merge operation. The `--source-format beads` form is different: it drives the
-`bd` CLI and merges into the current project. See
+Export reads host-local storage directly. It refuses `--daemon` and configured
+remote server targets rather than silently exporting an unrelated local
+database; run it on the daemon host with the intended storage configuration.
+
+The kata-format `import` creates a fresh SQLite database at a target path or a
+fresh Postgres `kata` schema at a Postgres DSN; it is not a merge operation. An
+initialized target requires `--force`, which atomically replaces kata-owned
+state. The `--source-format beads` form is different: it drives the `bd` CLI
+and merges into the current project. See
 [Migrating from Beads](../guide/migrating-from-beads.md).
 
 ## Remote and identity tokens

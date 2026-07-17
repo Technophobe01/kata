@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/kata/internal/config"
+	"go.kenn.io/kata/internal/db/pgstore"
 	"go.kenn.io/kata/internal/db/storeopen"
 	"go.kenn.io/kata/internal/jsonl"
 )
@@ -45,7 +49,7 @@ func newImportCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&sourceFormat, "source-format", "kata", "import source format (kata or beads)")
 	cmd.Flags().StringVar(&input, "input", "", "path to JSONL export")
-	cmd.Flags().StringVar(&target, "target", "", "database path to create")
+	cmd.Flags().StringVar(&target, "target", "", "SQLite database path or Postgres DSN to create")
 	cmd.Flags().BoolVar(&force, "force", false, "replace existing target database")
 	cmd.Flags().BoolVar(&newInstance, "new-instance", false,
 		"keep the target database's new identity instead of reusing the source identity; useful when restoring into a separate copy")
@@ -105,6 +109,13 @@ func runKataJSONLImport(cmd *cobra.Command, input, target string, force, newInst
 		"daemon is running for this database; stop it before importing"); err != nil {
 		return err
 	}
+	backend, err := storeopen.BackendForDSN(target)
+	if err != nil {
+		return err
+	}
+	if backend == storeopen.BackendPostgres {
+		return runPostgresJSONLImport(cmd, input, target, force, newInstance)
+	}
 	targetExists, err := sqliteFileSetExists(target)
 	if err != nil {
 		return fmt.Errorf("stat import target: %w", err)
@@ -136,7 +147,8 @@ func runKataJSONLImport(cmd *cobra.Command, input, target string, force, newInst
 		return err
 	}
 	if err := jsonl.ImportWithOptions(cmd.Context(), in, d, jsonl.ImportOptions{
-		NewInstance: newInstance,
+		RequireFreshTarget: true,
+		NewInstance:        newInstance,
 	}); err != nil {
 		_ = d.Close()
 		return err
@@ -148,9 +160,88 @@ func runKataJSONLImport(cmd *cobra.Command, input, target string, force, newInst
 		return err
 	}
 	installed = true
+	return writeImportSuccess(cmd, target)
+}
+
+func runPostgresJSONLImport(cmd *cobra.Command, input, target string, force, newInstance bool) error {
+	identity, err := config.CanonicalDSNIdentity(target)
+	if err != nil {
+		return err
+	}
+	pgConfig, err := postgresRestoreConfig(cmd.Context())
+	if err != nil {
+		return err
+	}
+	version, err := pgstore.PeekSchemaVersionWithConfig(cmd.Context(), target, pgConfig)
+	if err != nil {
+		return err
+	}
+	if version != 0 && !force {
+		return &cliError{
+			Message:  "target already exists; pass --force to replace it",
+			Kind:     kindValidation,
+			ExitCode: ExitValidation,
+		}
+	}
+	in, err := os.Open(input) //nolint:gosec // import path is user-provided CLI input
+	if err != nil {
+		return fmt.Errorf("open import input: %w", err)
+	}
+	defer func() { _ = in.Close() }()
+	store, err := pgstore.OpenWithConfig(cmd.Context(), target, pgConfig)
+	if err != nil {
+		return err
+	}
+	installedFreshSchema := store.InstalledFreshSchema()
+	instanceUID := store.InstanceUID()
+	if err := jsonl.ImportWithOptions(cmd.Context(), in, store, jsonl.ImportOptions{
+		RequireFreshTarget: version == 0,
+		NewInstance:        newInstance,
+	}); err != nil {
+		_ = store.Close()
+		if installedFreshSchema {
+			return errors.Join(err, removeFreshPostgresTargetAfterFailure(
+				cmd.Context(), target, instanceUID, pgConfig,
+			))
+		}
+		return err
+	}
+	if err := store.Close(); err != nil {
+		return fmt.Errorf("close import target: %w", err)
+	}
+	return writeImportSuccess(cmd, identity)
+}
+
+func postgresRestoreConfig(ctx context.Context) (pgstore.Config, error) {
+	storageConfig, err := config.KataPostgresStorageConfig(ctx)
+	if err != nil {
+		return pgstore.Config{}, err
+	}
+	pgConfig := pgstore.ConfigFromValues(
+		storageConfig.Schema, storageConfig.Mode, storageConfig.SchemaOwner,
+		storageConfig.AllowInsecure,
+	)
+	// Import is an explicit offline schema-owner operation. It must prepare a
+	// fresh target even when the long-running runtime is validation-only.
+	pgConfig.SchemaMode = pgstore.SchemaModeBootstrap
+	return pgConfig, nil
+}
+
+func removeFreshPostgresTargetAfterFailure(
+	parent context.Context,
+	target, instanceUID string,
+	pgConfig pgstore.Config,
+) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 10*time.Second)
+	defer cancel()
+	return pgstore.RemoveFreshSchemaWithConfig(ctx, target, instanceUID, pgConfig)
+}
+
+func writeImportSuccess(cmd *cobra.Command, target string) error {
 	if flags.Quiet || flags.JSON {
 		return nil
 	}
+	var err error
 	switch currentOutputMode() {
 	case outputAgent:
 		_, err = fmt.Fprintf(cmd.OutOrStdout(), "OK import source_format=kata target=%s\n", agentValue(target))

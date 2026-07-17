@@ -55,6 +55,17 @@ func parseMetaFilters(raw []string) ([]db.MetaFilter, error) {
 	return out, nil
 }
 
+func validateIssueTitle(title string) error {
+	if strings.TrimSpace(title) == "" {
+		return api.NewError(400, "validation",
+			"title must contain at least one non-whitespace character", "", nil)
+	}
+	if strings.ContainsRune(title, '\x00') {
+		return api.NewError(400, "validation", "title must not contain NUL bytes", "", nil)
+	}
+	return nil
+}
+
 // registerIssuesHandlers installs the four issue routes (create/list/show/edit)
 // on humaAPI. CreateIssue writes both the issue row and the matching
 // issue.created event in one tx (see db.CreateIssue) so the response always
@@ -93,6 +104,18 @@ func registerIssuesHandlers(humaAPI huma.API, cfg ServerConfig) {
 		if err := validateCreateMetadata(in.Body.Metadata); err != nil {
 			return nil, err
 		}
+		if err := validateIssueTitle(in.Body.Title); err != nil {
+			return nil, err
+		}
+
+		// Hold one backend-wide project/key lock across lookup and commit. A
+		// daemon-local mutex is insufficient for PostgreSQL because several
+		// daemon processes can serve the same schema.
+		releaseIdempotency, err := cfg.DB.AcquireIdempotencyLock(ctx, in.ProjectID, in.IdempotencyKey)
+		if err != nil {
+			return nil, api.NewError(500, "internal", err.Error(), "", nil)
+		}
+		defer func() { _ = releaseIdempotency() }()
 
 		// Idempotency runs before the federated claim gate AND before
 		// look-alike: a retry of an already-successful create must return the
@@ -368,6 +391,11 @@ func editIssueHandler(cfg ServerConfig) func(context.Context, *api.EditIssueRequ
 		}
 		if err := validatePriorityRange(in.Body.SetPriority); err != nil {
 			return nil, err
+		}
+		if in.Body.Title != nil {
+			if err := validateIssueTitle(*in.Body.Title); err != nil {
+				return nil, err
+			}
 		}
 		if hasLinkChange {
 			if err := validateLinksDelta(in.Body.LinksDelta); err != nil {
@@ -1099,13 +1127,6 @@ const (
 // (the caller should return it directly). Returns the relevant 409 wire error
 // for mismatch / soft-deleted cases. When IdempotencyKey is empty, returns
 // ("", nil, nil) so the caller falls through to the look-alike check.
-//
-// Known limitation: the lookup → CreateIssue is not atomic. Two concurrent
-// requests with the same Idempotency-Key can both miss the lookup and both
-// insert a fresh issue. Closing the race requires either a daemon-level
-// per-key mutex with bounded GC, or restructuring CreateIssue around
-// BEGIN IMMEDIATE with an in-TX re-lookup. Deferred from Plan 3 — small
-// in single-user CLI usage. Tracked under roborev Job 16791-1.
 func tryIdempotencyMatch(ctx context.Context, cfg ServerConfig, in *api.CreateIssueRequest,
 	links []db.InitialLink) (string, *api.MutationResponse, error) {
 	if in.IdempotencyKey == "" {

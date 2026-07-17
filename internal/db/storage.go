@@ -1,7 +1,7 @@
 // Package db hosts the neutral Storage contract — interface, parameter
 // structs, sentinel errors, and pure helpers — shared by every backend.
-// Concrete implementations live in sibling packages (sqlitestore today;
-// pgstore in Phase 3); production entry points pick a backend through the
+// Concrete implementations live in sibling packages (sqlitestore and
+// pgstore); production entry points pick a backend through the
 // storeopen DSN dispatcher and hold a db.Storage thereafter.
 package db
 
@@ -11,11 +11,10 @@ import (
 	"time"
 )
 
-// Storage is the backend-neutral domain API. The current implementation is
-// *sqlitestore.Store; a future Postgres backend will satisfy the same interface.
-// Transactions are an implementation detail and never appear here. Production
-// entry points hold a db.Storage; backend selection happens through the
-// storeopen DSN dispatcher.
+// Storage is the backend-neutral domain API implemented by both SQLite and
+// Postgres. Transactions are an implementation detail and never appear here.
+// Production entry points hold a db.Storage; backend selection happens
+// through the storeopen DSN dispatcher.
 type Storage interface {
 	// identity / lifecycle
 	InstanceUID() string
@@ -139,6 +138,10 @@ type Storage interface {
 	MaxEventID(ctx context.Context) (int64, error)
 	MaxLocalOriginEventID(ctx context.Context, projectID int64) (int64, error)
 	MaxFederationBaselineEventID(ctx context.Context, projectID, sinceEventID int64) (int64, error)
+	// AcquireIdempotencyLock serializes one project/key create decision until
+	// the returned release function runs. Implementations must coordinate every
+	// daemon that can write the same backend, not only goroutines in one server.
+	AcquireIdempotencyLock(ctx context.Context, projectID int64, key string) (release func() error, err error)
 	LookupIdempotency(ctx context.Context, projectID int64, key string, since time.Time) (*IdempotencyMatch, error)
 	InsertCloseThrottledEvent(ctx context.Context, issueID int64, actor string, payload CloseThrottledPayload) (Event, error)
 	RecentSiblingCloses(ctx context.Context, parentIssueID, excludeIssueID int64, actor string, since time.Time) ([]Event, error)

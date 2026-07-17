@@ -1,8 +1,11 @@
 # Backup and restore
 
-`kata export` writes the local database as JSONL. `kata import` rebuilds a
-database from that file. Use these commands for backups, machine moves, and
-schema cutovers.
+`kata export` writes the host-local database as JSONL. It is an offline storage
+operation, not a remote-daemon API: `KATA_SERVER`, a remote workspace target,
+or `--daemon` makes it fail before opening any local database. Run exports on
+the daemon host with that daemon's storage configuration. `kata import`
+rebuilds a database from that file. Use these commands for backups, machine
+moves, and schema cutovers.
 
 ## Use JSONL exports
 
@@ -33,7 +36,7 @@ kata export --allow-running-daemon --output backups/kata-$(date -u +%Y%m%d).json
 
 ## Restore
 
-Restore into a fresh database file:
+Restore into a fresh SQLite database file:
 
 ```sh
 kata import --input backups/kata-20260531.jsonl --target ~/.kata/restored.db
@@ -45,6 +48,34 @@ or move it into `KATA_HOME` as `kata.db`, then restart.
 
 `kata import` is not a merge operation. It creates a target database from the
 input snapshot.
+
+For Postgres, pass a DSN as the target:
+
+```sh
+kata import --input backups/kata-20260531.jsonl \
+  --target 'postgres://kata_schema_owner@db.example/kata?sslmode=verify-full&sslrootcert=system'
+```
+
+A missing `kata` schema is installed before the snapshot is replayed. An
+initialized target is refused unless `--force` is set; forced replay replaces
+all kata-owned state atomically and retains unrelated schemas in the database.
+In a split-role deployment, `--target` must use the schema-owner credential:
+fresh restore may create schema objects, and forced restore requires table
+replacement privileges that the serving role intentionally lacks. Import
+overrides an ambient `mode = "validate"` only for this explicit offline
+schema-owner operation; it does not expand the runtime role's grants. Restore
+the runtime DSN and validation mode before restarting service.
+Stop every daemon using that database and schema before restore. Each serving
+daemon holds a database advisory lease for its lifetime, and replay requires
+the exclusive counterpart, so a daemon on another host cannot retain a
+pre-restore identity while replacement is in progress. Postgres credentials are
+redacted from command output and errors.
+
+For a shared production database, also take a database-native snapshot before
+schema upgrades. JSONL is the portable logical backup; a managed snapshot or
+`pg_dump` archive is the exact-version rollback artifact. The split-role
+upgrade and restore ordering is documented in [PostgreSQL
+operations](postgres.md).
 
 ## Versioned backups
 

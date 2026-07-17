@@ -12,7 +12,7 @@ documented.
 | `internal/daemon` | HTTP routes, daemon runtime, auth, SSE, federation routes. |
 | `internal/db` | Storage contract, backend implementations, schemas, projections, events, queries, federation state. |
 | `internal/embedding` | OpenAI-compatible embeddings client and text recipe (storage-free). |
-| `internal/vector` | `kata.vectors.db` sidecar: mirror, generation lifecycle, fill, KNN query (built on `go.kenn.io/kit/vector`). |
+| `internal/vector` | Backend-native semantic index: SQLite sidecar/sqlite-vec or canonical PostgreSQL/pgvector tables, plus mirror, generation lifecycle, fill, and query. |
 | `internal/client` | Client discovery, auto-start, remote daemon, bearer handling. |
 | `internal/tui` | Bubble Tea TUI. |
 | `internal/jsonl` | Export/import, cutover, fixture compatibility. |
@@ -47,6 +47,10 @@ Federation-specific checks:
 make test-stress
 make test-federation-docker
 ```
+
+The pre-commit hook protects released PostgreSQL migration history. Install
+the configured hooks with `prek install`; see [PostgreSQL
+migrations](postgres-migrations.md) before proposing a schema change.
 
 `make test-stress` runs randomized and failpoint tests. If Rapid prints a
 failing seed, reproduce it with the seed from the failure output:

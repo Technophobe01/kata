@@ -87,21 +87,42 @@ func (d *Store) mergeProjects(ctx context.Context, p db.MergeProjectsParams) (db
 	if err != nil {
 		return db.ProjectMergeResult{}, err
 	}
+	targetName := target.Name
+	if p.TargetName != nil {
+		targetName = *p.TargetName
+	}
 
+	if _, err := tx.ExecContext(ctx, `UPDATE recurrences SET project_id = ? WHERE project_id = ?`, target.ID, source.ID); err != nil {
+		return db.ProjectMergeResult{}, fmt.Errorf("move recurrences: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE issues SET project_id = ? WHERE project_id = ?`, target.ID, source.ID); err != nil {
 		return db.ProjectMergeResult{}, fmt.Errorf("move issues: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE issue_claims SET project_id = ? WHERE project_id = ?`, target.ID, source.ID); err != nil {
+		return db.ProjectMergeResult{}, fmt.Errorf("move issue claims: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE pending_claim_requests SET project_id = ? WHERE project_id = ?`, target.ID, source.ID); err != nil {
+		return db.ProjectMergeResult{}, fmt.Errorf("move pending claim requests: %w", err)
 	}
 	// Links are project-independent edges (storage v16): they reference issues
 	// by id/uid, so moving the issues above carries every link with them. No
 	// link reproject is needed.
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE events SET project_id = ?, project_name = ? WHERE project_id = ?`,
-		target.ID, target.Name, source.ID); err != nil {
+	rows, err := tx.QueryContext(ctx,
+		`UPDATE events SET project_id = ?, project_name = ? WHERE project_id = ? RETURNING id`,
+		target.ID, target.Name, source.ID)
+	if err != nil {
 		return db.ProjectMergeResult{}, fmt.Errorf("move events: %w", err)
 	}
+	movedEventIDs, err := collectEventIDs(rows)
+	if err != nil {
+		return db.ProjectMergeResult{}, err
+	}
+	if err := recomputeEventContentHashesTx(ctx, tx, movedEventIDs); err != nil {
+		return db.ProjectMergeResult{}, err
+	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE purge_log SET project_id = ?, project_name = ? WHERE project_id = ?`,
-		target.ID, target.Name, source.ID); err != nil {
+		`UPDATE purge_log SET project_id = ?, project_uid = ?, project_name = ? WHERE project_id = ?`,
+		target.ID, target.UID, target.Name, source.ID); err != nil {
 		return db.ProjectMergeResult{}, fmt.Errorf("move purge log: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE import_mappings SET project_id = ? WHERE project_id = ?`, target.ID, source.ID); err != nil {
@@ -114,7 +135,7 @@ func (d *Store) mergeProjects(ctx context.Context, p db.MergeProjectsParams) (db
 	if p.TargetName != nil {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE projects SET name = ? WHERE id = ?`,
-			*p.TargetName, target.ID); err != nil {
+			targetName, target.ID); err != nil {
 			return db.ProjectMergeResult{}, fmt.Errorf("update target project: %w", err)
 		}
 	}

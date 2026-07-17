@@ -4,13 +4,11 @@ Status: implemented. This note captures the semantic search design
 rationale; for current operator-facing behavior see the
 [semantic search guide](../guide/semantic-search.md) and
 [Configuration](../reference/configuration.md#semantic-search). The
-"Storage" section reflects the kit-based sidecar vector index
-(`kata.vectors.db`) that replaced the single-table brute-force design this
-note originally described.
+"Storage" section reflects the backend-native indexes: a kit-based SQLite
+sidecar and canonical pgvector tables for PostgreSQL.
 
-kata's search is lexical: SQLite FTS5 with BM25 ranking over title, body, and
-comments (`internal/db/sqlitestore/queries_search.go`), with the PostgreSQL
-equivalent stubbed pending its tsvector implementation. Lexical search misses
+kata's search is lexical: SQLite FTS5 with BM25 ranking and PostgreSQL tsvector
+ranking over title, body, and comments. Lexical search misses
 issues that describe the same problem in different words — the exact case
 that matters for agents running search-before-create. This note describes the
 design for semantic search: embedding-based vector retrieval fused with the
@@ -23,8 +21,9 @@ Goals:
 
 - `kata search` finds paraphrased and conceptually-related issues, not just
   token matches, when an embedding endpoint is configured.
-- Zero new requirements for deployments that do not opt in: no extensions,
-  no network calls, no behavior change to ranking or scores.
+- No embedding endpoint or network calls for deployments that do not opt in,
+  and no behavior change to ranking or scores. PostgreSQL installations carry
+  pgvector as part of their canonical schema even when semantic search is off.
 - Index freshness is owned by the daemon, never by user discipline. Stale or
   missing embeddings degrade recall gracefully; they never break search.
 - Both storage backends reach the same observable contract, by different
@@ -71,7 +70,7 @@ Credential handling follows the existing bearer-token trust model:
 
 ```
 write path:  mutation commit ──nudge──▶ reconciler ──▶ RefreshMirror
-                                           │              (issue_mirror in kata.vectors.db)
+                                           │              (backend-native derived tables)
                                            ▼
                                      kitvec.Fill ──▶ embedding client (batched HTTP)
                                      (active-or-building generation)
@@ -89,11 +88,11 @@ Components:
   recipe. Storage-free: it does not import `internal/db` and operates on
   plain strings (`EmbedText(title, body string)`). Named `embedding`, not
   `embed`, to avoid colliding with the Go stdlib package.
-- `internal/vector` — owns the `kata.vectors.db` sidecar (mirror table,
-  generation lifecycle, fill, and query), built on `go.kenn.io/kit/vector`
-  and `go.kenn.io/kit/vector/sqlitevec`. See "Storage" below. `internal/db`
-  contributes one read method, `ListIssueContent`, that feeds the mirror; it
-  has no per-vector write or search path of its own.
+- `internal/vector` — owns the mirror, generation lifecycle, fill, and query
+  over a SQLite/sqlite-vec sidecar or canonical PostgreSQL/pgvector tables.
+  Both use the `go.kenn.io/kit/vector` fill contract. See "Storage" below.
+  `internal/db` contributes one read method, `ListIssueContent`, that feeds
+  the mirror; it has no per-vector write or search path of its own.
 - `internal/daemon` — the reconciler goroutine (started only when
   configured), which refreshes the mirror and drives the generation fill,
   and the hybrid orchestrator inside the search handler. The RRF merge is a
@@ -268,9 +267,9 @@ semantic recall lags.
 
 ## Storage
 
-### Sidecar database
+### Backend-native derived storage
 
-Vectors live in a SQLite sidecar the daemon opens (creating it if absent)
+SQLite vectors live in a sidecar the daemon opens (creating it if absent)
 next to the main database the first time `[search.embeddings]` is configured
 — `internal/vector.Open`. Its name is derived from the database filename
 (`kata.db` → `kata.vectors.db`) so two databases in one directory never
@@ -295,6 +294,23 @@ issue UIDs; kata never writes chunk rows directly — `kitvec.Fill` chunks
 content (`vector.Split`, 2000 runes with 200-rune overlap) and writes chunks,
 stamps, and vec0 rows together.
 
+PostgreSQL keeps the corresponding mirror, generation, stamp, and chunk rows
+in its selected Kata schema. The canonical schema owns those tables and the
+schema-owner ceremony installs pgvector 0.7 or later in `public`; the daemon's
+runtime role needs DML only. Chunk embeddings use unbounded `public.halfvec`
+so model dimensions can change without runtime DDL. Both forms are derived
+state and portable JSONL restore deliberately rebuilds them from issue content.
+
+Every PostgreSQL reconciler polls for a database/schema-scoped advisory lease
+on a dedicated connection before touching this derived state and holds it for
+the reconciler lifetime. Additional daemon replicas remain idle as standbys and
+take over promptly when the connection closes. Every derived-state mutation
+runs on that same dedicated connection, so loss of the PostgreSQL session both
+releases leadership and fences the former leader from further writes. This
+prevents duplicate embedding calls and prevents differently configured replicas
+from repeatedly replacing each other's active generation. SQLite vector state
+is process-local and needs no equivalent lease.
+
 ### Generation lifecycle and cutover
 
 The desired generation is derived from config
@@ -310,8 +326,8 @@ retired generation's storage — drops its `vec0` table, deletes its
 yet (a workaround other kit consumers share). Reclaim is unconditional and
 idempotent, so a crash between retire and reclaim self-heals on the next
 cutover. Cold start is the deliberate exception to build-then-cutover: when
-no generation is active (fresh sidecar, or the first start after an upgrade
-that reset the sidecar), the reconciler cuts the new generation over
+no generation is active (fresh vector storage, or the first start after an
+upgrade that reset it), the reconciler cuts the new generation over
 immediately — before the fill — so search serves partial results during the
 initial backfill and the health backlog explains the coverage. `Index.Query`
 reads only the active generation — never a building one — so a model swap
@@ -352,16 +368,17 @@ down to fewer in-project hits than wanted (another project's higher-scoring
 chunks crowded the batch), the leg retries once at `knnDeepLimit` (1000)
 before giving up — one bounded retry, not a loop.
 
-### PostgreSQL: not supported
+### PostgreSQL vector execution: pgvector exact cosine
 
-Semantic search requires the SQLite backend today. A daemon started with
-`[search.embeddings]` configured against a non-SQLite DSN fails at startup
-with a clear configuration error (`internal/vector` needs a `kit/vector`
-store backend that does not exist for PostgreSQL yet) rather than silently
-running lexical-only. kit is expected to grow a pgvector sibling backend;
-that becomes kata's PostgreSQL acceleration path when it lands, in place of
-the brute-force-with-pgvector-acceleration design this note originally
-sketched for PostgreSQL.
+PostgreSQL implements the same kit vector-store contract in `internal/vector`
+over `public.halfvec`. Queries use pgvector's cosine-distance operator and a
+bounded exact scan of the active generation, followed by the same chunk rollup,
+project/liveness hydration, similarity floor, and bounded deep retry as SQLite.
+The unbounded column is intentionally not ANN-indexed: pgvector ANN indexes
+require a fixed dimension, which would make model changes demand runtime DDL
+and conflict with the split-role operator posture. Dimension-specific ANN
+tables remain a future scale lever once measurements justify their lifecycle
+cost.
 
 ## Query pipeline
 
@@ -422,8 +439,9 @@ between a soft delete and the refresh that removes its stale vectors.
 
 `SearchResponse` gains `mode` (always present), `degraded` and
 `degraded_reason` (omitempty). `score` semantics are mode-scoped, documented
-at `SearchHit` (`internal/api/types.go`): lexical → negated BM25 exactly as
-today; hybrid → RRF score; semantic → cosine similarity.
+at `SearchHit` (`internal/api/types.go`): lexical → backend-native lexical
+relevance, normalized so higher is better (negated FTS5 BM25 on SQLite and
+`ts_rank_cd` on PostgreSQL); hybrid → RRF score; semantic → cosine similarity.
 
 This is explicit API evolution, not strict invisibility: `api_schema_version`
 takes a minor bump, the compatibility doc records that *ranking and score
@@ -480,8 +498,8 @@ The CLI has three output surfaces, each handled to a precise shape:
 | Definitive 4xx in reconciler | Max backoff immediately + health error; no hot loop |
 | Rows not yet embedded (reconciler backlog) | Invisible to vector leg (not yet stamped in the active generation), carried by FTS leg; not degradation |
 | Model swap in progress (active generation fingerprint ≠ configured embedder) | Vector leg unavailable until cutover: `auto` → lexical + `degraded:true`; explicit `hybrid`/`semantic` → 503 |
-| Non-SQLite backend with embeddings configured | Daemon fails to start with a configuration error |
-| Missing or version-mismatched `kata.vectors.db` at query time | Treated as vector-leg failure (degraded / 503) |
+| PostgreSQL missing pgvector or canonical vector tables | Schema preparation/startup fails closed |
+| Missing or version-mismatched vector storage at query time | Treated as vector-leg failure (degraded / 503) |
 | Mirror/fill lag (edited issue before next reconcile) | Ranking-only effect; visibility always resolved against live `issues` |
 
 ## Testing
@@ -489,7 +507,7 @@ The CLI has three output surfaces, each handled to a precise shape:
 TDD throughout (red, green, refactor). Highlights, not an exhaustive list;
 the storage-conformance bullet below describes the original v1 test plan
 against the single-table design — `internal/vector`'s actual suite covers
-the sidecar equivalents instead: mirror refresh and staleness, fill and
+the backend-native equivalents instead: mirror refresh and staleness, fill and
 backfill, generation cutover with reclaim, project filtering, soft-delete
 retention (removal only on purge or project deletion), and mirror
 version-mismatch handling.
@@ -501,8 +519,8 @@ version-mismatch handling.
   composition (each component independently changes it), L2 normalization.
 - RRF as a pure function: overlapping/disjoint/empty legs, similarity floor,
   determinism and tie-breaks.
-- Storage conformance suite shared by both backends (pgstore joins in
-  Phase 2): upsert round-trips including CHECK violations (dims, vector
+- Storage conformance suite shared by both backends: upsert round-trips
+  including CHECK violations (dims, vector
   length, fingerprint length); the three dirty predicates (missing,
   fingerprint mismatch, `content_revision` mismatch); that `content_revision`
   bumps via every title/body writer (`EditIssue`, `EditIssueAtomic`, import)
@@ -520,13 +538,15 @@ version-mismatch handling.
 - CLI/API compatibility test pinning the unconfigured-default search across
   surfaces: JSON envelope and agent status line carry `mode:"lexical"` /
   `mode=lexical`; human output is byte-identical to today; lexical score
-  semantics (negated BM25) unchanged. A companion human-rendering test pins
+  ordering and higher-is-better semantics unchanged. A companion human-rendering test pins
   that degraded `auto` (embedder down, effective `mode=lexical`,
   `degraded:true`) *does* print the `# mode=lexical degraded: <reason>` note
   — distinguishing baseline lexical from degraded lexical.
 - e2e with a deterministic fixture-map embedder and neutral placeholder
   data: create → instant lexical hit; after reconcile → paraphrase found
   semantically; embedder killed → degraded lexical.
+- PostgreSQL e2e against a real pgvector container: canonical issue content →
+  mirror → batched embedding fill → `halfvec` persistence → cosine ranking.
 - Explicitly untested: real model quality; no network in tests.
 
 ## Phasing
@@ -536,13 +556,11 @@ version-mismatch handling.
   interface methods with the sqlitestore implementation, reconciler, RRF
   merge and mode resolution, API/CLI surface, JSONL export/import, health
   reporting.
-- **Phase 2 — PostgreSQL parity**: implement `SearchFTS`/`SearchFTSAny`
-  over the existing tsvector machinery (currently stubbed in
-  `internal/db/pgstore/stubs_gen.go`), splitting or weighting the tsvector
-  so `matched_in` keeps parity with SQLite; semantic search stays
-  SQLite-only (hard startup error otherwise, see "Storage") until kit ships
-  a pgvector sibling backend for its vector store, at which point kata
-  adopts it as the PostgreSQL acceleration path.
+- **Phase 2 — PostgreSQL lexical and semantic parity (complete)**: `SearchFTS` and
+  `SearchFTSAny` use the Postgres tsvector projection with the same observable
+  filtering and `matched_in` contract as SQLite. The backend-native vector
+  store uses pgvector `halfvec` exact cosine search and shares the reconciler,
+  generation, mode, and result contracts with SQLite.
 
 ## Future work
 

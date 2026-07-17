@@ -1,11 +1,15 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // CanonicalDSNIdentity returns a stable, credential-free identity for a database
@@ -48,6 +52,128 @@ func CanonicalDSNIdentity(dsn string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported dsn scheme %q", scheme)
 	}
+}
+
+type postgresConnectionTarget struct {
+	Host string `json:"host"`
+	Port uint16 `json:"port"`
+}
+
+type postgresConnectionTargetIdentity struct {
+	Database string                     `json:"database"`
+	Targets  []postgresConnectionTarget `json:"targets"`
+}
+
+// postgresTargetIdentity returns the effective credential-free PostgreSQL
+// connection targets selected by pgx. Unlike CanonicalDSNIdentity, which is a
+// display-safe database label, this identity retains routing overrides and HA
+// fallbacks so two different servers cannot share daemon runtime state.
+func postgresTargetIdentity(dsn string) (string, error) {
+	canonical, err := CanonicalDSNIdentity(dsn)
+	if err != nil {
+		return "", err
+	}
+	identity, err := parsePostgresConnectionTargetIdentity(dsn)
+	if err != nil {
+		return "", err
+	}
+	ambientRouting, err := postgresTargetUsesAmbientRouting(dsn)
+	if err != nil {
+		return "", err
+	}
+	if !ambientRouting {
+		canonicalIdentity, err := parsePostgresCanonicalTargetIdentity(dsn)
+		if err != nil {
+			return "", err
+		}
+		if samePostgresConnectionTargetIdentity(identity, canonicalIdentity) {
+			// Preserve the original runtime namespace for ordinary DSNs. Only
+			// routing overrides that change pgx's effective targets need the new
+			// expanded identity.
+			return canonical, nil
+		}
+	}
+	body, err := json.Marshal(identity)
+	if err != nil {
+		return "", errors.New("encode postgres target identity")
+	}
+	return string(body), nil
+}
+
+// postgresTargetUsesAmbientRouting reports whether pgx can fill a missing URL
+// target field from libpq environment settings. Such targets must retain the
+// expanded effective identity: the same URL can otherwise address different
+// servers in two shells while sharing one daemon namespace.
+func postgresTargetUsesAmbientRouting(dsn string) (bool, error) {
+	u, err := url.Parse(dsn)
+	if err != nil || ambiguousUserinfo(u) {
+		return false, errors.New("parse postgres target identity: invalid dsn")
+	}
+	query := u.Query()
+	hostExplicit := u.Hostname() != "" || query.Has("host")
+	portExplicit := u.Port() != "" || query.Has("port")
+	databaseExplicit := strings.TrimLeft(u.Path, "/") != "" || query.Has("database") || query.Has("dbname")
+	if (os.Getenv("PGSERVICE") != "" || query.Has("service")) &&
+		(!hostExplicit || !portExplicit || !databaseExplicit) {
+		return true, nil
+	}
+	return os.Getenv("PGHOST") != "" && !hostExplicit ||
+		os.Getenv("PGPORT") != "" && !portExplicit ||
+		os.Getenv("PGDATABASE") != "" && !databaseExplicit, nil
+}
+
+// parsePostgresCanonicalTargetIdentity derives the ordinary URL target from
+// the original parsed DSN while removing credentials and query overrides. It
+// must not reparse CanonicalDSNIdentity: that legacy display identity contains
+// decoded database-path characters, so a database name containing an encoded
+// '#' or '?' would be reinterpreted as URL syntax and split the runtime
+// namespace after an upgrade.
+func parsePostgresCanonicalTargetIdentity(dsn string) (postgresConnectionTargetIdentity, error) {
+	u, err := url.Parse(dsn)
+	if err != nil || ambiguousUserinfo(u) {
+		return postgresConnectionTargetIdentity{}, errors.New("parse postgres target identity: invalid dsn")
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return parsePostgresConnectionTargetIdentity(u.String())
+}
+
+func parsePostgresConnectionTargetIdentity(dsn string) (postgresConnectionTargetIdentity, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		// pgx parse errors may echo credentials from the input.
+		return postgresConnectionTargetIdentity{}, errors.New("parse postgres target identity: invalid dsn")
+	}
+	identity := postgresConnectionTargetIdentity{Database: cfg.Database}
+	seen := map[postgresConnectionTarget]struct{}{}
+	appendTarget := func(host string, port uint16) {
+		target := postgresConnectionTarget{Host: host, Port: port}
+		if _, exists := seen[target]; exists {
+			return
+		}
+		seen[target] = struct{}{}
+		identity.Targets = append(identity.Targets, target)
+	}
+	appendTarget(cfg.Host, cfg.Port)
+	for _, fallback := range cfg.Fallbacks {
+		appendTarget(fallback.Host, fallback.Port)
+	}
+	return identity, nil
+}
+
+func samePostgresConnectionTargetIdentity(a, b postgresConnectionTargetIdentity) bool {
+	if a.Database != b.Database || len(a.Targets) != len(b.Targets) {
+		return false
+	}
+	for index := range a.Targets {
+		if a.Targets[index] != b.Targets[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // RedactDSN returns dsn with any password removed, safe for errors and logs.

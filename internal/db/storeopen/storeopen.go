@@ -1,7 +1,6 @@
 // Package storeopen routes a DSN to the right db.Storage backend. Bare paths
-// and sqlite:// DSNs open the SQLite backend. postgres:// and postgresql://
-// DSNs are recognized but rejected until the Postgres backend implements the
-// core db.Storage domain methods.
+// and sqlite:// DSNs open SQLite; postgres:// and postgresql:// DSNs open
+// Postgres.
 //
 // Open peeks the on-disk schema, runs JSONL cutover for SQLite DBs whose
 // schema_version predates db.CurrentSchemaVersion(), and hands the path to
@@ -17,37 +16,102 @@ import (
 	"os"
 	"strings"
 
+	"go.kenn.io/kata/internal/config"
 	"go.kenn.io/kata/internal/db"
+	"go.kenn.io/kata/internal/db/pgstore"
 	"go.kenn.io/kata/internal/db/sqlitestore"
 	"go.kenn.io/kata/internal/jsonl"
 )
 
-// ErrPostgresNotSelectable reports that production callers cannot select
-// pgstore through storeopen yet. The pgstore package remains available for
-// schema/bootstrap tests, but its domain methods are still stubs.
-var ErrPostgresNotSelectable = errors.New("postgres backend is not selectable until db.Storage methods are implemented")
+// Backend identifies the storage implementation selected by a DSN.
+type Backend string
+
+const (
+	// BackendSQLite selects the local SQLite implementation.
+	BackendSQLite Backend = "sqlite"
+	// BackendPostgres selects the Postgres implementation.
+	BackendPostgres Backend = "postgres"
+)
+
+// Config carries backend-specific startup policy. Zero-value backend fields
+// are replaced with that backend's standalone defaults.
+type Config struct {
+	Postgres pgstore.Config
+}
+
+// InstalledFreshPostgresSchema reports whether store's open created its
+// configured Postgres schema. False is the safe answer for other backends and
+// for Postgres schemas that already existed.
+func InstalledFreshPostgresSchema(store db.Storage) bool {
+	reporter, ok := store.(interface{ InstalledFreshSchema() bool })
+	return ok && reporter.InstalledFreshSchema()
+}
+
+// DefaultConfig returns the standalone storage startup policy.
+func DefaultConfig() Config {
+	return Config{Postgres: pgstore.DefaultConfig()}
+}
+
+// BackendForDSN resolves a DSN without opening or mutating its target.
+func BackendForDSN(dsn string) (Backend, error) {
+	scheme, _, hasScheme := splitScheme(dsn)
+	switch {
+	case !hasScheme || scheme == "sqlite":
+		return BackendSQLite, nil
+	case scheme == "postgres" || scheme == "postgresql":
+		return BackendPostgres, nil
+	default:
+		return "", fmt.Errorf("unsupported dsn scheme %q", scheme)
+	}
+}
 
 // Validate reports whether dsn selects a storage backend this binary can
 // start without opening or mutating the database.
 func Validate(dsn string) error {
-	scheme, _, hasScheme := splitScheme(dsn)
-	switch {
-	case hasScheme && (scheme == "postgres" || scheme == "postgresql"):
-		return ErrPostgresNotSelectable
-	case hasScheme && scheme != "sqlite":
-		return fmt.Errorf("unsupported dsn scheme %q", scheme)
-	default:
-		return nil
-	}
+	_, err := BackendForDSN(dsn)
+	return err
 }
 
 // Open selects a storage backend from the DSN and returns a ready-to-use
 // db.Storage. SQLite DSNs at a pre-current schema_version are upgraded through
 // internal/jsonl.AutoCutover before the backend handle is opened.
 func Open(ctx context.Context, dsn string, opts ...db.OpenOption) (db.Storage, error) {
+	openConfig := DefaultConfig()
+	backend, err := BackendForDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if backend == BackendPostgres {
+		storageConfig, err := config.KataPostgresStorageConfig(ctx)
+		if err != nil {
+			return nil, err
+		}
+		openConfig.Postgres = pgstore.ConfigFromValues(
+			storageConfig.Schema, storageConfig.Mode, storageConfig.SchemaOwner,
+			storageConfig.AllowInsecure,
+		)
+	}
+	return OpenWithConfig(ctx, dsn, openConfig, opts...)
+}
+
+// OpenWithConfig selects a backend while preserving backend-specific startup
+// policy. SQLite ignores the Postgres field; Postgres validates it before
+// connecting or attempting schema work.
+func OpenWithConfig(ctx context.Context, dsn string, openConfig Config, opts ...db.OpenOption) (db.Storage, error) {
 	cfg := db.ApplyOpenOptions(opts...)
 	if err := Validate(dsn); err != nil {
 		return nil, err
+	}
+	backend, err := BackendForDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if backend == BackendPostgres {
+		pgConfig := openConfig.Postgres
+		if pgConfig == (pgstore.Config{}) {
+			pgConfig = pgstore.DefaultConfig()
+		}
+		return pgstore.OpenWithConfig(ctx, dsn, pgConfig, opts...)
 	}
 	_, _, hasScheme := splitScheme(dsn)
 	path := dsn
@@ -55,6 +119,55 @@ func Open(ctx context.Context, dsn string, opts ...db.OpenOption) (db.Storage, e
 		path = strings.TrimPrefix(dsn, "sqlite://")
 	}
 	return openSQLite(ctx, path, cfg, opts)
+}
+
+// PeekSchemaVersion reads a target's schema version without applying
+// migrations. A missing Postgres schema reports version zero; SQLite keeps its
+// existing missing-file error so callers can distinguish it from a v0 file.
+func PeekSchemaVersion(ctx context.Context, dsn string) (int, error) {
+	backend, err := BackendForDSN(dsn)
+	if err != nil {
+		return 0, err
+	}
+	if backend == BackendPostgres {
+		storageConfig, err := config.KataPostgresStorageConfig(ctx)
+		if err != nil {
+			return 0, err
+		}
+		pgConfig := pgstore.ConfigFromValues(
+			storageConfig.Schema, storageConfig.Mode, storageConfig.SchemaOwner,
+			storageConfig.AllowInsecure,
+		)
+		return pgstore.PeekSchemaVersionWithConfig(ctx, dsn, pgConfig)
+	}
+	_, _, hasScheme := splitScheme(dsn)
+	path := dsn
+	if hasScheme {
+		path = strings.TrimPrefix(dsn, "sqlite://")
+	}
+	return sqlitestore.PeekSchemaVersion(ctx, path)
+}
+
+// RemoveFreshPostgresTarget rolls back a schema installed for a failed first
+// import. pgstore verifies the exact instance identity and absence of domain
+// state under exclusive table locks before dropping anything.
+func RemoveFreshPostgresTarget(ctx context.Context, dsn, instanceUID string) error {
+	backend, err := BackendForDSN(dsn)
+	if err != nil {
+		return err
+	}
+	if backend != BackendPostgres {
+		return fmt.Errorf("fresh target cleanup requires a postgres DSN")
+	}
+	storageConfig, err := config.KataPostgresStorageConfig(ctx)
+	if err != nil {
+		return err
+	}
+	pgConfig := pgstore.ConfigFromValues(
+		storageConfig.Schema, storageConfig.Mode, storageConfig.SchemaOwner,
+		storageConfig.AllowInsecure,
+	)
+	return pgstore.RemoveFreshSchemaWithConfig(ctx, dsn, instanceUID, pgConfig)
 }
 
 // OpenReadOnly opens the backend selected by dsn read-only. The cutover

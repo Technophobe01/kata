@@ -8,6 +8,44 @@ All notable changes to kata, grouped by release. Versioned releases start with
 
 ## Unreleased
 
+**New features**
+
+- Added production Postgres storage selected with `KATA_DSN`, `[storage].dsn`,
+  or a `postgres://` / `postgresql://` URL. Postgres now implements the complete
+  storage contract, including federation, claims, external import, JSONL
+  replay, lexical search, daemon startup, export, and atomic snapshot restore.
+- Added `kata storage postgres migrate` and `status`, plus validation-only
+  runtime configuration, so production deployments can separate schema-owner
+  and serving credentials.
+- Added PostgreSQL semantic search with pgvector `halfvec` storage and the same
+  generation/fill contract as SQLite, covered end to end against a real
+  pgvector service.
+
+**Improvements**
+
+- Runs the same behavioral storage conformance fixtures against SQLite and
+  Postgres, with no expected Postgres failures or generated method stubs.
+- Added Postgres JSONL restore targets. Fresh restores install the dedicated
+  `kata` schema; `--force` atomically replaces existing kata-owned state, and
+  failed first restores remove only an unchanged fresh schema.
+- Established the first released Postgres schema as the migration floor rather
+  than retaining migrations for development-only versions that never shipped.
+- Added an append-only numbered migration convention and pre-commit history
+  guard for PostgreSQL schema changes after that release floor.
+- Required server-identity-verified TLS for every remote Postgres connection
+  candidate, with a separately configured lab-only insecure opt-in.
+- Added a dedicated PostgreSQL CI service job that cannot silently skip backend
+  conformance and operator-ceremony tests when Docker discovery is unavailable.
+- Made generic CI lanes skip automatic PostgreSQL testcontainers immediately
+  while preserving local autostart and fail-hard coverage in the explicit
+  service job.
+- Added a real-daemon federation matrix proving bidirectional synchronization,
+  durable restart recovery, and lease-authorized edits across every SQLite and
+  PostgreSQL hub/spoke pairing.
+- Isolated daemon namespaces by PostgreSQL schema, fenced restore against
+  daemons on every host, and made failed fresh-import cleanup survive request
+  cancellation.
+
 ## 0.10.0
 <small>2026-07-11</small>
 

@@ -13,8 +13,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/kata/internal/config"
 	"go.kenn.io/kata/internal/db"
+	"go.kenn.io/kata/internal/db/pgstore"
 	"go.kenn.io/kata/internal/db/sqlitestore"
 	"go.kenn.io/kata/internal/db/storeopen"
+	"go.kenn.io/kata/internal/testenv"
 	_ "modernc.org/sqlite"
 )
 
@@ -46,21 +48,96 @@ func TestOpen_SQLiteSchemeBootstrapsFreshSQLite(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestOpen_PostgresSchemeRejectedUntilDomainMethodsLand proves production
-// store opening does not route normal callers into pgstore while core domain
-// methods are still stubs. The embedded password must not be echoed in the
-// error path.
-func TestOpen_PostgresSchemeRejectedUntilDomainMethodsLand(t *testing.T) {
-	ctx := context.Background()
-	rawDSN := "postgres://user:SECRET@127.0.0.1:1/kata?connect_timeout=1&sslmode=disable" //nolint:gosec // fixture
+func TestValidateAcceptsPostgresSchemes(t *testing.T) {
+	t.Parallel()
 
-	store, err := storeopen.Open(ctx, rawDSN)
+	assert.NoError(t, storeopen.Validate("postgres://db.example/kata"))
+	assert.NoError(t, storeopen.Validate("postgresql://db.example/kata"))
+}
+
+// TestOpen_PostgresDSNRoundTripsThroughReadOnlyOpen proves production store
+// selection routes a Postgres DSN to a usable backend. The read-only reopen
+// must observe the committed project and reject a real mutation.
+func TestOpen_PostgresDSNRoundTripsThroughReadOnlyOpen(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres testcontainer")
+	}
+	ctx := context.Background()
+	dsn, cleanup := testenv.NewPostgresContainer(t, ctx)
+	t.Cleanup(cleanup)
+
+	store, err := storeopen.Open(ctx, dsn)
+	require.NoError(t, err)
+	created, err := store.CreateProject(ctx, "selected-backend")
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	readOnly, err := storeopen.OpenReadOnly(ctx, dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = readOnly.Close() })
+	got, err := readOnly.ProjectByName(ctx, "selected-backend")
+	require.NoError(t, err)
+	assert.Equal(t, created.UID, got.UID)
+	_, err = readOnly.CreateProject(ctx, "must-not-write")
+	assert.Error(t, err)
+}
+
+func TestOpenWithConfig_PostgresValidateModeDoesNotInstallSchema(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres testcontainer")
+	}
+	ctx := context.Background()
+	dsn, cleanup := testenv.NewPostgresContainer(t, ctx)
+	t.Cleanup(cleanup)
+	admin, err := sql.Open("pgx", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = admin.Close() })
+	var schemaOwner string
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT current_user`).Scan(&schemaOwner))
+
+	store, err := storeopen.OpenWithConfig(ctx, dsn, storeopen.Config{
+		Postgres: pgstore.Config{
+			Schema: "runtime_store", SchemaMode: pgstore.SchemaModeValidate,
+			SchemaOwner: schemaOwner,
+		},
+	})
 	assert.Nil(t, store)
 	require.Error(t, err)
-	msg := err.Error()
-	assert.Contains(t, msg, "not selectable")
-	assert.NotContains(t, msg, "SECRET",
-		"password must not leak into the rejection message")
+	assert.Contains(t, err.Error(), `schema "runtime_store" is not installed`)
+
+	var exists bool
+	require.NoError(t, admin.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'runtime_store')`).Scan(&exists))
+	assert.False(t, exists)
+}
+
+func TestOpen_PostgresHonorsResolvedValidationPolicy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres testcontainer")
+	}
+	ctx := context.Background()
+	dsn, cleanup := testenv.NewPostgresContainer(t, ctx)
+	t.Cleanup(cleanup)
+	admin, err := sql.Open("pgx", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = admin.Close() })
+	var schemaOwner string
+	require.NoError(t, admin.QueryRowContext(ctx, `SELECT current_user`).Scan(&schemaOwner))
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_POSTGRES_SCHEMA", "resolved_store")
+	t.Setenv("KATA_POSTGRES_SCHEMA_MODE", "validate")
+	t.Setenv("KATA_POSTGRES_SCHEMA_OWNER", schemaOwner)
+
+	store, err := storeopen.Open(ctx, dsn)
+	assert.Nil(t, store)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `schema "resolved_store" is not installed`)
+
+	var exists bool
+	require.NoError(t, admin.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'resolved_store')`).Scan(&exists))
+	assert.False(t, exists)
 }
 
 // TestOpen_UnknownSchemeIsUnsupported refuses any non-sqlite/non-postgres
@@ -179,8 +256,8 @@ func TestOpenReadOnly_OnCurrentDBSucceeds(t *testing.T) {
 }
 
 // TestOpenResolvedFromKataDSNEnvKeepsPasswordOutOfError proves KATA_DSN
-// plumbing reaches storeopen.Open end-to-end and that the Postgres rejection
-// path never echoes the password embedded in the DSN.
+// plumbing reaches storeopen.Open end-to-end and that a connection failure
+// never echoes the password embedded in the DSN.
 func TestOpenResolvedFromKataDSNEnvKeepsPasswordOutOfError(t *testing.T) {
 	t.Setenv("KATA_HOME", t.TempDir())
 	t.Setenv("KATA_DSN", "postgres://user:SECRET@127.0.0.1:1/kata?connect_timeout=1&sslmode=disable") //nolint:gosec // fixture
@@ -192,9 +269,8 @@ func TestOpenResolvedFromKataDSNEnvKeepsPasswordOutOfError(t *testing.T) {
 
 	_, err = storeopen.Open(context.Background(), dsn)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not selectable")
 	assert.NotContains(t, err.Error(), "SECRET",
-		"password must not leak into the rejection message")
+		"password must not leak into the connection error")
 }
 
 // TestOpenResolvedFromStorageDSNKeepsPasswordOutOfError mirrors the env case
@@ -213,7 +289,6 @@ func TestOpenResolvedFromStorageDSNKeepsPasswordOutOfError(t *testing.T) {
 
 	_, err = storeopen.Open(context.Background(), dsn)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not selectable")
 	assert.NotContains(t, err.Error(), "SECRET")
 }
 

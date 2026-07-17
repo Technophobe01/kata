@@ -311,6 +311,50 @@ func TestKataDSN_TolerantOfMalformedAuthSection(t *testing.T) {
 	assert.Equal(t, "postgres://h/db", got)
 }
 
+func TestKataDSN_ReadsCommentedStorageHeadingAndStopsAtCommentedPeer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_DSN", "")
+	t.Setenv("KATA_DB", "")
+	body := "[storage] # primary database\ndsn = \"postgres://h/db\"\n[auth] # unrelated\ntoken =\n"
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(body), 0o600))
+
+	got, err := config.KataDSN(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "postgres://h/db", got)
+}
+
+func TestKataDSN_RejectsUnknownStorageKeys(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		body    string
+		wantKey string
+	}{
+		{
+			name:    "storage",
+			body:    "[storage]\ndsn = \"postgres://h/db\"\nscheam = \"wrong\"\n",
+			wantKey: "storage.scheam",
+		},
+		{
+			name:    "postgres",
+			body:    "[storage]\ndsn = \"postgres://h/db\"\n[storage.postgres]\nscheam = \"wrong\"\n[auth]\ntoken =\n",
+			wantKey: "storage.postgres.scheam",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("KATA_HOME", home)
+			t.Setenv("KATA_DSN", "")
+			t.Setenv("KATA_DB", "")
+			require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(test.body), 0o600))
+
+			_, err := config.KataDSN(context.Background())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), test.wantKey)
+		})
+	}
+}
+
 // TestKataDSN_TolerantOfMissingStorageSection confirms that a config.toml
 // with no [storage] section at all is harmless — KataDSN falls through to
 // KATA_DB / default without complaint.
